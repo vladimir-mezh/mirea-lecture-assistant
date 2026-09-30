@@ -96,6 +96,8 @@ REJECTED_ROOM_SECONDS = 300
 FRESH_SESSION_SECONDS = 600
 # Later attempts of an automatic login that failed before any code was requested.
 AUTO_LOGIN_RETRY_MINUTES = (2, 5, 15)
+# «Открыть» this long before a pair still means "this pair": it is monitored at once.
+MANUAL_OPEN_LEAD = timedelta(minutes=60)
 # How often the cached schedule is checked for a pair to open, with or without Pulse.
 LESSON_CHECK_MS = 15_000
 # The chat fallback: a few spaced attempts per pair, not one per scanned frame.
@@ -1869,8 +1871,8 @@ class MainWindow(QMainWindow):
     def _evaluate_cached_lessons(self):
         self._evaluate_current_lessons(self.db.list_lessons())
 
-    def _is_current(self, lesson, now: datetime) -> bool:
-        lead = timedelta(minutes=self.join_before.value())
+    def _is_current(self, lesson, now: datetime, lead: timedelta | None = None) -> bool:
+        lead = timedelta(minutes=self.join_before.value()) if lead is None else lead
         return lesson.start_at - lead <= now <= lesson.end_at + LEAVE_AFTER_END
 
     def _earlier_pair_holds_tab(self, lesson, now: datetime) -> bool:
@@ -1944,6 +1946,12 @@ class MainWindow(QMainWindow):
                 if now <= lesson.end_at + LEAVE_AFTER_END + timedelta(minutes=10):
                     self._resolve_from_sources(lesson)
                 continue
+            if url and not self.active_lecture_id and self.browser.lecture_url == url:
+                # The student opened this room by hand well before the pair: monitor
+                # it now instead of asking about it or opening it a second time.
+                log.info("current_lesson_adopted_open_room lesson_id=%s", lesson.external_id)
+                self._lecture_opened("браузере", lesson.external_id)
+                break
             if mode is RuleMode.AUTO or lesson.external_id in self.accepted_lessons:
                 log.info(
                     "current_lesson_action lesson_id=%s mode=%s action=open",
@@ -2377,6 +2385,15 @@ class MainWindow(QMainWindow):
     def _save_lesson_link(self, lesson_id: str, url: str, shown: str | None = None):
         if url == shown:
             return  # focus merely left the field
+        if not url:
+            if shown:
+                # Cleared by the student: unpin the room, the СДО decides again.
+                manual = self.db.get_setting("manual_links", {})
+                if manual.pop(lesson_id, None) is not None:
+                    self.db.set_setting("manual_links", manual)
+                self.db.forget_resolved_link(lesson_id)
+                log.info("lesson_link_cleared lesson_id=%s", lesson_id)
+            return
         if url and url != self.db.get_resolved_link(lesson_id):
             self.db.set_resolved_link(lesson_id, url)
             # Remembered as the student's own: СДО rechecks used to replace it.
@@ -2513,7 +2530,7 @@ class MainWindow(QMainWindow):
         self.opening_lecture_id = None
         lesson = self._lesson_of(lesson_id)
         now = datetime.now().astimezone()
-        if manual and lesson is not None and not self._is_current(lesson, now):
+        if manual and lesson is not None and not self._is_current(lesson, now, MANUAL_OPEN_LEAD):
             # A future or past pair opened by hand: its QR codes and marks must not
             # be booked to it, and the pairs of now keep their own monitoring.
             log.info("manual_open_not_monitored lesson_id=%s", lesson_id)

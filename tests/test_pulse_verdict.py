@@ -153,3 +153,17 @@ def test_a_week_without_pairs_is_an_empty_schedule_not_an_error(pulse):
     pulse.handle = _accepting_pulse
 
     assert asyncio.run(MireaService({"access_token": "a"}).get_schedule(3)) == []
+
+
+def test_a_maintenance_page_does_not_cost_the_saved_cookie(pulse):
+    """The retry without the cookie proved nothing, so the cookie must stay: saved
+    without it, the session was judged expired once Pulse came back (new code)."""
+
+    def maintenance(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, html="<html><h1>Технические работы</h1></html>")
+
+    pulse.handle = maintenance
+    session = {".AspNetCore.Cookies": "still-good", "access_token": "a"}
+
+    assert asyncio.run(MireaService(session).verify_state()) is SessionState.UNKNOWN
+    assert session[".AspNetCore.Cookies"] == "still-good"

@@ -151,12 +151,17 @@ class MireaService:
         day's own answer, so a free day is not taken for a refusal.
         """
         state = await self._pulse_verdict_once()
-        if state is SessionState.EXPIRED and self.session.pop(PULSE_COOKIE, None) is not None:
+        saved = self.session.pop(PULSE_COOKIE, None) if state is SessionState.EXPIRED else None
+        if saved is not None:
             # pymirea sends a saved cookie as is and never replaces it, and with one
             # any HTML answer (a firewall or maintenance page) reads as a refusal.
             # Only a fresh bootstrap through the SSO can tell.
             log.info("session_verify_retry reason=saved_cookie_refused")
             state = await self._pulse_verdict_once()
+            if state is not SessionState.VALID:
+                # No new cookie came of it: keep the one that may well still work,
+                # rather than save a session without it after a maintenance page.
+                self.session.setdefault(PULSE_COOKIE, saved)
         return state
 
     async def _pulse_verdict_once(self) -> SessionState:

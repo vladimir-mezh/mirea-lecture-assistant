@@ -1347,3 +1347,75 @@ def test_a_health_result_about_a_room_left_meanwhile_is_dropped(window, monkeypa
     pending[0]("ended")
 
     assert ended == []
+
+
+def test_opening_the_next_pair_by_hand_minutes_early_monitors_it(window, monkeypatch):
+    soon = _pair("soon", datetime.now().astimezone() + timedelta(minutes=10))
+
+    _opened_by_hand(window, monkeypatch, soon)
+
+    assert window.active_lecture_id == "soon"
+
+
+def test_a_room_opened_by_hand_long_before_is_taken_over_without_a_question(window, monkeypatch):
+    lesson = _running_lesson("early")
+    today = datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
+    window.db.sync_lessons([lesson], today)
+    window.db.set_rule(lesson.subject_name, RuleMode.ASK)
+    window.db.set_resolved_link("early", "https://my.mts-link.ru/j/early")
+    window.browser.lecture_url = "https://my.mts-link.ru/j/early"
+    monkeypatch.setattr(window, "_enter_lecture_room", lambda: None)
+    monkeypatch.setattr(window, "toggle_scanner", lambda: None)
+    asked = []
+    monkeypatch.setattr(window, "_ask", lambda *args: asked.append(args) or False)
+
+    window._evaluate_current_lessons(window.db.list_lessons())
+
+    assert asked == []
+    assert window.active_lecture_id == "early"
+
+
+def test_clearing_a_typed_link_unpins_it(window):
+    window._save_lesson_link("wrong", "https://my.mts-link.ru/j/other-subgroup", shown="")
+    assert window.db.get_setting("manual_links", {}) == {
+        "wrong": "https://my.mts-link.ru/j/other-subgroup"
+    }
+
+    window._save_lesson_link("wrong", "", shown="https://my.mts-link.ru/j/other-subgroup")
+
+    assert "wrong" not in window.db.get_setting("manual_links", {})
+    assert not window.db.get_resolved_link("wrong")
+
+
+def test_a_handover_answer_survives_a_locked_response_file(tmp_path, monkeypatch):
+    """An antivirus holding the answer file turned "handover" into "shown", and both
+    copies quit."""
+    import pathlib
+    import threading
+
+    from mirea_lecture_assistant.app import ask_running_copy_to_show
+    from mirea_lecture_assistant.paths import SHOW_REQUEST_FILE, SHOW_RESPONSE_FILE
+
+    response = tmp_path / SHOW_RESPONSE_FILE
+    real_unlink = pathlib.Path.unlink
+
+    def unlink(self, missing_ok=False):
+        if self == response and self.exists():
+            raise PermissionError("[WinError 32] used by another process")
+        return real_unlink(self, missing_ok=missing_ok)
+
+    monkeypatch.setattr(pathlib.Path, "unlink", unlink)
+
+    def running_copy():
+        request = tmp_path / SHOW_REQUEST_FILE
+        for _ in range(100):
+            if request.exists():
+                response.write_text("handover", encoding="ascii")
+                real_unlink(request)
+                return
+            threading.Event().wait(0.02)
+
+    responder = threading.Thread(target=running_copy)
+    responder.start()
+    assert ask_running_copy_to_show(tmp_path, wait_seconds=3) == "handover"
+    responder.join()

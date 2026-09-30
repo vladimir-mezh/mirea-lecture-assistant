@@ -80,12 +80,19 @@ def ask_running_copy_to_show(root: Path, wait_seconds: float = 3.0) -> str | Non
         if not request.exists():
             try:
                 answer = response.read_text(encoding="ascii").strip()
-                response.unlink(missing_ok=True)
             except OSError:
                 answer = ""
+            try:
+                # An antivirus may hold the fresh file; the answer is read already.
+                response.unlink(missing_ok=True)
+            except OSError:
+                pass
             return "handover" if answer == "handover" else "shown"
         time.sleep(0.1)
-    request.unlink(missing_ok=True)
+    try:
+        request.unlink(missing_ok=True)
+    except OSError:
+        pass
     return None
 
 
