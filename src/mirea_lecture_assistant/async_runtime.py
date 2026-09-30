@@ -15,8 +15,8 @@ class AsyncRuntime:
     """A single long-lived event loop shared by every async call in the app.
 
     ``asyncio.run`` per call cannot be used here: pymirea keeps one httpx client
-    alive between the login and the 2FA step, and Playwright objects stay bound
-    to the loop that created them. As soon as the first loop closes, the second
+    alive between the login and the 2FA step, and the browser connection stays bound
+    to the loop that created it. As soon as the first loop closes, the second
     call fails with "Event loop is closed".
     """
 

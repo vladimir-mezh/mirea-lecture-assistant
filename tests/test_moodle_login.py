@@ -14,7 +14,7 @@ MAX_URL = (
 
 
 class FakePage:
-    """Minimal stand-in for a Playwright page driving the SSO forms."""
+    """Minimal stand-in for a browser page driving the SSO forms."""
 
     def __init__(
         self,
@@ -36,14 +36,14 @@ class FakePage:
         self.visited.append(url)
         self.url = self.lands_on or url
 
-    async def wait_for_selector(self, selector, timeout=0, state=None):
-        from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+    async def wait_for_selector(self, selector, timeout=0):
+        from mirea_lecture_assistant.cdp import CdpTimeout
 
         for screen in self.screens:
             if screen in selector:
                 self.screens.remove(screen)
-                return object()
-        raise PlaywrightTimeoutError("not found")
+                return
+        raise CdpTimeout("not found")
 
     async def fill(self, selector, value):
         self.filled["code" if "emailCode" in selector else selector.split("[")[0]] = value
@@ -53,17 +53,11 @@ class FakePage:
         self.clicks += 1
         self.url = self.final_url
 
-    def locator(self, selector):
+    async def evaluate(self, script, selector):
         assert selector == MAX_SKIP
-        page = self
-
-        class Locator:
-            async def evaluate(self, script):
-                assert script == "button => button.click()"
-                page.dom_submits += 1
-                page.url = page.final_url
-
-        return Locator()
+        assert ".click()" in script
+        self.dom_submits += 1
+        self.url = self.final_url
 
     async def wait_for_url(self, predicate, timeout=0):
         if not predicate(self.url):

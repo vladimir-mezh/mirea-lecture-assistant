@@ -66,8 +66,6 @@ def test_reopening_the_same_mts_room_reuses_the_existing_tab(service, monkeypatc
         url = meeting
 
         def __init__(self):
-            self.context = self
-            self.pages = [self]
             self.navigations = 0
             self.reloads = 0
 
@@ -80,16 +78,16 @@ def test_reopening_the_same_mts_room_reuses_the_existing_tab(service, monkeypatc
         async def reload(self, **_kwargs):
             self.reloads += 1
 
-    class Playwright:
-        async def stop(self):
-            return None
-
     page = Page()
 
     async def active_page():
         return page
 
+    async def connected_browser():
+        return type("Browser", (), {"pages": [page]})()
+
     monkeypatch.setattr(service, "_active_page", active_page)
+    monkeypatch.setattr(service, "_connected_browser", connected_browser)
 
     asyncio.run(service._navigate_async(invitation))
     asyncio.run(service._navigate_async(invitation, force_navigation=True))
@@ -194,7 +192,7 @@ def test_content_is_retried_while_the_page_redirects(service):
     """An SSO bounce makes content() fail outright instead of returning the old DOM."""
     import asyncio
 
-    from playwright.async_api import Error as PlaywrightError
+    from mirea_lecture_assistant.cdp import CdpError
 
     class RedirectingPage:
         def __init__(self):
@@ -203,7 +201,7 @@ def test_content_is_retried_while_the_page_redirects(service):
         async def content(self):
             self.attempts += 1
             if self.attempts < 3:
-                raise PlaywrightError("Unable to retrieve content because the page is navigating")
+                raise CdpError("Execution context was destroyed")
             return "<html>готово</html>"
 
         async def wait_for_timeout(self, _ms):
@@ -217,16 +215,16 @@ def test_content_is_retried_while_the_page_redirects(service):
 def test_a_page_that_never_settles_reports_the_failure(service):
     import asyncio
 
-    from playwright.async_api import Error as PlaywrightError
+    from mirea_lecture_assistant.cdp import CdpError
 
     class NeverSettles:
         async def content(self):
-            raise PlaywrightError("page is navigating")
+            raise CdpError("page is navigating")
 
         async def wait_for_timeout(self, _ms):
             return None
 
-    with pytest.raises(PlaywrightError):
+    with pytest.raises(CdpError):
         asyncio.run(service._settled_content(NeverSettles()))
 
 
@@ -235,68 +233,45 @@ def test_capture_defaults_to_full_resolution(service):
     assert service.capture_size == (1920, 1080)
 
 
+class OverridePage:
+    """A tab that records the DevTools commands sent to it."""
+
+    def __init__(self):
+        self.sent = []
+
+    def is_closed(self):
+        return False
+
+    async def send(self, method, params=None):
+        self.sent.append((method, params))
+
+
 def test_capture_override_is_skipped_when_disabled(service):
     import asyncio
 
-    class Page:
-        class context:
-            @staticmethod
-            async def new_cdp_session(_page):
-                raise AssertionError("no CDP session should be opened")
-
+    page = OverridePage()
     service.capture_size = None
-    asyncio.run(service._apply_capture_size(Page()))
+    asyncio.run(service._apply_capture_size(page))
+
+    assert page.sent == []
 
 
 def test_capture_override_sends_the_configured_size(service):
     import asyncio
 
-    sent = {}
-
-    class Session:
-        async def send(self, method, params):
-            sent[method] = params
-
-        async def detach(self):
-            sent["detached"] = True
-
-    class Page:
-        class context:
-            @staticmethod
-            async def new_cdp_session(_page):
-                return Session()
-
+    page = OverridePage()
     service.capture_size = (1600, 900)
-    asyncio.run(service._apply_capture_size(Page()))
+    asyncio.run(service._apply_capture_size(page))
 
-    assert sent["Emulation.setDeviceMetricsOverride"]["width"] == 1600
-    assert sent["Emulation.setDeviceMetricsOverride"]["height"] == 900
-    # The session is kept so the override stays in force for the next frames.
-    assert "detached" not in sent
+    ((method, params),) = page.sent
+    assert method == "Emulation.setDeviceMetricsOverride"
+    assert (params["width"], params["height"]) == (1600, 900)
 
 
 def test_capture_override_is_sent_once_per_tab_and_again_on_a_size_change(service):
     import asyncio
 
-    sent = []
-
-    class Session:
-        async def send(self, method, params):
-            sent.append((method, params))
-
-        async def detach(self):
-            sent.append(("detach", None))
-
-    class Page:
-        def is_closed(self):
-            return False
-
-        class context:
-            @staticmethod
-            async def new_cdp_session(_page):
-                return Session()
-
-    page = Page()
+    page = OverridePage()
 
     async def frames():
         for _ in range(5):
@@ -307,10 +282,10 @@ def test_capture_override_is_sent_once_per_tab_and_again_on_a_size_change(servic
     asyncio.run(frames())
 
     overrides = [
-        params for method, params in sent if method == "Emulation.setDeviceMetricsOverride"
+        params for method, params in page.sent if method == "Emulation.setDeviceMetricsOverride"
     ]
     assert [(item["width"], item["height"]) for item in overrides] == [(1920, 1080), (1280, 720)]
-    assert ("Emulation.clearDeviceMetricsOverride", {}) in sent
+    assert ("Emulation.clearDeviceMetricsOverride", {}) in page.sent
 
 
 @pytest.mark.parametrize(
@@ -346,102 +321,100 @@ def test_only_room_entry_controls_are_pressed(label, expected):
     assert BrowserService.is_entry_label(label) is expected
 
 
-def test_an_already_open_chat_is_not_toggled_closed(service):
+class ChatPage:
+    """An MTS Link room reduced to what the chat fallback looks at."""
+
+    url = LECTURE
+
+    def __init__(self, *, chat_open: bool):
+        self.chat_open = chat_open
+        self.messages: list[str] = []
+        self.clicks: list[int] = []
+        self.typed = ""
+
+    async def elements(self, selector):
+        from mirea_lecture_assistant import browser_service
+
+        blank = {"text": "", "value": "", "placeholder": "", "label": ""}
+        if selector == browser_service.CHAT_EDITORS:
+            return [
+                {**blank, "index": 0, "visible": True, "placeholder": "Поиск"},
+                {
+                    **blank,
+                    "index": 1,
+                    "visible": self.chat_open,
+                    "placeholder": "Введите сообщение",
+                },
+            ]
+        if selector == browser_service.CHAT_BUTTONS:
+            return [
+                {**blank, "index": 0, "visible": True, "text": "Скрыть чат-бот"},
+                {**blank, "index": 1, "visible": True, "label": "Чат"},
+            ]
+        return []
+
+    async def click(self, _selector, *, index=None):
+        self.clicks.append(index)
+        self.chat_open = not self.chat_open
+
+    async def fill(self, _selector, value, *, index=None):
+        assert index == 1
+        self.typed = value
+
+    async def press_enter(self):
+        self.messages.append(self.typed)
+
+    async def count_text(self, text):
+        return self.messages.count(text)
+
+    async def wait_for_timeout(self, _ms):
+        return None
+
+
+def _send_chat(service, page):
     import asyncio
 
-    clicks = []
-
-    class Editor:
-        async def count(self):
-            return 1
-
-        def nth(self, _index):
-            return self
-
-        async def is_visible(self):
-            return True
-
-        async def fill(self, text):
-            typed.append(text)
-
-        async def press(self, _key):
-            delivered.append(1)
-
-    class Delivered:
-        async def count(self):
-            return len(delivered)
-
-    class Buttons:
-        async def count(self):
-            return 1
-
-        def nth(self, _index):
-            return self
-
-        async def is_visible(self):
-            return True
-
-        async def click(self):
-            clicks.append(1)
-
-    class Page:
-        url = LECTURE
-
-        def get_by_placeholder(self, _pattern):
-            return Editor()
-
-        def get_by_role(self, *_args, **_kwargs):
-            return Buttons()
-
-        def get_by_text(self, *_args, **_kwargs):
-            return Delivered()
-
-        async def wait_for_timeout(self, _ms):
-            return None
-
-    typed, delivered = [], []
-
     async def active_page():
-        return Page()
+        return page
 
     service._active_page = active_page
     asyncio.run(service._send_chat_message_async("Иванов Иван ИКБО-01-24"))
 
-    assert clicks == []
-    assert typed == ["Иванов Иван ИКБО-01-24"]
+
+def test_an_already_open_chat_is_not_toggled_closed(service):
+    page = ChatPage(chat_open=True)
+    _send_chat(service, page)
+
+    assert page.clicks == []
+    assert page.messages == ["Иванов Иван ИКБО-01-24"]
 
 
-def test_concurrent_reconnects_start_a_single_driver(service, monkeypatch):
+def test_a_closed_chat_is_opened_with_the_button_named_exactly_chat(service):
+    page = ChatPage(chat_open=False)
+    _send_chat(service, page)
+
+    assert page.clicks == [1]  # not the «чат-бот» toggle that comes first
+    assert page.messages == ["Иванов Иван ИКБО-01-24"]
+
+
+def test_concurrent_reconnects_open_a_single_connection(service, monkeypatch):
     import asyncio
-    import sys
-    import types
 
-    started = []
+    from mirea_lecture_assistant import browser_service
+
+    opened = []
 
     class Browser:
         def is_connected(self):
             return True
 
-    class Chromium:
-        async def connect_over_cdp(self, *_args, **_kwargs):
+        @staticmethod
+        async def connect(_port):
+            opened.append(1)
             await asyncio.sleep(0.01)
             return Browser()
 
-    class Driver:
-        chromium = Chromium()
-
-        async def stop(self):
-            return None
-
-    class Starter:
-        async def start(self):
-            started.append(1)
-            await asyncio.sleep(0.01)
-            return Driver()
-
-    fake = types.ModuleType("playwright.async_api")
-    fake.async_playwright = Starter
-    monkeypatch.setitem(sys.modules, "playwright.async_api", fake)
+    monkeypatch.setattr(browser_service, "Browser", Browser)
     monkeypatch.setattr(type(service), "is_running", property(lambda _self: True))
     service.port = 9222
 
@@ -450,7 +423,7 @@ def test_concurrent_reconnects_start_a_single_driver(service, monkeypatch):
 
     browsers = asyncio.run(many())
 
-    assert len(started) == 1
+    assert len(opened) == 1
     assert len({id(browser) for browser in browsers}) == 1
 
 
@@ -537,60 +510,51 @@ def test_nothing_to_close_is_reported(service):
 class FakeConnection:
     def __init__(self, connected: bool = True):
         self.connected = connected
-        self.stopped = False
+        self.disconnected = False
 
     def is_connected(self):
         return self.connected
 
-
-class FakeDriver:
-    def __init__(self, connection):
-        self.connection = connection
-        self.stopped = False
-
-    async def stop(self):
-        self.stopped = True
+    async def disconnect(self):
+        self.disconnected = True
 
 
 def test_the_connection_is_reused_between_calls(service):
-    """Restarting the driver per frame cost ~270 ms and timed captures out."""
+    """Connecting anew for every frame cost more than the capture and timed it out."""
     import asyncio
 
     connection = FakeConnection()
     service._browser = connection
-    service._playwright = FakeDriver(connection)
 
     assert asyncio.run(service._connected_browser()) is connection
-    assert not service._playwright.stopped
+    assert not connection.disconnected
 
 
 def test_a_broken_connection_is_dropped_before_reconnecting(service, monkeypatch):
     import asyncio
 
-    driver = FakeDriver(None)
-    service._browser = FakeConnection(connected=False)
-    service._playwright = driver
+    broken = FakeConnection(connected=False)
+    service._browser = broken
     monkeypatch.setattr(type(service), "is_running", property(lambda _self: False))
 
     with pytest.raises(RuntimeError, match="не запущен"):
         asyncio.run(service._connected_browser())
 
-    assert driver.stopped
-    assert service._browser is None and service._playwright is None
+    assert broken.disconnected
+    assert service._browser is None
 
 
 def test_releasing_the_connection_leaves_the_browser_running(service):
-    """Shutdown must free the driver without closing the lecture or the СДО session."""
+    """Shutdown must free the connection without closing the lecture or the СДО session."""
     import asyncio
 
-    driver = FakeDriver(None)
-    service._playwright = driver
-    service._browser = FakeConnection()
+    connection = FakeConnection()
+    service._browser = connection
 
     asyncio.run(service._release_connection())
 
-    assert driver.stopped
-    assert service._browser is None and service._playwright is None
+    assert connection.disconnected
+    assert service._browser is None
 
 
 def test_releasing_twice_is_harmless(service):

@@ -30,11 +30,9 @@ class SignInFailed(RuntimeError):
 
 
 async def _visible(page, selector: str, timeout: int) -> bool:
-    from playwright.async_api import TimeoutError as PlaywrightTimeoutError
-
     try:
-        await page.wait_for_selector(selector, timeout=timeout, state="visible")
-    except PlaywrightTimeoutError:
+        await page.wait_for_selector(selector, timeout=timeout)
+    except TimeoutError:
         return False
     return True
 
@@ -62,7 +60,7 @@ async def _skip_optional_max(page, timeout_ms: int) -> None:
     # Chrome can put a native compromised-password warning above this page.
     # A DOM click submits the *same* optional form without disabling that warning
     # or depending on the browser chrome being unobstructed.
-    await page.locator(MAX_SKIP).evaluate("button => button.click()")
+    await page.evaluate("selector => document.querySelector(selector).click()", MAX_SKIP)
 
 
 async def sign_in(page, *, username: str, password: str, request_code, timeout_ms: int = 20_000):

@@ -53,6 +53,7 @@ a = Analysis(
     runtime_hooks=[],
     excludes=[
         "numpy",
+        "playwright",
         "tkinter",
         "PySide6.QtNetwork",
         "PySide6.QtQml",
