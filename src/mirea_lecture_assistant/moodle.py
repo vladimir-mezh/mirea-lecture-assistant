@@ -293,6 +293,11 @@ def discover_course_urls(fetch, subject: str, courses_url: str = COURSES_URL) ->
     return matches
 
 
+def is_group_code(value: str) -> bool:
+    """Whether a string looks like a MIREA group, e.g. ИКБО-11-99."""
+    return bool(GROUP_RE.fullmatch(normalize_group(value)))
+
+
 def module_group_rank(title: str, group: str) -> int:
     """0 — the module names this group, 1 — it names none, 2 — it names other groups only."""
     named = {normalize_group(found) for found in GROUP_RE.findall(title)}

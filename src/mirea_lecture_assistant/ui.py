@@ -43,7 +43,7 @@ from .database import Database
 from .domain import PendingAttendance, RuleMode, SessionState
 from .email_otp import EMAIL_PROVIDERS, EmailAccount, ImapOtpReader
 from .mirea_service import MireaService
-from .moodle import discover_course_urls, resolve_lecture_url
+from .moodle import discover_course_urls, is_group_code, resolve_lecture_url
 from .moodle_login import SignInFailed, sign_in
 from .qr import QrDeduplicator, ScreenScanner, validate_qr
 from .relative_time import format_relative_time
@@ -165,6 +165,45 @@ class Worker(QRunnable):
                     elapsed_ms,
                 )
             self.signals.done.emit(result)
+
+
+class SetupDialog(QDialog):
+    """Asked once, on a fresh installation, before anything else happens."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Первый запуск")
+        self.setMinimumWidth(460)
+        layout = QVBoxLayout(self)
+        intro = QLabel(
+            "Для работы понадобятся три вещи:<br>"
+            "• учётная запись МИРЭА — приложение входит в «Пульс» и в СДО;<br>"
+            "• почта, куда приходит код подтверждения, и <b>пароль приложения</b> для неё "
+            "(обычный пароль от почты не подойдёт);<br>"
+            "• ваша группа — по ней среди вебинаров выбирается нужная комната.<br><br>"
+            "Всё хранится только на этом компьютере: пароли — в хранилище Windows."
+        )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+        form = QFormLayout()
+        self.group = QLineEdit()
+        self.group.setPlaceholderText("Например, ИКБО-01-24")
+        self.student_name = QLineEdit()
+        self.student_name.setPlaceholderText("Иванов Иван")
+        form.addRow("Группа", self.group)
+        form.addRow("Фамилия и имя", self.student_name)
+        hint = QLabel("Фамилия и имя нужны только для резервного сообщения в чат лекции.")
+        hint.setObjectName("muted")
+        hint.setWordWrap(True)
+        form.addRow("", hint)
+        layout.addLayout(form)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Дальше: вход в МИРЭА")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
 
 
 class LoginDialog(QDialog):
@@ -1025,10 +1064,46 @@ class MainWindow(QMainWindow):
         self.login_retry_scheduled = False
         self._auto_login()
 
+    def _needs_setup(self) -> bool:
+        """A fresh installation: nothing to log in with and no group to match rooms by."""
+        if self.mirea.session or self.db.get_setting("group", ""):
+            return False
+        try:
+            return not self.session_store.load_credentials()
+        except Exception:  # noqa: BLE001 - an unreadable keyring is also "nothing saved"
+            return True
+
+    def _first_run_setup(self):
+        log.info("first_run_setup_started")
+        dialog = SetupDialog(self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            self.statusBar().showMessage(
+                "Настройка не завершена: заполните группу в «Настройках» и нажмите «Войти в MIREA»"
+            )
+            return
+        group = dialog.group.text().strip()
+        if group and not is_group_code(group):
+            QMessageBox.warning(
+                self,
+                "Группа",
+                f"«{group}» не похоже на номер группы. Ожидается вид ИКБО-01-24. "
+                "Продолжить можно, но комната вебинара по такой группе не найдётся.",
+            )
+        self.db.set_setting("group", group)
+        self.db.set_setting("student_name", dialog.student_name.text().strip())
+        self.group_edit.setText(group)
+        self.student_name.setText(dialog.student_name.text().strip())
+        self._update_group_label()
+        log.info("first_run_setup_done group_valid=%s", is_group_code(group))
+        self.login()
+
     def _startup_auth(self):
         if os.environ.get("MIREA_ASSISTANT_SMOKE_TEST") == "1":
             # A build smoke test must never reach MIREA and trigger a real 2FA email.
             log.info("startup_auth_skipped reason=smoke_test")
+            return
+        if self._needs_setup():
+            self._first_run_setup()
             return
         # A valid saved session must not generate a fresh OTP on every launch.
         if self.mirea.session:

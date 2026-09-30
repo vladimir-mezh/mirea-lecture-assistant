@@ -10,6 +10,7 @@ from mirea_lecture_assistant.moodle import (
     find_courses,
     find_sso_login_links,
     find_webinar_modules,
+    is_group_code,
     looks_like_login_page,
     match_webinar,
     module_group_rank,
@@ -554,3 +555,17 @@ def test_a_module_without_group_or_teacher_still_beats_another_group():
 
 def test_group_spelling_in_a_title_is_matched_loosely():
     assert module_group_rank("лекция икбо-11-99 поток", "ИКБО-11-99") == 0
+
+
+def test_a_group_code_is_recognised():
+    assert is_group_code("ИКБО-11-99")
+    assert is_group_code("  бсбо-11-23  ")
+    assert is_group_code("икбо–11–99")  # dashes pasted from the portal
+
+
+def test_something_that_is_not_a_group_is_rejected():
+    """A mistyped group silently breaks room matching, so it is checked on first run."""
+    assert not is_group_code("")
+    assert not is_group_code("ИКБО")
+    assert not is_group_code("32-23")
+    assert not is_group_code("моя группа ИКБО-11-99")
