@@ -1,0 +1,210 @@
+"""The lecture flow against a real Chrome, through the DevTools client.
+
+A local page stands in for an MTS Link room (Chrome resolves mts-link.ru to the
+test server): a lobby with the entry and microphone buttons, a QR on screen and
+a chat that is closed until its button is pressed. Skipped without Chrome.
+"""
+
+from __future__ import annotations
+
+import glob
+import http.server
+import io
+import os
+import shutil
+import socket
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+
+import pytest
+import qrcode
+
+from mirea_lecture_assistant.async_runtime import run_async
+from mirea_lecture_assistant.browser_service import BrowserService
+from mirea_lecture_assistant.cdp import endpoint_alive
+from mirea_lecture_assistant.qr import ScreenScanner
+
+QR_PAYLOAD = "https://pulse.mirea.ru/selfapprove?token=123e4567-e89b-12d3-a456-426614174000"
+
+ROOM = """<!doctype html><html><head><meta charset="utf-8"><title>Лекция</title>
+<style>
+  body { font-family: sans-serif; margin: 0; }
+  #room, #chatEditor { display: none; }
+  #qr { width: 360px; height: 360px; image-rendering: pixelated; }
+</style></head><body>
+<div id="lobby">
+  <input type="text" id="name" placeholder="Ваше имя">
+  <button onclick="window.micPressed = true">Подключить микрофон</button>
+  <button id="join" onclick="enter()">Подключиться</button>
+</div>
+<div id="room">
+  <h1 id="who"></h1>
+  <img id="qr" src="/qr.png">
+  <button aria-label="Чат" onclick="toggleChat()">💬</button>
+  <div class="chat-panel">
+    <div id="messages"><div>Петров: переподключитесь, у кого звук пропал</div></div>
+    <textarea id="chatEditor" placeholder="Введите сообщение"
+      onkeydown="send(event, this)"></textarea>
+  </div>
+</div>
+<div id="ended" style="display:none">Вебинар завершён</div>
+<script>
+  function enter() {
+    document.getElementById('who').textContent = document.getElementById('name').value;
+    document.getElementById('lobby').style.display = 'none';
+    document.getElementById('room').style.display = 'block';
+  }
+  function toggleChat() {
+    const editor = document.getElementById('chatEditor');
+    editor.style.display = editor.style.display === 'block' ? 'none' : 'block';
+  }
+  function send(event, editor) {
+    if (event.key !== 'Enter') return;
+    event.preventDefault();
+    const line = document.createElement('div');
+    line.textContent = editor.value;
+    document.getElementById('messages').appendChild(line);
+    editor.value = '';
+  }
+  if (location.search.includes('ended')) {
+    document.getElementById('lobby').style.display = 'none';
+    document.getElementById('ended').style.display = 'block';
+  }
+</script></body></html>"""
+
+WEBINARS = """<!doctype html><html><head><meta charset="utf-8"></head><body>
+<div id="wb2-table"><table class="data"><tbody></tbody></table></div>
+<script>
+  setTimeout(() => {
+    document.querySelector('tbody').innerHTML = '<tr><td>Физика</td></tr>';
+  }, 300);
+</script></body></html>"""
+
+
+def _chrome() -> str | None:
+    candidates = [
+        os.environ.get("CHROME_PATH", ""),
+        *sorted(glob.glob("/opt/pw-browsers/chromium-*/chrome-linux/chrome")),
+        shutil.which("google-chrome") or "",
+        shutil.which("chromium") or "",
+        shutil.which("chromium-browser") or "",
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+    ]
+    return next((path for path in candidates if path and Path(path).is_file()), None)
+
+
+def _free_port() -> int:
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+class Site(http.server.BaseHTTPRequestHandler):
+    qr_png = b""
+
+    def do_GET(self):
+        if self.path.startswith("/event/"):
+            body, kind = ROOM.encode(), "text/html; charset=utf-8"
+        elif self.path == "/qr.png":
+            body, kind = self.qr_png, "image/png"
+        elif self.path.startswith("/mod/webinars/"):
+            body, kind = WEBINARS.encode(), "text/html; charset=utf-8"
+        else:
+            self.send_error(404)
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", kind)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *_args):
+        return None
+
+
+@pytest.fixture(scope="module")
+def room(tmp_path_factory):
+    chrome = _chrome()
+    if chrome is None:
+        pytest.skip("Chrome is not installed")
+    image = io.BytesIO()
+    qrcode.make(QR_PAYLOAD).save(image, format="PNG")
+    Site.qr_png = image.getvalue()
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Site)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    port = _free_port()
+    profile = tmp_path_factory.mktemp("profile")
+    args = [
+        chrome,
+        "--headless=new",
+        f"--remote-debugging-port={port}",
+        f"--user-data-dir={profile}",
+        "--no-first-run",
+        "--no-proxy-server",
+        "--host-resolver-rules=MAP mts-link.ru 127.0.0.1, MAP online-edu.mirea.ru 127.0.0.1",
+        "about:blank",
+    ]
+    if sys.platform.startswith("linux"):
+        args.insert(1, "--no-sandbox")
+    process = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    for _ in range(150):
+        if endpoint_alive(port):
+            break
+        time.sleep(0.1)
+    else:
+        process.kill()
+        pytest.skip("Chrome did not open its debugging port")
+    service = BrowserService(profile / "service")
+    service.port = port
+    service._find_browser = lambda: ("Chromium", chrome)
+    yield service, server.server_address[1]
+    try:
+        service.close()
+    finally:
+        if process.poll() is None:
+            process.kill()
+        server.shutdown()
+
+
+def test_the_whole_lecture_flow_runs_on_a_real_browser(room):
+    service, http_port = room
+    lecture = f"http://mts-link.ru:{http_port}/event/12345"
+
+    service.open(lecture)
+    assert service.lecture_state() == "waiting"
+
+    assert service.join_lecture("Иванов Иван") == "joined"
+    page = run_async(service._active_page())
+    assert run_async(page.inner_text("#who")) == "Иванов Иван"
+    # The microphone button also says "подключ…", but only the entry was pressed.
+    assert run_async(page.evaluate("() => Boolean(window.micPressed)")) is False
+
+    # A classmate asking to reconnect in the chat is not a lost connection.
+    assert service.lecture_state() == "live"
+
+    png, text = run_async(service.capture_page_state())
+    assert ScreenScanner().decode_png(png).decoded == (QR_PAYLOAD,)
+    assert "переподключитесь" in text
+
+    service.send_chat_message("Иванов Иван ИКБО-01-24")
+    assert run_async(page.count_text("Иванов Иван ИКБО-01-24")) == 1
+
+    run_async(page.goto(lecture + "?ended=1"))
+    assert service.lecture_state() == "ended"
+
+
+def test_a_page_filled_by_script_is_read_after_its_rows_appear(room):
+    service, http_port = room
+    html = service.read_html(f"http://online-edu.mirea.ru:{http_port}/mod/webinars/view.php?id=1")
+    assert "<td>Физика</td>" in html
+
+
+def test_the_finished_lecture_tab_closes_but_the_browser_stays(room):
+    service, http_port = room
+    service.lecture_url = f"http://mts-link.ru:{http_port}/event/12345"
+    assert service.close_lecture_tab() is True
+    assert service.is_running

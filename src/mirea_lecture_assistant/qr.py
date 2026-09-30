@@ -95,13 +95,15 @@ class ScreenScanner:
 
     def scan_once(self) -> ScanBatch:
         import mss
-        import numpy as np
+        from PIL import Image
 
         results: list[str] = []
         unreadable = False
         with mss.mss() as capture:
             for monitor in capture.monitors[1:]:
-                image = np.asarray(capture.grab(monitor))[:, :, :3]
+                shot = capture.grab(monitor)
+                # zxing reads PIL images directly; numpy only added ~40 MB to the build.
+                image = Image.frombytes("RGB", shot.size, shot.rgb)
                 batch = self._decode_image(image)
                 unreadable = unreadable or batch.unreadable_qr
                 for text in batch.decoded:
@@ -110,8 +112,8 @@ class ScreenScanner:
         return ScanBatch(tuple(results), unreadable)
 
     def decode_png(self, png: bytes) -> ScanBatch:
-        import numpy as np
         from PIL import Image
 
-        image = np.asarray(Image.open(io.BytesIO(png)).convert("RGB"))
+        # Grayscale is all the decoder uses, and a third of the pixels to copy.
+        image = Image.open(io.BytesIO(png)).convert("L")
         return self._decode_image(image)

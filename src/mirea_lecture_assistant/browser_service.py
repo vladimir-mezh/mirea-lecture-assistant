@@ -9,12 +9,11 @@ import socket
 import subprocess
 import sys
 import time
-import urllib.error
-import urllib.request
 from pathlib import Path
 from urllib.parse import urlparse
 
 from .async_runtime import run_async
+from .cdp import Browser, CdpError, CdpTimeout, endpoint_alive
 from .moodle import looks_like_login_page
 
 log = logging.getLogger(__name__)
@@ -46,6 +45,21 @@ selector => {
 
 class NotSignedInError(RuntimeError):
     """The page came back as a sign-in form instead of content."""
+
+
+# Controls that can take a visitor from a lobby into the room.
+ENTRY_CONTROLS = "button, a, [role='button'], input[type='submit'], input[type='button']"
+NAME_FIELDS = "input[type='text'], input:not([type])"
+CHAT_EDITORS = "textarea, input, [contenteditable='true']"
+CHAT_BUTTONS = "button, [role='button']"
+CHAT_PLACEHOLDER_RE = re.compile(r"введите сообщение", re.IGNORECASE)
+# Chrome throttles and stops painting background, minimised or covered windows;
+# the lecture is captured exactly while it is in the background.
+BACKGROUND_FLAGS = (
+    "--disable-background-timer-throttling",
+    "--disable-backgrounding-occluded-windows",
+    "--disable-renderer-backgrounding",
+)
 
 
 class BrowserService:
@@ -91,8 +105,7 @@ class BrowserService:
         # 520x360 window screenshots at ~504x265, where a QR in the stream is
         # far too small to decode.
         self.capture_size: tuple[int, int] | None = (1920, 1080)
-        self._playwright = None
-        self._browser = None
+        self._browser: Browser | None = None
         self._connect_lock: asyncio.Lock | None = None
         self._connect_lock_loop = None
         # (page, size, CDP session) of the viewport override currently in force.
@@ -182,11 +195,7 @@ class BrowserService:
 
     @staticmethod
     def _cdp_available(port: int) -> bool:
-        try:
-            with urllib.request.urlopen(f"http://127.0.0.1:{port}/json/version", timeout=0.3):
-                return True
-        except (OSError, urllib.error.URLError):
-            return False
+        return endpoint_alive(port)
 
     def ensure_running(self) -> str | None:
         """Start the profile's browser on a blank tab, leaving any lecture alone."""
@@ -235,6 +244,7 @@ class BrowserService:
                 "--window-position=20,20",
                 "--no-first-run",
                 "--no-default-browser-check",
+                *BACKGROUND_FLAGS,
             ]
             if muted:
                 args.append("--mute-audio")
@@ -305,7 +315,7 @@ class BrowserService:
         if room_key is not None:
             matching = [
                 candidate
-                for candidate in page.context.pages
+                for candidate in (await self._connected_browser()).pages
                 if not candidate.is_closed() and self._room_key(candidate.url) == room_key
             ]
             if matching:
@@ -313,7 +323,7 @@ class BrowserService:
                 if force_navigation:
                     # Reload the actual webinar instead of reopening its /j/
                     # invitation, which makes MTS Link spawn another tab.
-                    await existing.reload(wait_until="domcontentloaded", timeout=15_000)
+                    await existing.reload(timeout=15_000)
                     log.info("lecture_tab_reloaded room=%s", room_key[1])
                 else:
                     log.info("lecture_tab_reused room=%s", room_key[1])
@@ -367,20 +377,18 @@ class BrowserService:
             return "lost"
 
     async def _lecture_state_async(self) -> str:
-        from playwright.async_api import Error as PlaywrightError
-
         page = await self._active_page()
         if page.is_closed() or not self._matches_lecture_url(page.url):
             return "lost"
         try:
             text = await page.evaluate(VISIBLE_TEXT_WITHOUT_CHAT, CHAT_SELECTOR)
-        except PlaywrightError:  # a transient DOM update is not proof that the tab died
+        except CdpError:  # a transient DOM update is not proof that the tab died
             return "live"
         state = self.room_state_from_text(text)
         if state is not None:
             return state
-        control, label = await self._entry_control(page)
-        if control is not None:
+        index, label = await self._entry_control(page)
+        if index is not None:
             log.info("lecture_entry_pending label=%s", label)
             return "waiting"
         return "live"
@@ -413,21 +421,14 @@ class BrowserService:
             and not cls.DEVICE_RE.search(label)
         )
 
-    async def _entry_control(self, page):
+    async def _entry_control(self, page) -> tuple[int | None, str]:
         """Find the visible control that takes this page from the lobby into the room."""
-        for handle in await page.query_selector_all(
-            "button, a, [role='button'], input[type='submit'], input[type='button']"
-        ):
-            try:
-                if not await handle.is_visible():
-                    continue
-                label = (await handle.inner_text()) or (await handle.get_attribute("value")) or ""
-            except Exception:  # the lobby re-renders while being read
-                log.debug("entry_control_unreadable", exc_info=True)
+        for element in await page.elements(ENTRY_CONTROLS):
+            if not element["visible"]:
                 continue
-            label = label.strip()
+            label = (element["text"] or element["value"]).strip()
             if self.is_entry_label(label):
-                return handle, label[:60]
+                return element["index"], label[:60]
         return None, ""
 
     def join_lecture(self, display_name: str = "") -> str:
@@ -441,42 +442,39 @@ class BrowserService:
             # Clicking unknown controls on an unknown page is never worth the risk.
             log.info("lecture_join_skipped host=%s", host or "unknown")
             return "refused"
-        control, label = await self._entry_control(page)
-        if control is None:
+        index, label = await self._entry_control(page)
+        if index is None:
             return "already"
         if display_name:
             await self._fill_display_name(page, display_name)
-        await control.click()
+        await page.click(ENTRY_CONTROLS, index=index)
         log.info("lecture_join_clicked label=%s", label)
         await page.wait_for_timeout(2_000)
         return "joined"
 
     async def _fill_display_name(self, page, display_name: str) -> None:
         """Lobbies ask who is entering; an empty field keeps the button disabled."""
-        for handle in await page.query_selector_all("input[type='text'], input:not([type])"):
+        for element in await page.elements(NAME_FIELDS):
+            if not element["visible"] or element["value"]:
+                continue
             try:
-                if not await handle.is_visible() or await handle.input_value():
-                    continue
-                await handle.fill(display_name)
-            except Exception:  # a read-only or decorative field is fine to skip
+                await page.fill(NAME_FIELDS, display_name, index=element["index"])
+            except CdpError:  # a read-only or decorative field is fine to skip
                 log.debug("entry_name_field_skipped", exc_info=True)
                 continue
-            else:
-                log.info("lecture_join_name_filled")
-                return
+            log.info("lecture_join_name_filled")
+            return
 
-    async def _connected_browser(self):
+    async def _connected_browser(self) -> Browser:
         """One CDP connection for the whole session, reconnected only when it breaks.
 
-        Starting a Playwright driver costs about 270 ms, and the scanner asks for
-        a frame every couple of seconds: reconnecting each time spawned and killed
-        a driver process thousands of times per lecture, which is what made frame
-        captures time out.
+        The scanner asks for a frame every couple of seconds; connecting anew for
+        each one cost more than the capture itself and made frames time out.
         """
         if self._browser is not None and self._browser.is_connected():
             return self._browser
         # Scan, health check and join may all find the connection broken at once;
-        # without the lock each started its own driver and all but one leaked.
+        # without the lock each opened its own connection and all but one leaked.
         async with self._lock():
             if self._browser is not None and self._browser.is_connected():
                 return self._browser
@@ -484,16 +482,7 @@ class BrowserService:
             # The liveness probe is blocking HTTP; keep it off the shared loop.
             if not await asyncio.to_thread(lambda: self.is_running):
                 raise RuntimeError("Браузер приложения не запущен")
-            from playwright.async_api import async_playwright
-
-            self._playwright = await async_playwright().start()
-            try:
-                self._browser = await self._playwright.chromium.connect_over_cdp(
-                    f"http://127.0.0.1:{self.port}", timeout=3_500
-                )
-            except Exception:
-                await self._release_connection()
-                raise
+            self._browser = await Browser.connect(self.port)
             log.info("cdp_connected port=%s", self.port)
             return self._browser
 
@@ -507,13 +496,13 @@ class BrowserService:
 
     async def _release_connection(self) -> None:
         """Drop the cached connection without closing the browser it controls."""
-        playwright, self._playwright, self._browser = self._playwright, None, None
+        browser, self._browser = self._browser, None
         self._capture_override = None
-        if playwright is None:
+        if browser is None:
             return
         try:
-            await playwright.stop()
-        except Exception:  # a driver that already died needs no goodbye
+            await browser.disconnect()
+        except Exception:  # a connection that already died needs no goodbye
             log.debug("cdp_release_failed", exc_info=True)
 
     def disconnect(self) -> None:
@@ -521,8 +510,8 @@ class BrowserService:
         run_async(self._release_connection())
 
     async def _active_page(self):
-        context = (await self._connected_browser()).contexts[0]
-        return self._pick_lecture_page(context.pages) or await context.new_page()
+        browser = await self._connected_browser()
+        return self._pick_lecture_page(browser.pages) or await browser.new_page()
 
     def read_html(self, url: str, *, timeout_ms: int = 20_000) -> str:
         """Read a page in a background tab of the same profile, then close it.
@@ -547,31 +536,29 @@ class BrowserService:
 
     async def _run_on_new_page(self, action):
         browser = await self._connected_browser()
-        page = await browser.contexts[0].new_page()
+        page = await browser.new_page()
         try:
             return await action(page)
         finally:
             await page.close()
 
     async def _read_html_async(self, url: str, timeout_ms: int) -> str:
-        from playwright.async_api import TimeoutError as PlaywrightTimeoutError
-
         log.info("page_read_requested host=%s", urlparse(url).hostname or "unknown")
         browser = await self._connected_browser()
-        page = await browser.contexts[0].new_page()
+        page = await browser.new_page()
         try:
             await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
             try:
                 # Moodle renders course lists and webinar tables after load,
                 # so the document alone is not yet the content we came for.
-                await page.wait_for_load_state("networkidle", timeout=8_000)
-            except PlaywrightTimeoutError:
+                await page.wait_for_network_idle(timeout=8_000)
+            except CdpTimeout:
                 log.debug("page_read_busy host=%s", urlparse(url).hostname)
             if "/mod/webinars/" in url:
                 try:
                     # The table is filled in by a script after the document loads.
                     await page.wait_for_selector("#wb2-table table.data tbody tr", timeout=5_000)
-                except PlaywrightTimeoutError:  # a page with no webinars grows no rows
+                except CdpTimeout:  # a page with no webinars grows no rows
                     log.debug("page_read_no_table host=%s", urlparse(url).hostname)
             return await self._settled_content(page)
         finally:
@@ -587,34 +574,28 @@ class BrowserService:
 
         The emulated viewport also makes the platform request a higher quality
         stream, so the picture gains real detail instead of being upscaled.
-        The override is set once per tab and its CDP session is kept: sending it
-        with every frame re-laid out the page each time, and a detached session
-        may take its override with it.
+        The override is set once per tab, on the tab's own DevTools session, which
+        stays attached: sending it with every frame re-laid out the page each time.
         """
         current = self._capture_override
         if current is not None:
-            applied_page, applied_size, session = current
+            applied_page, applied_size = current
             if applied_page is page and applied_size == self.capture_size and not page.is_closed():
                 return
             self._capture_override = None
-            try:
-                await session.send("Emulation.clearDeviceMetricsOverride", {})
-                await session.detach()
-            except Exception:  # the old tab may be gone together with its session
-                log.debug("capture_override_release_failed", exc_info=True)
+            if not applied_page.is_closed():
+                try:
+                    await applied_page.send("Emulation.clearDeviceMetricsOverride", {})
+                except Exception:  # the old tab may be going away right now
+                    log.debug("capture_override_release_failed", exc_info=True)
         if not self.capture_size:
             return
         width, height = self.capture_size
-        session = await page.context.new_cdp_session(page)
-        try:
-            await session.send(
-                "Emulation.setDeviceMetricsOverride",
-                {"width": width, "height": height, "deviceScaleFactor": 1, "mobile": False},
-            )
-        except Exception:
-            await session.detach()
-            raise
-        self._capture_override = (page, self.capture_size, session)
+        await page.send(
+            "Emulation.setDeviceMetricsOverride",
+            {"width": width, "height": height, "deviceScaleFactor": 1, "mobile": False},
+        )
+        self._capture_override = (page, self.capture_size)
 
     async def capture_page_state(self) -> tuple[bytes, str]:
         """Capture pixels plus currently visible page text for chat signal detection."""
@@ -622,9 +603,9 @@ class BrowserService:
         await self._apply_capture_size(page)
         # A 1920x1080 frame of a live lecture needs more than the 3.5s that
         # used to be allowed here: on 24.09 that budget lost 370 frames of 526.
-        png = await page.screenshot(type="png", animations="disabled", timeout=CAPTURE_TIMEOUT_MS)
+        png = await page.screenshot(timeout=CAPTURE_TIMEOUT_MS)
         try:
-            visible_text = await page.locator("body").inner_text(timeout=1_000)
+            visible_text = await page.inner_text("body", timeout=1_000)
         except Exception:  # noqa: BLE001 - text observation must not break QR capture
             visible_text = ""
         return png, visible_text
@@ -642,16 +623,16 @@ class BrowserService:
         if not await asyncio.to_thread(lambda: self.is_running):
             return False
         browser = await self._connected_browser()
-        return await self._close_lecture_page(browser.contexts[0])
+        return await self._close_lecture_page(browser)
 
-    async def _close_lecture_page(self, context) -> bool:
-        page = self._pick_lecture_page(context.pages)
+    async def _close_lecture_page(self, browser) -> bool:
+        page = self._pick_lecture_page(browser.pages)
         if page is None:
             return False
-        if len(context.pages) == 1:
+        if len(browser.pages) == 1:
             # Closing the last tab would close the browser, and the СДО session
             # this profile holds would have to be established again.
-            await context.new_page()
+            await browser.new_page()
         await page.close()
         self.lecture_url = None
         log.info("lecture_tab_closed")
@@ -670,34 +651,26 @@ class BrowserService:
         if host != "mts-link.ru" and not host.endswith(".mts-link.ru"):
             raise RuntimeError("Автоматическая отправка чата поддерживается только для MTS Link")
 
-        visible_editor = await self._visible_chat_editor(page)
-        if visible_editor is None:
+        editor = await self._visible_chat_editor(page)
+        if editor is None:
             # The «Чат» button toggles the pane: pressing it while the chat is
             # already open used to close it and the message could not be typed.
-            chat_buttons = page.get_by_role(
-                "button", name=re.compile(r"^\s*чат\s*$|открыть\s+чат", re.IGNORECASE)
-            )
-            if not await chat_buttons.count():
-                chat_buttons = page.get_by_role("button", name=re.compile(r"чат", re.IGNORECASE))
-            for index in range(await chat_buttons.count()):
-                button = chat_buttons.nth(index)
-                if await button.is_visible():
-                    await button.click()
-                    break
+            button = await self._chat_button(page)
+            if button is not None:
+                await page.click(CHAT_BUTTONS, index=button)
             for _ in range(6):
-                visible_editor = await self._visible_chat_editor(page)
-                if visible_editor is not None:
+                editor = await self._visible_chat_editor(page)
+                if editor is not None:
                     break
                 await page.wait_for_timeout(250)
-        if visible_editor is None:
+        if editor is None:
             raise RuntimeError("MTS Link не показал поле «Введите сообщение»")
-        delivered = page.get_by_text(message, exact=True)
-        before = await delivered.count()
-        await visible_editor.fill(message)
-        await visible_editor.press("Enter")
+        before = await page.count_text(message)
+        await page.fill(CHAT_EDITORS, message, index=editor)
+        await page.press_enter()
         for _ in range(10):
             await page.wait_for_timeout(500)
-            if await delivered.count() > before:
+            if await page.count_text(message) > before:
                 log.info("chat_delivery_confirmed")
                 return
         raise RuntimeError(
@@ -705,21 +678,26 @@ class BrowserService:
         )
 
     @staticmethod
-    async def _visible_chat_editor(page):
-        editor = page.get_by_placeholder(re.compile(r"введите сообщение", re.IGNORECASE))
-        for index in range(await editor.count()):
-            candidate = editor.nth(index)
-            if await candidate.is_visible():
-                return candidate
-        fallback = page.locator(
-            'textarea[placeholder*="Введите сообщение"], '
-            'input[placeholder*="Введите сообщение"], '
-            '[contenteditable="true"][data-placeholder*="Введите сообщение"]'
-        )
-        for index in range(await fallback.count()):
-            candidate = fallback.nth(index)
-            if await candidate.is_visible():
-                return candidate
+    async def _visible_chat_editor(page) -> int | None:
+        for element in await page.elements(CHAT_EDITORS):
+            if element["visible"] and CHAT_PLACEHOLDER_RE.search(element["placeholder"]):
+                return element["index"]
+        return None
+
+    @staticmethod
+    async def _chat_button(page) -> int | None:
+        """The button that opens the chat, preferring one named exactly «Чат»."""
+        exact = re.compile(r"^\s*чат\s*$|открыть\s+чат", re.IGNORECASE)
+        loose = re.compile(r"чат", re.IGNORECASE)
+        buttons = [
+            (element["index"], element["label"] or element["text"])
+            for element in await page.elements(CHAT_BUTTONS)
+            if element["visible"]
+        ]
+        for pattern in (exact, loose):
+            for index, name in buttons:
+                if pattern.search(name):
+                    return index
         return None
 
     def close(self) -> None:
@@ -736,8 +714,9 @@ class BrowserService:
     async def _close_async(self) -> None:
 
         browser = await self._connected_browser()
-        await browser.close()
-        await self._release_connection()
+        self._browser = None
+        self._capture_override = None
+        await browser.close_browser()
 
     def minimize(self) -> bool:
         """Minimize the controlled lecture window. Native implementation is Windows-first."""
@@ -765,12 +744,10 @@ class BrowserService:
         An SSO bounce makes `page.content()` fail outright rather than return the
         old document, so the read is repeated until the navigation settles.
         """
-        from playwright.async_api import Error as PlaywrightError
-
         for attempt in range(attempts):
             try:
                 return await page.content()
-            except PlaywrightError:
+            except CdpError:
                 if attempt == attempts - 1:
                     raise
                 log.debug("page_content_retry attempt=%s", attempt + 1)
