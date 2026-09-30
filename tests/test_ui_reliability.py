@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 
@@ -27,6 +28,7 @@ def window(tmp_path, monkeypatch):
     instance = MainWindow(Database(tmp_path / "assistant.sqlite3"))
     instance.schedule_timer.stop()
     instance.lecture_watch_timer.stop()
+    instance.lesson_timer.stop()
     yield instance
     instance.force_exit = True
     instance.close()
@@ -340,8 +342,10 @@ def test_a_rejected_token_is_not_resent(window, monkeypatch):
 
     assert scheduled == []
     assert event_id not in window.pending_qr
-    assert window.db.recent_qr_events()[0].status == "failed"
+    assert window.db.recent_qr_events()[0].status == "rejected"
     assert window.attendance_failures_by_lesson["lesson"] == 1
+    # The same code still on screen is not submitted again with the next frame.
+    assert window.deduplicator.is_duplicate("fingerprint")
 
 
 def test_only_one_retry_timer_runs_per_event(window, monkeypatch):
@@ -807,7 +811,7 @@ def test_an_authenticator_code_is_asked_for_instead_of_waiting_for_email(window,
     monkeypatch.setattr(window, "_manual_2fa", lambda challenge, reason="": asked.append(reason))
     monkeypatch.setattr(window, "_run", lambda *args, **kwargs: waited.append(args))
 
-    challenge = SimpleNamespace(kind="otp", field_name="otp")
+    challenge = SimpleNamespace(kind="otp", field_name="otp", hidden_fields={})
     window._login_finished(SimpleNamespace(challenge=challenge, success=False, message=""))
 
     assert waited == [] and len(asked) == 1
@@ -863,3 +867,555 @@ def test_both_themes_define_every_colour_the_stylesheet_uses():
     for name, tokens in THEMES.items():
         STYLE.substitute(tokens)  # raises KeyError on a missing token
         assert tokens.keys() == THEMES["light"].keys(), name
+
+
+@pytest.mark.parametrize(
+    ("challenge", "uses_email"),
+    [
+        (SimpleNamespace(kind="email_code", field_name="emailCode", hidden_fields={}), True),
+        # pymirea's classic-form fallback labels an email form "otp" too.
+        (SimpleNamespace(kind="otp", field_name="otp", hidden_fields={"session_code": "x"}), True),
+        (SimpleNamespace(kind="otp", field_name="otp", hidden_fields={}), False),  # authenticator
+        (SimpleNamespace(kind="otp", field_name="code", hidden_fields={"login": "true"}), False),
+    ],
+)
+def test_the_email_wait_is_skipped_only_for_known_non_email_codes(window, challenge, uses_email):
+    assert window._challenge_uses_email(challenge) is uses_email
+
+
+def test_tokens_renewed_during_a_schedule_refresh_are_saved_once(window, monkeypatch):
+    """Unsaved renewals made the next start use spent tokens: a new login and code."""
+    saved = []
+    monkeypatch.setattr(window.session_store, "save", lambda session: saved.append(dict(session)))
+    window.mirea.session = {"access_token": "old"}
+    window.persisted_session = window._session_fingerprint({"access_token": "old"})
+
+    window._schedule_loaded([])
+    assert saved == []  # nothing changed, nothing written
+
+    window.mirea.session["access_token"] = "renewed"
+    window._schedule_loaded([])
+    window._schedule_loaded([])
+    assert saved == [{"access_token": "renewed"}]
+
+
+def test_an_inconclusive_session_check_still_loads_the_schedule(window, monkeypatch):
+    window.mirea.session = {"cookie": "kept"}
+    started = []
+    monkeypatch.setattr(window, "_refresh_schedule_background", lambda: started.append(True))
+    monkeypatch.setattr("mirea_lecture_assistant.ui.QTimer.singleShot", lambda *_args: None)
+
+    window._session_verified(SessionState.UNKNOWN)
+
+    assert started == [True]
+    assert window.mirea.session == {"cookie": "kept"}
+
+
+def test_a_second_launch_brings_the_hidden_window_back(window):
+    from mirea_lecture_assistant import __version__
+
+    window.hide()
+    window.show_request.write_text(__version__, encoding="ascii")
+
+    window._check_show_request()
+
+    assert window.isVisible()
+    assert not window.show_request.exists()
+    assert window.show_response.read_text(encoding="ascii") == "shown"
+
+
+def test_a_newer_version_launched_over_this_one_takes_its_place(window, monkeypatch):
+    handed = []
+    monkeypatch.setattr(window, "_hand_over", lambda: handed.append(True))
+    window.show_request.write_text("99.0.0", encoding="ascii")
+
+    window._check_show_request()
+
+    assert handed == [True]
+    assert window.show_response.read_text(encoding="ascii") == "handover"
+
+
+def test_a_second_launch_learns_what_the_running_copy_did(tmp_path):
+    import threading
+
+    from mirea_lecture_assistant.app import ask_running_copy_to_show
+    from mirea_lecture_assistant.paths import SHOW_REQUEST_FILE, SHOW_RESPONSE_FILE
+
+    # Nobody picks the request up: an older version or a hung copy.
+    assert ask_running_copy_to_show(tmp_path, wait_seconds=0.3) is None
+    assert not (tmp_path / SHOW_REQUEST_FILE).exists()
+
+    def running_copy(answer):
+        request = tmp_path / SHOW_REQUEST_FILE
+        for _ in range(100):
+            if request.exists():
+                (tmp_path / SHOW_RESPONSE_FILE).write_text(answer, encoding="ascii")
+                request.unlink()
+                return
+            threading.Event().wait(0.02)
+
+    for answer in ("shown", "handover"):
+        responder = threading.Thread(target=running_copy, args=(answer,))
+        responder.start()
+        assert ask_running_copy_to_show(tmp_path, wait_seconds=3) == answer
+        responder.join()
+
+
+class _Lock:
+    def __init__(self, pid, frees_after):
+        self.pid, self.tries, self.frees_after = pid, 0, frees_after
+
+    def getLockInfo(self):
+        return (self.pid, "host", "MireaLectureAssistant.exe")
+
+    def tryLock(self, _timeout):
+        self.tries += 1
+        return self.tries >= self.frees_after
+
+
+def test_an_old_copy_in_the_tray_is_ended_when_the_student_agrees(monkeypatch):
+    import logging
+
+    from mirea_lecture_assistant import app
+
+    killed = []
+    monkeypatch.setattr(app.os, "kill", lambda pid, sig: killed.append(pid))
+    lock = _Lock(pid=4242, frees_after=3)
+
+    assert app.replace_running_copy(lock, logging.getLogger("t"), lambda _text: True) is True
+    assert killed == [4242]
+
+
+def test_an_old_copy_is_left_alone_without_consent(monkeypatch):
+    import logging
+
+    from mirea_lecture_assistant import app
+
+    killed = []
+    monkeypatch.setattr(app.os, "kill", lambda pid, sig: killed.append(pid))
+
+    assert (
+        app.replace_running_copy(_Lock(4242, 1), logging.getLogger("t"), lambda _t: False) is False
+    )
+    assert killed == []
+
+
+def test_quitting_does_not_wait_forever_for_a_worker_blocked_on_the_loop():
+    """Workers waiting in run_async kept the process alive after «Выход»."""
+    import asyncio
+    import threading
+
+    from mirea_lecture_assistant.async_runtime import AsyncRuntime
+
+    runtime = AsyncRuntime()
+    outcome = []
+
+    def worker():
+        try:
+            runtime.run(asyncio.sleep(3600))
+        except BaseException as exc:  # noqa: BLE001 - the outcome is what is checked
+            outcome.append(type(exc).__name__)
+
+    thread = threading.Thread(target=worker)
+    thread.start()
+    threading.Event().wait(0.3)
+    started = time.monotonic()
+
+    runtime.shutdown()
+    thread.join(5)
+
+    assert outcome == ["CancelledError"]
+    assert time.monotonic() - started < 5
+
+
+def test_database_connections_are_reused_by_qt_pool_threads(tmp_path):
+    from PySide6.QtCore import QRunnable, QThreadPool
+
+    db = Database(tmp_path / "pool.sqlite3")
+
+    class Task(QRunnable):
+        def run(self):
+            db.get_setting("theme", "system")
+
+    pool = QThreadPool()
+    pool.setMaxThreadCount(2)
+    for _ in range(40):
+        pool.start(Task())
+    pool.waitForDone(10_000)
+
+    assert len(db._connections) <= 3  # this thread and at most two pool threads
+    db.close()
+
+
+def test_a_verdict_about_a_replaced_session_is_dropped(window, monkeypatch):
+    """A slow check of the old session must not throw away the one just signed in."""
+    old = {"cookie": "old"}
+    window.mirea.session = {"cookie": "new"}
+    logins = []
+    monkeypatch.setattr(window, "_auto_login", lambda: logins.append(True))
+
+    window._session_verified(SessionState.EXPIRED, old)
+
+    assert window.mirea.session == {"cookie": "new"}
+    assert logins == []
+
+
+def test_a_recovery_verdict_about_a_replaced_session_is_dropped(window, monkeypatch):
+    window.mirea.session = {"cookie": "old"}
+    pending = []
+    monkeypatch.setattr(
+        window, "_run", lambda _function, done, _busy, failed=None: pending.append(done)
+    )
+    logins = []
+    monkeypatch.setattr(window, "_auto_login", lambda: logins.append(True))
+
+    window._recover_expired_session("schedule_refresh")
+    window.mirea.session = {"cookie": "new"}  # the student signed in meanwhile
+    pending[0](SessionState.EXPIRED)
+
+    assert window.mirea.session == {"cookie": "new"}
+    assert logins == [] and not window.auth_recovery_running
+
+
+def test_a_session_issued_minutes_ago_is_not_logged_in_again(window, monkeypatch):
+    """Pulse refusing a brand-new session would otherwise mean a code every few minutes."""
+    window.mirea.session = {"cookie": "fresh"}
+    window.session_obtained_at = time.monotonic()
+    checks = []
+    monkeypatch.setattr(window, "_run", lambda *args, **kwargs: checks.append(args))
+
+    window._recover_expired_session("schedule_refresh")
+
+    assert checks == []
+
+
+def _failed_automatic_login(window, monkeypatch, message, *, code_sent=False):
+    from mirea_lecture_assistant import ui
+
+    timers, problems, modals = [], [], []
+    monkeypatch.setattr(ui.QTimer, "singleShot", lambda delay, callback: timers.append(delay))
+    monkeypatch.setattr(window, "_background_problem", lambda title, text: problems.append(title))
+    monkeypatch.setattr(window, "_operation_failed", lambda text: modals.append(text))
+    window.automatic_login_cycle = True
+    window.otp_submission_attempted = code_sent
+    window._login_finished(SimpleNamespace(challenge=None, success=False, message=message))
+    return timers, problems, modals
+
+
+def test_an_automatic_login_that_met_a_silent_server_is_tried_again_later(window, monkeypatch):
+    timers, problems, modals = _failed_automatic_login(
+        window, monkeypatch, "Сервер МИРЭА не отвечает"
+    )
+
+    assert timers == [2 * 60_000] and window.login_retry_scheduled
+    assert problems == [] and modals == []
+
+
+def test_a_wrong_password_or_a_refused_code_is_never_retried_on_its_own(window, monkeypatch):
+    timers, problems, modals = _failed_automatic_login(
+        window, monkeypatch, "Неверный логин или пароль"
+    )
+    assert timers == [] and problems == ["Автовход не удался"] and modals == []
+
+    timers, problems, modals = _failed_automatic_login(
+        window, monkeypatch, "Сервер МИРЭА не отвечает", code_sent=True
+    )
+    assert timers == [] and problems == ["Автовход не удался"] and modals == []
+
+
+def test_automatic_login_retries_are_limited(window, monkeypatch):
+    window.login_retry_attempt = 3
+    timers, problems, _modals = _failed_automatic_login(
+        window, monkeypatch, "Сервер МИРЭА не отвечает"
+    )
+
+    assert timers == [] and problems == ["Автовход не удался"]
+
+
+def test_codes_count_from_the_moment_a_deferred_login_really_starts(window, monkeypatch):
+    from mirea_lecture_assistant import ui
+
+    monkeypatch.setattr(window, "_run", lambda *args, **kwargs: None)
+    monkeypatch.setattr(ui.QTimer, "singleShot", lambda *_args: None)
+    window.login_started_at = datetime(2020, 1, 1, tzinfo=ui.UTC)
+
+    window._run_initial_login("user", "password", "Вход…")
+
+    assert window.login_started_at > datetime.now(ui.UTC) - timedelta(seconds=5)
+
+
+def test_a_lookup_waiting_for_a_deferred_sdo_sign_in_does_not_back_off(window, monkeypatch):
+    import threading
+
+    started, release = threading.Event(), threading.Event()
+    results = {}
+
+    def holder():
+        started.set()
+        release.wait(5)
+        return False  # deferred: a Pulse login held the mailbox
+
+    monkeypatch.setattr(window, "_sign_in_to_sdo_locked", holder)
+    first = threading.Thread(target=lambda: results.setdefault("holder", window._sign_in_to_sdo()))
+    first.start()
+    started.wait(5)
+    second = threading.Thread(target=lambda: results.setdefault("waiter", window._sign_in_to_sdo()))
+    second.start()
+    release.set()
+    first.join(5)
+    second.join(5)
+
+    assert results == {"holder": False, "waiter": False}
+    assert window.sdo_sign_in_failed_at is None
+
+
+def test_pairs_open_from_the_cached_schedule_without_a_pulse_session(window, monkeypatch):
+    """With the session being renewed (or Pulse down) nothing used to open at all."""
+    lesson = _running_lesson("cached")
+    today = datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
+    window.db.sync_lessons([lesson], today)
+    window.db.set_rule(lesson.subject_name, RuleMode.AUTO)
+    window.db.set_resolved_link("cached", "https://my.mts-link.ru/j/cached")
+    window.mirea.session = {}
+    opened = []
+    monkeypatch.setattr(window, "_open_lecture", lambda url, lesson_id: opened.append(lesson_id))
+
+    window._evaluate_cached_lessons()
+
+    assert opened == ["cached"]
+    assert window.lesson_timer.interval() == 15_000
+
+
+def test_lookup_pauses_count_from_the_start_of_the_lookup(window):
+    lesson = _running_lesson("paced")
+    started = time.monotonic() - 50  # a slow СДО: the lookup took 50 seconds
+
+    window._source_resolved(lesson, None, [], started=started)
+
+    assert window.lookup_not_before["paced"] == pytest.approx(started + 120, abs=0.01)
+
+
+def test_the_next_pair_waits_while_the_earlier_one_looks_for_a_new_room(window):
+    """A's room closed 18 minutes before its end: B (lead 30) must not take the tab."""
+    now = datetime.now().astimezone()
+    a = _pair("A", now - timedelta(minutes=72), subject="Физика")
+    b = _pair("B", now + timedelta(minutes=28), subject="Химия")
+    window.join_before.setValue(30)
+    window.db.sync_lessons([a, b], now.replace(hour=0, minute=0, second=0, microsecond=0))
+    window.room_lost_lessons.add("A")
+
+    assert window._may_open("https://my.mts-link.ru/j/b", "B") is False
+
+    window.room_lost_lessons.discard("A")
+    assert window._may_open("https://my.mts-link.ru/j/b", "B") is True
+
+
+def _opened_by_hand(window, monkeypatch, lesson):
+    today = datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
+    window.db.sync_lessons([lesson], today)
+    monkeypatch.setattr(window, "_enter_lecture_room", lambda: None)
+    monkeypatch.setattr(window, "toggle_scanner", lambda: None)
+    window.browser.lecture_url = "https://my.mts-link.ru/j/by-hand"
+    window._lecture_opened("Chrome", lesson.external_id, manual=True)
+
+
+def test_opening_a_future_pair_by_hand_does_not_book_codes_to_it(window, monkeypatch):
+    tomorrow = _pair("tomorrow", datetime.now().astimezone() + timedelta(days=1))
+
+    _opened_by_hand(window, monkeypatch, tomorrow)
+
+    assert window.active_lecture_id is None
+    assert "tomorrow" not in window.joined_lessons
+
+
+def test_opening_the_current_pair_by_hand_monitors_it(window, monkeypatch):
+    _opened_by_hand(window, monkeypatch, _running_lesson("now"))
+
+    assert window.active_lecture_id == "now"
+
+
+def test_a_room_the_student_typed_in_is_not_replaced_by_the_sdo(window, monkeypatch):
+    lesson = _running_lesson("typed")
+    today = datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
+    window.db.sync_lessons([lesson], today)
+    window._save_lesson_link("typed", "https://my.mts-link.ru/j/typed", shown="")
+    window.active_lecture_id = "typed"
+    window.active_lecture_url = "https://my.mts-link.ru/j/typed"
+    opened = []
+    monkeypatch.setattr(window, "_open_lecture", lambda *args, **kwargs: opened.append(args))
+
+    window._source_resolved(lesson, _webinar("https://my.mts-link.ru/j/other", 99), [])
+
+    assert opened == []
+    assert window.db.get_resolved_link("typed") == "https://my.mts-link.ru/j/typed"
+
+
+def test_focus_leaving_an_unchanged_link_field_saves_nothing(window):
+    window._save_lesson_link(
+        "x", "https://my.mts-link.ru/j/shown", shown="https://my.mts-link.ru/j/shown"
+    )
+
+    assert window.db.get_setting("manual_links", {}) == {}
+    assert window.db.get_resolved_link("x") in (None, "")
+
+
+def test_a_room_that_ended_behind_the_same_link_is_reloaded(window, monkeypatch):
+    lesson = _running_lesson("again")
+    url = "https://my.mts-link.ru/j/again"
+    window.room_lost_notified.add(("again", url))
+    navigations = []
+
+    class Browser:
+        lecture_url = url
+
+        def open(self, target, **kwargs):
+            navigations.append(kwargs["force_navigation"])
+            return "Chrome"
+
+    monkeypatch.setattr(window, "browser", Browser())
+    monkeypatch.setattr(window, "_may_open", lambda *_args: True)
+    monkeypatch.setattr(
+        window, "_run", lambda function, done, _busy, failed=None, **_kw: function()
+    )
+    today = datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
+    window.db.sync_lessons([lesson], today)
+
+    window._open_lecture(url, "again")
+
+    assert navigations == [True]
+
+
+def test_an_accepted_ask_pair_is_opened_again_after_a_failed_open(window, monkeypatch):
+    lesson = _running_lesson("asked")
+    today = datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
+    window.db.sync_lessons([lesson], today)
+    window.db.set_rule(lesson.subject_name, RuleMode.ASK)
+    window.db.set_resolved_link("asked", "https://my.mts-link.ru/j/asked")
+    window.prompted_lessons.add("asked")
+    window.accepted_lessons.add("asked")
+    opened = []
+    monkeypatch.setattr(window, "_open_lecture", lambda url, lesson_id: opened.append(lesson_id))
+
+    window._evaluate_current_lessons(window.db.list_lessons())
+
+    assert opened == ["asked"]
+
+
+def test_the_chat_fallback_is_spaced_and_capped(window, monkeypatch):
+    window.active_lecture_id = "chat"
+    window.student_name.setText("Иванов Иван")
+    window.group_edit.setText("ИКБО-01-24")
+    window.chat_fallback.setChecked(True)
+    monkeypatch.setattr(type(window.browser), "probably_running", property(lambda self: True))
+    sends = []
+    monkeypatch.setattr(
+        window,
+        "_run",
+        lambda _function, _done, _busy, failed=None, **_kw: (
+            sends.append(1),
+            failed("Чат не найден"),
+        ),
+    )
+    clock = [1000.0]
+    monkeypatch.setattr("mirea_lecture_assistant.ui.time.monotonic", lambda: clock[0])
+
+    for _ in range(5):
+        window._send_chat_fallback()
+    assert len(sends) == 1  # not once per frame
+
+    for _ in range(5):
+        clock[0] += 61
+        window._send_chat_fallback()
+    assert len(sends) == 3  # and never more than three times a pair
+
+
+def test_a_health_result_about_a_room_left_meanwhile_is_dropped(window, monkeypatch):
+    lesson = _running_lesson("health")
+    today = datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
+    window.db.sync_lessons([lesson], today)
+    window.active_lecture_id = "health"
+    window.active_lecture_url = "https://my.mts-link.ru/j/old"
+    pending = []
+    monkeypatch.setattr(
+        window, "_run", lambda _function, done, _busy, failed=None: pending.append(done)
+    )
+    ended = []
+    monkeypatch.setattr(window, "_room_ended", lambda lesson: ended.append(lesson))
+
+    window._lecture_watch_tick()
+    window.active_lecture_url = "https://my.mts-link.ru/j/new"  # switched meanwhile
+    pending[0]("ended")
+
+    assert ended == []
+
+
+def test_opening_the_next_pair_by_hand_minutes_early_monitors_it(window, monkeypatch):
+    soon = _pair("soon", datetime.now().astimezone() + timedelta(minutes=10))
+
+    _opened_by_hand(window, monkeypatch, soon)
+
+    assert window.active_lecture_id == "soon"
+
+
+def test_a_room_opened_by_hand_long_before_is_taken_over_without_a_question(window, monkeypatch):
+    lesson = _running_lesson("early")
+    today = datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
+    window.db.sync_lessons([lesson], today)
+    window.db.set_rule(lesson.subject_name, RuleMode.ASK)
+    window.db.set_resolved_link("early", "https://my.mts-link.ru/j/early")
+    window.browser.lecture_url = "https://my.mts-link.ru/j/early"
+    monkeypatch.setattr(window, "_enter_lecture_room", lambda: None)
+    monkeypatch.setattr(window, "toggle_scanner", lambda: None)
+    asked = []
+    monkeypatch.setattr(window, "_ask", lambda *args: asked.append(args) or False)
+
+    window._evaluate_current_lessons(window.db.list_lessons())
+
+    assert asked == []
+    assert window.active_lecture_id == "early"
+
+
+def test_clearing_a_typed_link_unpins_it(window):
+    window._save_lesson_link("wrong", "https://my.mts-link.ru/j/other-subgroup", shown="")
+    assert window.db.get_setting("manual_links", {}) == {
+        "wrong": "https://my.mts-link.ru/j/other-subgroup"
+    }
+
+    window._save_lesson_link("wrong", "", shown="https://my.mts-link.ru/j/other-subgroup")
+
+    assert "wrong" not in window.db.get_setting("manual_links", {})
+    assert not window.db.get_resolved_link("wrong")
+
+
+def test_a_handover_answer_survives_a_locked_response_file(tmp_path, monkeypatch):
+    """An antivirus holding the answer file turned "handover" into "shown", and both
+    copies quit."""
+    import pathlib
+    import threading
+
+    from mirea_lecture_assistant.app import ask_running_copy_to_show
+    from mirea_lecture_assistant.paths import SHOW_REQUEST_FILE, SHOW_RESPONSE_FILE
+
+    response = tmp_path / SHOW_RESPONSE_FILE
+    real_unlink = pathlib.Path.unlink
+
+    def unlink(self, missing_ok=False):
+        if self == response and self.exists():
+            raise PermissionError("[WinError 32] used by another process")
+        return real_unlink(self, missing_ok=missing_ok)
+
+    monkeypatch.setattr(pathlib.Path, "unlink", unlink)
+
+    def running_copy():
+        request = tmp_path / SHOW_REQUEST_FILE
+        for _ in range(100):
+            if request.exists():
+                response.write_text("handover", encoding="ascii")
+                real_unlink(request)
+                return
+            threading.Event().wait(0.02)
+
+    responder = threading.Thread(target=running_copy)
+    responder.start()
+    assert ask_running_copy_to_show(tmp_path, wait_seconds=3) == "handover"
+    responder.join()

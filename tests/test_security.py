@@ -51,6 +51,24 @@ def test_large_session_round_trips(tmp_path, fake_keyring):
     assert SessionStore(tmp_path).load() == BIG_SESSION
 
 
+def test_a_save_interrupted_half_way_keeps_the_previous_session(
+    tmp_path, fake_keyring, monkeypatch
+):
+    """Sessions are saved on every token renewal; a crash while writing must not
+    leave an unreadable file (and with it a new login and emailed code)."""
+    store = SessionStore(tmp_path)
+    store.save({"access_token": "first"})
+
+    def crash(*_args):
+        raise OSError("power cut")
+
+    monkeypatch.setattr(security.os, "replace", crash)
+    with pytest.raises(OSError):
+        store.save({"access_token": "second"})
+
+    assert SessionStore(tmp_path).load() == {"access_token": "first"}
+
+
 def test_session_is_not_written_in_plain_text(tmp_path, fake_keyring):
     store = SessionStore(tmp_path)
     store.save(BIG_SESSION)
@@ -134,11 +152,3 @@ def test_obsolete_pending_attendance_is_deleted(tmp_path, fake_keyring):
     store.discard_obsolete_pending_attendance()
 
     assert not stale.exists()
-
-
-def test_a_redirect_to_the_sso_sign_in_page_means_the_session_expired():
-    from mirea_lecture_assistant.domain import SessionState
-    from mirea_lecture_assistant.mirea_service import classify_session_response
-
-    url = "https://sso.mirea.ru/realms/mirea/protocol/openid-connect/auth?client_id=attendance-app"
-    assert classify_session_response(200, url) is SessionState.EXPIRED

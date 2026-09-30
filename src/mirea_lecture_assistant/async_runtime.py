@@ -61,11 +61,30 @@ class AsyncRuntime:
             self._loop = self._thread = None
         if loop is None or loop.is_closed():
             return
+        # Worker threads waiting on a coroutine would wait forever once the loop
+        # stops, and Qt waits for those threads: after «Выход» the process stayed
+        # alive, invisible, and kept the exe locked against an update.
+        try:
+            asyncio.run_coroutine_threadsafe(_cancel_pending(), loop).result(3)
+        except Exception:
+            log.warning("async_runtime_cancel_incomplete", exc_info=True)
         loop.call_soon_threadsafe(loop.stop)
         if thread is not None:
             thread.join(timeout=5)
+        if thread is not None and thread.is_alive():
+            # Still inside blocking work: closing a running loop raises at exit.
+            log.warning("async_runtime_still_busy")
+            return
         loop.close()
         log.info("async_runtime_stopped")
+
+
+async def _cancel_pending() -> None:
+    current = asyncio.current_task()
+    tasks = [task for task in asyncio.all_tasks() if task is not current]
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
 
 
 _runtime = AsyncRuntime()
