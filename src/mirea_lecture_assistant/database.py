@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import json
 import logging
 import os
@@ -93,7 +94,13 @@ class Database:
         for suffix in ("", "-wal", "-shm"):
             source = self.path.with_name(self.path.name + suffix)
             if source.exists():
-                os.replace(source, backup / source.name)
+                try:
+                    os.replace(source, backup / source.name)
+                except PermissionError:
+                    # Windows will not move a file a forgotten connection object
+                    # still holds; collecting it releases the handle.
+                    gc.collect()
+                    os.replace(source, backup / source.name)
         salvaged = self._salvage(backup / self.path.name)
         daily = sorted(self.backup_dir.glob("assistant-*.sqlite3"))
         if daily:

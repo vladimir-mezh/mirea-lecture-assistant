@@ -227,9 +227,10 @@ def test_a_damaged_file_keeps_every_readable_row(tmp_path):
     with db.connection() as conn:
         conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
     db.close()
-    with sqlite3.connect(path) as conn:
-        page_size = conn.execute("PRAGMA page_size").fetchone()[0]
-        pages = conn.execute("PRAGMA page_count").fetchone()[0]
+    conn = sqlite3.connect(path)  # "with" would commit but leave it open (and locked)
+    page_size = conn.execute("PRAGMA page_size").fetchone()[0]
+    pages = conn.execute("PRAGMA page_count").fetchone()[0]
+    conn.close()
     raw = bytearray(path.read_bytes())
     middle = (pages // 2) * page_size
     raw[middle : middle + page_size] = b"\xff" * page_size  # one destroyed page
