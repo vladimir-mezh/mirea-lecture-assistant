@@ -24,6 +24,13 @@ def window(tmp_path, monkeypatch):
     monkeypatch.setattr(SessionStore, "load", lambda _self: None)
     monkeypatch.setattr(SessionStore, "load_credentials", lambda _self: None)
     monkeypatch.setattr(SessionStore, "load_email_credentials", lambda _self: None)
+    # UI auth tests must never write/delete the real student's encrypted session
+    # or credentials, even when a new recovery branch invokes the store.
+    monkeypatch.setattr(SessionStore, "save", lambda _self, _session: None)
+    monkeypatch.setattr(SessionStore, "clear", lambda _self: None)
+    monkeypatch.setattr(SessionStore, "save_credentials", lambda _self, *_args: None)
+    monkeypatch.setattr(SessionStore, "clear_credentials", lambda _self: None)
+    monkeypatch.setattr(SessionStore, "clear_email_credentials", lambda _self: None)
     app = QApplication.instance() or QApplication([])
     instance = MainWindow(Database(tmp_path / "assistant.sqlite3"))
     instance.schedule_timer.stop()
@@ -897,6 +904,47 @@ def test_tokens_renewed_during_a_schedule_refresh_are_saved_once(window, monkeyp
     window._schedule_loaded([])
     window._schedule_loaded([])
     assert saved == [{"access_token": "renewed"}]
+
+
+def test_unconfirmed_login_waits_for_pulse_and_finishes_after_network_returns(window, monkeypatch):
+    window.mirea.session = {"KEYCLOAK_SESSION": "new"}
+    window.automatic_login_cycle = True
+    window.pending_login_credentials = ("user", "password")
+    window.remember_login_requested = True
+    calls = []
+    monkeypatch.setattr(window, "_refresh_schedule_background", lambda: calls.append("schedule"))
+    monkeypatch.setattr(window, "refresh_schedule", lambda: calls.append("refresh"))
+    monkeypatch.setattr(window, "_auto_login", lambda: calls.append("otp"))
+    result = SimpleNamespace(
+        challenge=None,
+        success=False,
+        session_pending=True,
+        cookies=dict(window.mirea.session),
+        message="unreachable",
+    )
+    window._login_finished(result)
+    assert window.pending_pulse_login is result
+    assert window.session_recheck_scheduled
+    assert "вход выполнен" not in window.auth_status.text().lower()
+    assert calls == ["schedule"]
+
+    window.mirea.session[".AspNetCore.Cookies"] = "working"
+    window._session_verified(SessionState.VALID)
+    assert result.success
+    assert window.pending_pulse_login is None
+    assert window.pending_login_credentials is None
+    assert not window.session_recheck_scheduled
+    assert calls == ["schedule", "refresh"]
+
+
+def test_expired_saved_session_is_cleared_before_recovery(window, monkeypatch):
+    window.mirea.session = {"KEYCLOAK_SESSION": "stale"}
+    calls = []
+    monkeypatch.setattr(window.session_store, "clear", lambda: calls.append("clear"))
+    monkeypatch.setattr(window, "_auto_login", lambda: calls.append("login"))
+    window._session_verified(SessionState.EXPIRED)
+    assert calls == ["clear", "login"]
+    assert window.mirea.session == {}
 
 
 def test_an_inconclusive_session_check_still_loads_the_schedule(window, monkeypatch):
