@@ -5,6 +5,7 @@ import logging
 import re
 import sys
 from datetime import datetime
+from urllib.parse import urlparse
 
 from .domain import Lesson, SessionState
 
@@ -91,12 +92,28 @@ def _with_reason(message: str) -> str:
     return f"{message} Причина: {reason}."
 
 
+def _is_sso_redirect_loop(failure: BaseException | None) -> bool:
+    """Only a loop inside MIREA's sign-in flow is evidence of failed auth."""
+    import httpx
+
+    if not isinstance(failure, httpx.TooManyRedirects):
+        return False
+    try:
+        url = urlparse(str(failure.request.url))
+    except RuntimeError:  # An upstream exception without the request is inconclusive.
+        return False
+    return url.hostname in {"sso.mirea.ru", "login.mirea.ru"} and (
+        "/login-actions/" in url.path or "/protocol/openid-connect/auth" in url.path
+    )
+
+
 class MireaService:
     """Small compatibility boundary around pymirea 0.3/0.4."""
 
     def __init__(self, session: dict | None = None):
         self.session = session or {}
         self._auth = None
+        self._expired_session = None
 
     @staticmethod
     def configure(session_key: str) -> None:
@@ -116,16 +133,39 @@ class MireaService:
                 log.debug("previous_auth_close_failed", exc_info=True)
         self._auth = MireaAuth()
         result = await self._auth.login(username, password)
-        if result.success and result.tokens:
-            self.session = result.tokens
+        if result.success:
+            self.session = result.tokens or {}
+            return await self._validate_completed_login(result)
         return result
 
     async def complete_2fa(self, challenge, code: str):
         if self._auth is None:
             raise RuntimeError("Сценарий входа уже завершён; начните вход заново")
         result = await self._auth.complete_2fa(challenge, code)
-        if result.success and result.tokens:
-            self.session = result.tokens
+        if result.success:
+            self.session = result.tokens or {}
+            return await self._validate_completed_login(result)
+        return result
+
+    async def _validate_completed_login(self, result):
+        """An accepted OTP is not yet an authenticated Pulse API session."""
+        state = await self.verify_state()
+        if state is SessionState.VALID:
+            result.cookies = dict(self.session)
+            return result
+        if state is SessionState.EXPIRED:
+            self.session = {}
+        # During an outage retain the new SSO session and recheck it without
+        # requesting another OTP. The UI completes this same login on success.
+        result.session_pending = state is SessionState.UNKNOWN
+        result.success = False
+        result.cookies = dict(self.session) or None
+        result.message = (
+            "Пульс пока не подтвердил вход; повторим проверку без нового кода."
+            if state is SessionState.UNKNOWN
+            else "Пульс не принял сессию после входа. Повторите вход в MIREA."
+        )
+        log.warning("completed_login_unconfirmed state=%s", state.value)
         return result
 
     async def verify(self) -> bool:
@@ -140,6 +180,8 @@ class MireaService:
         that a dead session passed as valid and was never renewed.
         """
         if not self.session:
+            return SessionState.EXPIRED
+        if self._expired_session is self.session:
             return SessionState.EXPIRED
         return await self.pulse_verdict()
 
@@ -183,6 +225,9 @@ class MireaService:
                 if raw is not None:
                     return SessionState.VALID
         except Exception as exc:  # noqa: BLE001 - trouble reaching Pulse is not a verdict
+            if _is_sso_redirect_loop(exc):
+                log.warning("session_verify_expired reason=sso_redirect_loop")
+                return SessionState.EXPIRED
             log.info(
                 "session_verify_unknown reason=api_exception kind=%s detail=%s",
                 type(exc).__name__,
@@ -202,6 +247,9 @@ class MireaService:
 
     @staticmethod
     def _verdict(message: str | None) -> SessionState:
+        if _is_sso_redirect_loop(_upstream_failure.get()):
+            log.warning("session_verify_expired reason=sso_redirect_loop")
+            return SessionState.EXPIRED
         if SESSION_EXPIRED_MESSAGE.search(message or ""):
             return SessionState.EXPIRED
         log.info("session_verify_unknown reason=api_error message=%s", _with_reason(message or ""))
@@ -212,12 +260,20 @@ class MireaService:
 
         _upstream_failure.set(None)
         api = MireaGrades(session_cookies=self.session)
+        session = self.session
         try:
             result = await api.get_schedule(days=days)
+            session.update(getattr(api, "session_cookies", {}))
         finally:
             await api.close()
         if not result.success:
             message = result.message or "Не удалось получить расписание"
+            if _is_sso_redirect_loop(_upstream_failure.get()):
+                # The circuit breaker may open after this failed bootstrap.
+                # Recovery must use the auth evidence already obtained rather
+                # than mistake the breaker's next refusal for a network outage.
+                self._expired_session = session
+                raise RuntimeError("Сессия Пульса истекла: вход зациклился на переадресациях.")
             if message == NO_LESSONS_MESSAGE:
                 # pymirea says this both for free days and when every request
                 # failed. Ask once more: an accepted session means truly no pairs.

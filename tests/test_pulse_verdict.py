@@ -167,3 +167,86 @@ def test_a_maintenance_page_does_not_cost_the_saved_cookie(pulse):
 
     assert asyncio.run(MireaService(session).verify_state()) is SessionState.UNKNOWN
     assert session[".AspNetCore.Cookies"] == "still-good"
+
+
+def test_a_loop_at_sso_authentication_expires_the_incomplete_session(pulse):
+    def looping(request):
+        return httpx.Response(
+            302,
+            headers={
+                "Location": "https://sso.mirea.ru/realms/mirea/login-actions/authenticate"
+                f"?tab_id={len(pulse.requests)}",
+            },
+        )
+
+    pulse.handle = looping
+    service = MireaService({"KEYCLOAK_SESSION": "intermediate"})
+    assert asyncio.run(service.verify_state()) is SessionState.EXPIRED
+
+
+def test_a_schedule_sso_loop_recovers_even_if_the_breaker_then_blocks_requests(pulse):
+    def looping(request):
+        return httpx.Response(
+            302,
+            headers={"Location": "https://sso.mirea.ru/realms/mirea/login-actions/authenticate"},
+        )
+
+    pulse.handle = looping
+    service = MireaService({"KEYCLOAK_SESSION": "stale"})
+    with pytest.raises(RuntimeError, match="Сессия Пульса истекла"):
+        asyncio.run(service.get_schedule(1))
+    pulse.requests.clear()
+    assert asyncio.run(service.verify_state()) is SessionState.EXPIRED
+    assert pulse.requests == []
+    # A replacement session is not affected by evidence from the old one.
+    service.session = {"KEYCLOAK_SESSION": "new"}
+    pulse.handle = _accepting_pulse
+    assert asyncio.run(service.verify_state()) is SessionState.VALID
+
+
+def test_a_loop_on_pulse_maintenance_route_is_inconclusive(pulse):
+    pulse.handle = lambda request: httpx.Response(
+        302, headers={"Location": "https://pulse.mirea.ru/maintenance"}
+    )
+    service = MireaService({"KEYCLOAK_SESSION": "preserve"})
+    assert asyncio.run(service.verify_state()) is SessionState.UNKNOWN
+    assert service.session == {"KEYCLOAK_SESSION": "preserve"}
+
+
+def test_completed_login_bootstraps_and_confirms_pulse_before_success(pulse):
+    from pymirea import AuthResult
+
+    pulse.handle = _accepting_pulse
+    service = MireaService({"KEYCLOAK_SESSION": "new"})
+    result = AuthResult(success=True, message="OK", cookies=dict(service.session))
+    result = asyncio.run(service._validate_completed_login(result))
+    assert result.success
+    assert result.tokens[".AspNetCore.Cookies"] == "fresh"
+    assert any("LessonService" in request for request in pulse.requests)
+
+
+def test_completed_login_waits_out_an_outage_without_losing_sso(pulse):
+    from pymirea import AuthResult
+
+    def offline(request):
+        raise httpx.ConnectTimeout("offline", request=request)
+
+    pulse.handle = offline
+    service = MireaService({"KEYCLOAK_SESSION": "new"})
+    result = AuthResult(success=True, message="OK", cookies=dict(service.session))
+    result = asyncio.run(service._validate_completed_login(result))
+    assert not result.success
+    assert result.session_pending
+    assert service.session == {"KEYCLOAK_SESSION": "new"}
+
+
+def test_a_completed_otp_does_not_make_a_refused_session_successful(pulse):
+    from pymirea import AuthResult
+
+    pulse.handle = _refusing_pulse
+    service = MireaService({"KEYCLOAK_SESSION": "refused"})
+    result = AuthResult(success=True, message="OK", cookies=dict(service.session))
+    result = asyncio.run(service._validate_completed_login(result))
+    assert not result.success
+    assert not result.session_pending
+    assert service.session == {}
