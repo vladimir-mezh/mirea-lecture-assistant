@@ -298,3 +298,49 @@ def test_a_locked_database_is_never_taken_for_a_damaged_one():
     assert not _is_damage(sqlite3.OperationalError("database is locked"))
     assert _is_damage(sqlite3.DatabaseError("database disk image is malformed"))
     assert _is_damage(sqlite3.DatabaseError("file is not a database"))
+
+
+def test_nothing_holds_the_damaged_file_when_it_is_put_aside(tmp_path, monkeypatch):
+    """Windows refuses to move an open file (WinError 32): a connection that failed
+    half way through its set-up used to stay open on the damaged file."""
+    import os
+    import sqlite3
+
+    from mirea_lecture_assistant import database
+
+    opened: list = []
+    real_connect = sqlite3.connect
+
+    class Tracked:
+        def __init__(self, conn):
+            object.__setattr__(self, "conn", conn)
+            object.__setattr__(self, "open", True)
+
+        def __getattr__(self, name):
+            return getattr(self.conn, name)
+
+        def __setattr__(self, name, value):
+            setattr(self.conn, name, value)
+
+        def close(self):
+            object.__setattr__(self, "open", False)
+            self.conn.close()
+
+    def tracking_connect(*args, **kwargs):
+        tracked = Tracked(real_connect(*args, **kwargs))
+        opened.append(tracked)
+        return tracked
+
+    real_replace = os.replace
+
+    def windows_like_replace(source, target):
+        if any(item.open for item in opened):
+            raise PermissionError("[WinError 32] used by another process")
+        return real_replace(source, target)
+
+    monkeypatch.setattr(database.sqlite3, "connect", tracking_connect)
+    monkeypatch.setattr(database.os, "replace", windows_like_replace)
+    path = tmp_path / "assistant.sqlite3"
+    path.write_bytes(b"garbage" * 500)
+
+    assert Database(path).recovery is not None

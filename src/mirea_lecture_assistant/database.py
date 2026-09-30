@@ -197,10 +197,16 @@ class Database:
         conn = self._connections.get(ident)
         if conn is None:
             conn = sqlite3.connect(self.path, timeout=10, check_same_thread=False)
-            conn.row_factory = sqlite3.Row
-            conn.execute("PRAGMA foreign_keys = ON")
-            conn.execute("PRAGMA journal_mode = WAL")
-            conn.execute("PRAGMA synchronous = NORMAL")
+            try:
+                conn.row_factory = sqlite3.Row
+                conn.execute("PRAGMA foreign_keys = ON")
+                conn.execute("PRAGMA journal_mode = WAL")
+                conn.execute("PRAGMA synchronous = NORMAL")
+            except sqlite3.Error:
+                # A damaged file fails right here; left open, the connection kept
+                # the file locked on Windows and it could not be put aside.
+                conn.close()
+                raise
             with self._connections_lock:
                 self._connections[ident] = conn
         return conn
