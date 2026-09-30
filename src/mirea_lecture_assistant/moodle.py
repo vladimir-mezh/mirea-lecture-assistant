@@ -191,7 +191,11 @@ def _slot_matches(
         return False
     if webinar.groups and wanted_group and wanted_group not in webinar.groups:
         return False
-    return start_at - tolerance <= webinar.start_at <= end_at
+    if start_at - tolerance <= webinar.start_at <= end_at:
+        return True
+    # One row for a double pair starts with the first pair and still runs when
+    # the second begins: without this the second pair never found its room.
+    return webinar.end_at is not None and webinar.start_at <= start_at < webinar.end_at
 
 
 def webinar_candidates(

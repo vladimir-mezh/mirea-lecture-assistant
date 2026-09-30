@@ -630,3 +630,34 @@ def test_a_room_recreated_during_the_pair_wins_over_the_first_one():
 
     assert picked.join_url == "https://my.mts-link.ru/j/10000001/20000000009"
     assert picked.webinar_id == 188790
+
+
+def test_the_second_pair_of_a_double_pair_finds_the_row_that_spans_both():
+    """The live row runs 09:00–12:11; the 10:40 pair used to find nothing and sit
+    on a blank tab whenever the first pair had not been joined in this run."""
+    second_start = LESSON_START + timedelta(minutes=100)
+    webinar = match_webinar(
+        parse_webinars(page(row()), MODULE_URL),
+        subject=SUBJECT,
+        start_at=second_start,
+        end_at=second_start + timedelta(minutes=90),
+        group="ИКБО-11-99",
+        tolerance=timedelta(minutes=20),
+    )
+
+    assert webinar is not None and webinar.is_joinable
+
+
+def test_a_row_of_the_first_pair_alone_is_not_taken_for_the_second():
+    first_only = str(int(LESSON_START.timestamp()) + 90 * 60)
+    second_start = LESSON_START + timedelta(minutes=100)
+    webinar = match_webinar(
+        parse_webinars(page(row(end_epoch=first_only)), MODULE_URL),
+        subject=SUBJECT,
+        start_at=second_start,
+        end_at=second_start + timedelta(minutes=90),
+        group="ИКБО-11-99",
+        tolerance=timedelta(minutes=20),
+    )
+
+    assert webinar is None

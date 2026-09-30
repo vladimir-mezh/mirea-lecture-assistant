@@ -95,6 +95,11 @@ REJECTED_ROOM_SECONDS = 300
 FRESH_SESSION_SECONDS = 600
 # Later attempts of an automatic login that failed before any code was requested.
 AUTO_LOGIN_RETRY_MINUTES = (2, 5, 15)
+# How often the cached schedule is checked for a pair to open, with or without Pulse.
+LESSON_CHECK_MS = 15_000
+# The chat fallback: a few spaced attempts per pair, not one per scanned frame.
+CHAT_MAX_ATTEMPTS = 3
+CHAT_RETRY_SECONDS = 60
 
 
 def _fill_email_providers(combo: QComboBox, selected: str = "auto") -> None:
@@ -274,6 +279,7 @@ HISTORY_STATUS = {
     "ignored": ("Пропущен", "muted"),
     "submitted": ("Посещение подтверждено", "ok"),
     "failed": ("Ошибка", "error"),
+    "rejected": ("Отклонён", "error"),
     "invalid": ("Неверный QR", "error"),
 }
 AUTH_STATES = {
@@ -554,6 +560,9 @@ class MainWindow(QMainWindow):
         self.session_obtained_at: float | None = None
         # Whether the last СДО sign-in actually ran and worked (lookups waiting for it reuse it).
         self.sdo_last_sign_in_ok = False
+        # ASK pairs the student agreed to open: retried like AUTO ones if opening fails.
+        self.accepted_lessons: set[str] = set()
+        self.chat_attempts: dict[str, tuple[int, float]] = {}
 
         self.setWindowTitle("MIREA Lecture Assistant")
         self.resize(1080, 700)
@@ -586,6 +595,12 @@ class MainWindow(QMainWindow):
         self.lecture_watch_timer.setInterval(10_000)
         self.lecture_watch_timer.timeout.connect(self._lecture_watch_tick)
         self.lecture_watch_timer.start()
+        # Pairs are opened from the cached schedule even while Pulse is down or the
+        # session is being renewed; this used to hang on a successful refresh.
+        self.lesson_timer = QTimer(self)
+        self.lesson_timer.setInterval(LESSON_CHECK_MS)
+        self.lesson_timer.timeout.connect(self._evaluate_cached_lessons)
+        self.lesson_timer.start()
         self.lecture_health_check_running = False
         self.entering_lecture_room = False
         self.lecture_recovery_failures = 0
@@ -1845,6 +1860,32 @@ class MainWindow(QMainWindow):
             f"«{lesson.subject_name}»: пара идёт в той же комнате — ищем её QR", 8000
         )
 
+    def _evaluate_cached_lessons(self):
+        self._evaluate_current_lessons(self.db.list_lessons())
+
+    def _is_current(self, lesson, now: datetime) -> bool:
+        lead = timedelta(minutes=self.join_before.value())
+        return lesson.start_at - lead <= now <= lesson.end_at + LEAVE_AFTER_END
+
+    def _earlier_pair_holds_tab(self, lesson, now: datetime) -> bool:
+        """An earlier pair still on: in its room, or looking for a new one."""
+        for other_id in {self.active_lecture_id, *self.room_lost_lessons} - {None}:
+            if other_id == lesson.external_id:
+                continue
+            other = self._lesson_of(other_id)
+            if (
+                other is not None
+                and other.start_at < lesson.start_at
+                and not self._superseded(other, now)
+            ):
+                return True
+        return False
+
+    def _manual_link(self, lesson_id: str) -> str:
+        """The room the student typed in for this pair, unless it just turned out closed."""
+        url = self.db.get_setting("manual_links", {}).get(lesson_id, "")
+        return "" if url in self._rejected_rooms(lesson_id) else url
+
     def _evaluate_current_lessons(self, lessons):
         now = datetime.now().astimezone()
         lead_minutes = self.join_before.value()
@@ -1884,7 +1925,11 @@ class MainWindow(QMainWindow):
                 # СДО row starts with the first pair and never matches the second.
                 self._adopt_running_room(lesson)
                 break
-            url = self.db.get_resolved_link(lesson.external_id) or lesson.source_url
+            url = (
+                self.db.get_resolved_link(lesson.external_id)
+                or self._manual_link(lesson.external_id)
+                or lesson.source_url
+            )
             if url and url in self._rejected_rooms(lesson.external_id):
                 url = ""
             if not url:
@@ -1893,9 +1938,11 @@ class MainWindow(QMainWindow):
                 if now <= lesson.end_at + LEAVE_AFTER_END + timedelta(minutes=10):
                     self._resolve_from_sources(lesson)
                 continue
-            if mode is RuleMode.AUTO:
+            if mode is RuleMode.AUTO or lesson.external_id in self.accepted_lessons:
                 log.info(
-                    "current_lesson_action lesson_id=%s mode=AUTO action=open", lesson.external_id
+                    "current_lesson_action lesson_id=%s mode=%s action=open",
+                    lesson.external_id,
+                    mode.value,
                 )
                 self._open_lecture(url, lesson.external_id)
                 break
@@ -1908,6 +1955,7 @@ class MainWindow(QMainWindow):
             if self._ask(
                 "Лекция доступна", f"Появилась лекция «{lesson.subject_name}». Открыть её?"
             ):
+                self.accepted_lessons.add(lesson.external_id)
                 # The answer may come much later: take the room known now.
                 fresh = self.db.get_resolved_link(lesson.external_id) or url
                 self._open_lecture(fresh, lesson.external_id)
@@ -2060,11 +2108,12 @@ class MainWindow(QMainWindow):
             # mix them permanently with explicitly configured manual sources.
             return webinar, []
 
+        started = time.monotonic()
         self._run(
             lookup,
-            lambda payload: self._source_resolved(lesson, *payload),
+            lambda payload: self._source_resolved(lesson, *payload, started=started),
             "Ищем вебинар в СДО…",
-            failed=lambda message: self._source_lookup_failed(lesson, message),
+            failed=lambda message: self._source_lookup_failed(lesson, message, started=started),
         )
 
     def _lookup_pause(self, lesson) -> float:
@@ -2077,9 +2126,13 @@ class MainWindow(QMainWindow):
             return RECHECK_EARLY_SECONDS if early else RECHECK_LATE_SECONDS
         return LOOKUP_RETRY_EMPTY_SECONDS
 
-    def _source_resolved(self, lesson, webinar, discovered: list[str]):
+    def _source_resolved(
+        self, lesson, webinar, discovered: list[str], started: float | None = None
+    ):
         self.resolving_lessons.discard(lesson.external_id)
-        self.lookup_not_before[lesson.external_id] = time.monotonic() + self._lookup_pause(lesson)
+        # Counted from the start: a slow СДО stretched "every 2 minutes" to 3 or 4.
+        begun = time.monotonic() if started is None else started
+        self.lookup_not_before[lesson.external_id] = begun + self._lookup_pause(lesson)
         if webinar is not None and webinar.join_url:
             if webinar.webinar_id is not None:
                 self.room_webinar_ids[webinar.join_url] = webinar.webinar_id
@@ -2119,11 +2172,14 @@ class MainWindow(QMainWindow):
                 8000,
             )
             return
+        manual = self._manual_link(lesson.external_id)
         if lesson.external_id == self.active_lecture_id:
             if webinar.join_url == self.active_lecture_url:
                 return
             if self.db.get_rule(lesson.subject_name) is RuleMode.IGNORE:
                 return
+            if manual and manual == self.active_lecture_url:
+                return  # the student's own room stays until it closes
             current_id = self.room_webinar_ids.get(self.active_lecture_url or "")
             if current_id is not None and (webinar.webinar_id or 0) <= current_id:
                 # Only a newer room replaces the one we are in; an older row
@@ -2141,6 +2197,10 @@ class MainWindow(QMainWindow):
             )
             self._open_lecture(webinar.join_url, lesson.external_id, force=True)
             return
+        if manual and manual != webinar.join_url:
+            # The student's own room goes first while it is not known to be closed.
+            log.info("webinar_resolved_kept_manual lesson_id=%s", lesson.external_id)
+            return
         self.room_lost_lessons.discard(lesson.external_id)
         self.db.set_resolved_link(lesson.external_id, webinar.join_url)
         log.info(
@@ -2157,24 +2217,28 @@ class MainWindow(QMainWindow):
         self._fill_schedule()
         self.statusBar().showMessage(f"Вебинар найден: {lesson.subject_name}", 5000)
         mode = self.db.get_rule(lesson.subject_name)
-        if mode is RuleMode.AUTO:
+        if mode is RuleMode.AUTO or (
+            mode is RuleMode.ASK and lesson.external_id in self.accepted_lessons
+        ):
             self._open_lecture(url, lesson.external_id)
         elif mode is RuleMode.ASK and lesson.external_id not in self.prompted_lessons:
             self.prompted_lessons.add(lesson.external_id)
             if self._ask(
                 "Вебинар найден", f"В СДО появился вебинар «{lesson.subject_name}». Открыть?"
             ):
+                self.accepted_lessons.add(lesson.external_id)
                 fresh = self.db.get_resolved_link(lesson.external_id) or url
                 self._open_lecture(fresh, lesson.external_id)
 
-    def _source_lookup_failed(self, lesson, message: str):
+    def _source_lookup_failed(self, lesson, message: str, started: float | None = None):
         self.resolving_lessons.discard(lesson.external_id)
+        begun = time.monotonic() if started is None else started
         # A pair in progress keeps its own cadence; otherwise back off further.
         in_progress = lesson.external_id in self.room_lost_lessons or (
             lesson.external_id == self.active_lecture_id
         )
         pause = self._lookup_pause(lesson) if in_progress else LOOKUP_RETRY_FAILED_SECONDS
-        self.lookup_not_before[lesson.external_id] = time.monotonic() + pause
+        self.lookup_not_before[lesson.external_id] = begun + pause
         log.warning("webinar_lookup_failed lesson_id=%s message=%s", lesson.external_id, message)
         self.statusBar().showMessage("Вебинар в СДО пока не найден: " + message, 6000)
 
@@ -2279,9 +2343,10 @@ class MainWindow(QMainWindow):
             link.setCursorPosition(0)
             # Saved per lesson: a subject-wide link reopened last week's room for
             # every later pair and stopped the СДО lookup for good.
+            shown_link = link.text().strip()
             link.editingFinished.connect(
-                lambda lesson_id=lesson.external_id, editor=link: self._save_lesson_link(
-                    lesson_id, editor.text().strip()
+                lambda lesson_id=lesson.external_id, editor=link, shown=shown_link: (
+                    self._save_lesson_link(lesson_id, editor.text().strip(), shown)
                 )
             )
             self.schedule_table.setCellWidget(row, 6, link)
@@ -2303,9 +2368,20 @@ class MainWindow(QMainWindow):
         self.schedule_redraw_pending = False
         self._fill_schedule()
 
-    def _save_lesson_link(self, lesson_id: str, url: str):
+    def _save_lesson_link(self, lesson_id: str, url: str, shown: str | None = None):
+        if url == shown:
+            return  # focus merely left the field
         if url and url != self.db.get_resolved_link(lesson_id):
             self.db.set_resolved_link(lesson_id, url)
+            # Remembered as the student's own: СДО rechecks used to replace it.
+            known = {lesson.external_id for lesson in self.db.list_lessons()}
+            manual = {
+                key: value
+                for key, value in self.db.get_setting("manual_links", {}).items()
+                if key in known
+            }
+            manual[lesson_id] = url
+            self.db.set_setting("manual_links", manual)
             # A link the student typed in is trusted even if a room there ended before.
             rejected = self.db.get_setting("rejected_rooms", {})
             if url in rejected.get(lesson_id, {}):
@@ -2363,6 +2439,10 @@ class MainWindow(QMainWindow):
             return
         if not manual and not self._may_open(url, lesson_id):
             return
+        if lesson_id and (lesson_id, url) in self.room_lost_notified:
+            # This address showed an ended room: reload it, as the tab may still be
+            # on that ended page and would otherwise be taken as already open.
+            force = True
         if lesson_id and (
             lesson_id == self.opening_lecture_id or (lesson_id in self.joined_lessons and not force)
         ):
@@ -2378,7 +2458,7 @@ class MainWindow(QMainWindow):
                 height=360 if compact else 760,
                 force_navigation=force,
             ),
-            lambda browser_name: self._lecture_opened(browser_name, lesson_id),
+            lambda browser_name: self._lecture_opened(browser_name, lesson_id, manual=manual),
             "Открываем лекцию…",
             failed=lambda message: self._lecture_open_failed(lesson_id, message),
         )
@@ -2396,6 +2476,10 @@ class MainWindow(QMainWindow):
             reason = "superseded"
         elif url in self._rejected_rooms(lesson.external_id):
             reason = "room_rejected"
+        elif self._earlier_pair_holds_tab(lesson, now):
+            # The earlier pair keeps the tab until its end + 5 minutes, also while
+            # it looks for a new room; the next pair used to take it at once.
+            reason = "earlier_pair_running"
         if reason:
             log.info("lecture_open_refused lesson_id=%s reason=%s", lesson_id, reason)
             return False
@@ -2419,8 +2503,19 @@ class MainWindow(QMainWindow):
             self.chat_baseline = None
             self.lecture_started_at = time.monotonic()
 
-    def _lecture_opened(self, browser_name: str, lesson_id: str | None):
+    def _lecture_opened(self, browser_name: str, lesson_id: str | None, *, manual: bool = False):
         self.opening_lecture_id = None
+        lesson = self._lesson_of(lesson_id)
+        now = datetime.now().astimezone()
+        if manual and lesson is not None and not self._is_current(lesson, now):
+            # A future or past pair opened by hand: its QR codes and marks must not
+            # be booked to it, and the pairs of now keep their own monitoring.
+            log.info("manual_open_not_monitored lesson_id=%s", lesson_id)
+            lesson_id = None
+        previous = self.active_lecture_id
+        if previous and lesson_id and previous != lesson_id:
+            # The tab now shows another pair's room; this one may be opened again.
+            self.joined_lessons.discard(previous)
         if lesson_id:
             self.joined_lessons.add(lesson_id)
         self.active_lecture_url = self.browser.lecture_url
@@ -2456,9 +2551,14 @@ class MainWindow(QMainWindow):
             self._finish_active_lecture("safety_timeout")
             return
         self.lecture_health_check_running = True
+        watched = (self.active_lecture_id, self.active_lecture_url)
 
         def checked(state: str):
             self.lecture_health_check_running = False
+            if (self.active_lecture_id, self.active_lecture_url) != watched:
+                # The room changed while this check ran; it says nothing about the new one.
+                log.info("lecture_health_result_dropped state=%s", state)
+                return
             if state == "unstable":
                 # A reconnect banner is usually gone within seconds: act only if
                 # it is still there at the next check.
@@ -2961,7 +3061,9 @@ class MainWindow(QMainWindow):
                 # A real rejection of this token: resending it every five seconds
                 # only raced the counter to the public chat message. The next
                 # rotating code is submitted instead.
-                self.db.update_qr_event(event_id, "failed", result.message)
+                # "rejected" keeps it deduplicated: the same code still on screen
+                # was submitted again with every frame and counted as a new failure.
+                self.db.update_qr_event(event_id, "rejected", result.message)
                 self._fill_history()
                 self._record_attendance_failure(event_id)
                 self.pending_qr.pop(event_id, None)
@@ -3121,6 +3223,12 @@ class MainWindow(QMainWindow):
         if not self.browser.probably_running:
             log.warning("chat_fallback_skipped reason=%s cause=browser_unavailable", reason)
             return
+        attempts, last = self.chat_attempts.get(lesson_id, (0, 0.0))
+        if attempts >= CHAT_MAX_ATTEMPTS or (
+            attempts and time.monotonic() - last < CHAT_RETRY_SECONDS
+        ):
+            return  # a failed send was retried with every frame, each with a balloon
+        self.chat_attempts[lesson_id] = (attempts + 1, time.monotonic())
         self.unreadable_chat_sent = True
         log.info("chat_fallback_triggered reason=%s lesson_id=%s", reason, lesson_id)
         message = f"{name} {group}"
@@ -3151,12 +3259,14 @@ class MainWindow(QMainWindow):
             self.unreadable_chat_sent = False
         log.warning("chat_fallback_failed lesson_id=%s message=%s", lesson_id, message)
         self.statusBar().showMessage("Не удалось отправить сообщение в чат", 5000)
-        self.tray.showMessage(
-            "Чат MTS Link недоступен",
-            message,
-            QSystemTrayIcon.MessageIcon.Warning,
-            8000,
-        )
+        attempts, _last = self.chat_attempts.get(lesson_id, (0, 0.0))
+        if attempts >= CHAT_MAX_ATTEMPTS:
+            self.tray.showMessage(
+                "Чат MTS Link недоступен",
+                f"{message}\n\nСообщение преподавателю не отправлено — напишите его сами.",
+                QSystemTrayIcon.MessageIcon.Warning,
+                8000,
+            )
 
     def closeEvent(self, event):
         if self.force_exit or not QSystemTrayIcon.isSystemTrayAvailable():

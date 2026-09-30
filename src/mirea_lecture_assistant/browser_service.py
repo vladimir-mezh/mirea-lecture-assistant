@@ -755,15 +755,18 @@ class BrowserService:
             raise RuntimeError("MTS Link не показал поле «Введите сообщение»")
         before = await page.count_text(message)
         await page.fill(CHAT_EDITORS, message, index=editor)
-        await page.press_enter()
-        for _ in range(10):
-            await page.wait_for_timeout(500)
-            if await page.count_text(message) > before:
-                log.info("chat_delivery_confirmed")
-                return
-        raise RuntimeError(
-            "Не удалось подтвердить доставку сообщения; повтор отключён во избежание дубля"
-        )
+        uncertain = "Не удалось подтвердить доставку сообщения; повтор отключён во избежание дубля"
+        try:
+            await page.press_enter()
+            for _ in range(10):
+                await page.wait_for_timeout(500)
+                if await page.count_text(message) > before:
+                    log.info("chat_delivery_confirmed")
+                    return
+        except Exception as exc:
+            # Enter may already have posted it; a retry would post it twice in public.
+            raise RuntimeError(uncertain) from exc
+        raise RuntimeError(uncertain)
 
     @staticmethod
     async def _visible_chat_editor(page) -> int | None:

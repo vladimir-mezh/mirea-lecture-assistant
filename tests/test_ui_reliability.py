@@ -28,6 +28,7 @@ def window(tmp_path, monkeypatch):
     instance = MainWindow(Database(tmp_path / "assistant.sqlite3"))
     instance.schedule_timer.stop()
     instance.lecture_watch_timer.stop()
+    instance.lesson_timer.stop()
     yield instance
     instance.force_exit = True
     instance.close()
@@ -341,8 +342,10 @@ def test_a_rejected_token_is_not_resent(window, monkeypatch):
 
     assert scheduled == []
     assert event_id not in window.pending_qr
-    assert window.db.recent_qr_events()[0].status == "failed"
+    assert window.db.recent_qr_events()[0].status == "rejected"
     assert window.attendance_failures_by_lesson["lesson"] == 1
+    # The same code still on screen is not submitted again with the next frame.
+    assert window.deduplicator.is_duplicate("fingerprint")
 
 
 def test_only_one_retry_timer_runs_per_event(window, monkeypatch):
@@ -1062,3 +1065,183 @@ def test_a_lookup_waiting_for_a_deferred_sdo_sign_in_does_not_back_off(window, m
 
     assert results == {"holder": False, "waiter": False}
     assert window.sdo_sign_in_failed_at is None
+
+
+def test_pairs_open_from_the_cached_schedule_without_a_pulse_session(window, monkeypatch):
+    """With the session being renewed (or Pulse down) nothing used to open at all."""
+    lesson = _running_lesson("cached")
+    today = datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
+    window.db.sync_lessons([lesson], today)
+    window.db.set_rule(lesson.subject_name, RuleMode.AUTO)
+    window.db.set_resolved_link("cached", "https://my.mts-link.ru/j/cached")
+    window.mirea.session = {}
+    opened = []
+    monkeypatch.setattr(window, "_open_lecture", lambda url, lesson_id: opened.append(lesson_id))
+
+    window._evaluate_cached_lessons()
+
+    assert opened == ["cached"]
+    assert window.lesson_timer.interval() == 15_000
+
+
+def test_lookup_pauses_count_from_the_start_of_the_lookup(window):
+    lesson = _running_lesson("paced")
+    started = time.monotonic() - 50  # a slow СДО: the lookup took 50 seconds
+
+    window._source_resolved(lesson, None, [], started=started)
+
+    assert window.lookup_not_before["paced"] == pytest.approx(started + 120, abs=0.01)
+
+
+def test_the_next_pair_waits_while_the_earlier_one_looks_for_a_new_room(window):
+    """A's room closed 18 minutes before its end: B (lead 30) must not take the tab."""
+    now = datetime.now().astimezone()
+    a = _pair("A", now - timedelta(minutes=72), subject="Физика")
+    b = _pair("B", now + timedelta(minutes=28), subject="Химия")
+    window.join_before.setValue(30)
+    window.db.sync_lessons([a, b], now.replace(hour=0, minute=0, second=0, microsecond=0))
+    window.room_lost_lessons.add("A")
+
+    assert window._may_open("https://my.mts-link.ru/j/b", "B") is False
+
+    window.room_lost_lessons.discard("A")
+    assert window._may_open("https://my.mts-link.ru/j/b", "B") is True
+
+
+def _opened_by_hand(window, monkeypatch, lesson):
+    today = datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
+    window.db.sync_lessons([lesson], today)
+    monkeypatch.setattr(window, "_enter_lecture_room", lambda: None)
+    monkeypatch.setattr(window, "toggle_scanner", lambda: None)
+    window.browser.lecture_url = "https://my.mts-link.ru/j/by-hand"
+    window._lecture_opened("Chrome", lesson.external_id, manual=True)
+
+
+def test_opening_a_future_pair_by_hand_does_not_book_codes_to_it(window, monkeypatch):
+    tomorrow = _pair("tomorrow", datetime.now().astimezone() + timedelta(days=1))
+
+    _opened_by_hand(window, monkeypatch, tomorrow)
+
+    assert window.active_lecture_id is None
+    assert "tomorrow" not in window.joined_lessons
+
+
+def test_opening_the_current_pair_by_hand_monitors_it(window, monkeypatch):
+    _opened_by_hand(window, monkeypatch, _running_lesson("now"))
+
+    assert window.active_lecture_id == "now"
+
+
+def test_a_room_the_student_typed_in_is_not_replaced_by_the_sdo(window, monkeypatch):
+    lesson = _running_lesson("typed")
+    today = datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
+    window.db.sync_lessons([lesson], today)
+    window._save_lesson_link("typed", "https://my.mts-link.ru/j/typed", shown="")
+    window.active_lecture_id = "typed"
+    window.active_lecture_url = "https://my.mts-link.ru/j/typed"
+    opened = []
+    monkeypatch.setattr(window, "_open_lecture", lambda *args, **kwargs: opened.append(args))
+
+    window._source_resolved(lesson, _webinar("https://my.mts-link.ru/j/other", 99), [])
+
+    assert opened == []
+    assert window.db.get_resolved_link("typed") == "https://my.mts-link.ru/j/typed"
+
+
+def test_focus_leaving_an_unchanged_link_field_saves_nothing(window):
+    window._save_lesson_link(
+        "x", "https://my.mts-link.ru/j/shown", shown="https://my.mts-link.ru/j/shown"
+    )
+
+    assert window.db.get_setting("manual_links", {}) == {}
+    assert window.db.get_resolved_link("x") in (None, "")
+
+
+def test_a_room_that_ended_behind_the_same_link_is_reloaded(window, monkeypatch):
+    lesson = _running_lesson("again")
+    url = "https://my.mts-link.ru/j/again"
+    window.room_lost_notified.add(("again", url))
+    navigations = []
+
+    class Browser:
+        lecture_url = url
+
+        def open(self, target, **kwargs):
+            navigations.append(kwargs["force_navigation"])
+            return "Chrome"
+
+    monkeypatch.setattr(window, "browser", Browser())
+    monkeypatch.setattr(window, "_may_open", lambda *_args: True)
+    monkeypatch.setattr(
+        window, "_run", lambda function, done, _busy, failed=None, **_kw: function()
+    )
+    today = datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
+    window.db.sync_lessons([lesson], today)
+
+    window._open_lecture(url, "again")
+
+    assert navigations == [True]
+
+
+def test_an_accepted_ask_pair_is_opened_again_after_a_failed_open(window, monkeypatch):
+    lesson = _running_lesson("asked")
+    today = datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
+    window.db.sync_lessons([lesson], today)
+    window.db.set_rule(lesson.subject_name, RuleMode.ASK)
+    window.db.set_resolved_link("asked", "https://my.mts-link.ru/j/asked")
+    window.prompted_lessons.add("asked")
+    window.accepted_lessons.add("asked")
+    opened = []
+    monkeypatch.setattr(window, "_open_lecture", lambda url, lesson_id: opened.append(lesson_id))
+
+    window._evaluate_current_lessons(window.db.list_lessons())
+
+    assert opened == ["asked"]
+
+
+def test_the_chat_fallback_is_spaced_and_capped(window, monkeypatch):
+    window.active_lecture_id = "chat"
+    window.student_name.setText("Иванов Иван")
+    window.group_edit.setText("ИКБО-01-24")
+    window.chat_fallback.setChecked(True)
+    monkeypatch.setattr(type(window.browser), "probably_running", property(lambda self: True))
+    sends = []
+    monkeypatch.setattr(
+        window,
+        "_run",
+        lambda _function, _done, _busy, failed=None, **_kw: (
+            sends.append(1),
+            failed("Чат не найден"),
+        ),
+    )
+    clock = [1000.0]
+    monkeypatch.setattr("mirea_lecture_assistant.ui.time.monotonic", lambda: clock[0])
+
+    for _ in range(5):
+        window._send_chat_fallback()
+    assert len(sends) == 1  # not once per frame
+
+    for _ in range(5):
+        clock[0] += 61
+        window._send_chat_fallback()
+    assert len(sends) == 3  # and never more than three times a pair
+
+
+def test_a_health_result_about_a_room_left_meanwhile_is_dropped(window, monkeypatch):
+    lesson = _running_lesson("health")
+    today = datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
+    window.db.sync_lessons([lesson], today)
+    window.active_lecture_id = "health"
+    window.active_lecture_url = "https://my.mts-link.ru/j/old"
+    pending = []
+    monkeypatch.setattr(
+        window, "_run", lambda _function, done, _busy, failed=None: pending.append(done)
+    )
+    ended = []
+    monkeypatch.setattr(window, "_room_ended", lambda lesson: ended.append(lesson))
+
+    window._lecture_watch_tick()
+    window.active_lecture_url = "https://my.mts-link.ru/j/new"  # switched meanwhile
+    pending[0]("ended")
+
+    assert ended == []

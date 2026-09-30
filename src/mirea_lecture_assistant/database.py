@@ -421,7 +421,7 @@ class Database:
         with self.connection() as conn:
             row = conn.execute(
                 "SELECT 1 FROM qr_events WHERE token_hash = ? AND detected_at >= ? "
-                "AND status IN ('detected', 'retrying', 'submitted') LIMIT 1",
+                "AND status IN ('detected', 'retrying', 'submitted', 'rejected') LIMIT 1",
                 (token_hash, after.isoformat()),
             ).fetchone()
         return row is not None
