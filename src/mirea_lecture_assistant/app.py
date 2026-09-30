@@ -3,7 +3,6 @@ from __future__ import annotations
 import base64
 import logging
 import os
-import re
 import signal
 import sys
 import time
@@ -14,6 +13,7 @@ from .async_runtime import shutdown_async_runtime
 from .database import Database
 from .logging_setup import configure_logging
 from .paths import SHOW_REQUEST_FILE, SHOW_RESPONSE_FILE, data_dir, resource_path
+from .updater import version_tuple  # noqa: F401 - the second-launch check imports it from here
 
 
 def _session_key(log) -> str:
@@ -30,10 +30,6 @@ def _session_key(log) -> str:
         # usable where it used to stop with a traceback before any window.
         log.warning("session_key_unavailable", exc_info=True)
         return base64.b64encode(os.urandom(32)).decode("ascii")
-
-
-def version_tuple(text: str) -> tuple[int, ...]:
-    return tuple(int(part) for part in re.findall(r"\d+", text or "")[:3])
 
 
 def _use_system_certificates(log) -> None:
@@ -264,6 +260,7 @@ def main() -> int:
     # traceback box before any window.
     try:
         db = Database(root / "assistant.sqlite3")
+        db.backup()
         MireaService.configure(_session_key(log))
         window = MainWindow(db)
     except Exception as exc:

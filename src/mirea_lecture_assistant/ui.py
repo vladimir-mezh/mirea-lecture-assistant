@@ -48,7 +48,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from . import __version__
+from . import __version__, updater
 from .async_runtime import run_async
 from .browser_service import CAPTURE_TIMEOUT_MS, BrowserService, NotSignedInError
 from .chat_detection import chat_baseline, classmates_report_attendance_issue
@@ -100,6 +100,9 @@ AUTO_LOGIN_RETRY_MINUTES = (2, 5, 15)
 MANUAL_OPEN_LEAD = timedelta(minutes=60)
 # How often the cached schedule is checked for a pair to open, with or without Pulse.
 LESSON_CHECK_MS = 15_000
+# New releases are looked for this often, and the first time soon after start.
+UPDATE_CHECK_MS = 6 * 60 * 60 * 1000
+FIRST_UPDATE_CHECK_MS = 20_000
 # The chat fallback: a few spaced attempts per pair, not one per scanned frame.
 CHAT_MAX_ATTEMPTS = 3
 CHAT_RETRY_SECONDS = 60
@@ -612,6 +615,128 @@ class MainWindow(QMainWindow):
         self.lecture_recovery_failures = 0
         self.lecture_unstable_checks = 0
         QTimer.singleShot(0, self._startup_auth)
+        self.available_update: updater.Release | None = None
+        self.update_check_running = False
+        self.update_timer = QTimer(self)
+        self.update_timer.setInterval(UPDATE_CHECK_MS)
+        self.update_timer.timeout.connect(self._check_for_updates)
+        if updater.can_self_update() and os.environ.get("MIREA_ASSISTANT_SMOKE_TEST") != "1":
+            self.update_timer.start()
+            QTimer.singleShot(FIRST_UPDATE_CHECK_MS, self._check_for_updates)
+        if self.db.recovery:
+            QTimer.singleShot(0, self._report_database_recovery)
+
+    def _check_for_updates(self, manual: bool = False):
+        if self.update_check_running:
+            return
+        if not manual and not bool(self.db.get_setting("check_updates", True)):
+            return
+        if updater.can_self_update():
+            updater.clean_leftovers(updater.current_executable())
+        self.update_check_running = True
+
+        def failed(message: str):
+            self.update_check_running = False
+            log.info("update_check_failed message=%s", message)
+            if manual:
+                QMessageBox.warning(
+                    self, "Обновления", f"Не удалось проверить обновления: {message}"
+                )
+
+        self._run(
+            updater.latest_release,
+            lambda release: self._update_checked(release, manual),
+            "Проверяем обновления…",
+            failed=failed,
+        )
+
+    def _update_checked(self, release, manual: bool):
+        self.update_check_running = False
+        if release is None or not updater.is_newer(release.version, __version__):
+            if manual:
+                QMessageBox.information(
+                    self, "Обновления", f"У вас последняя версия ({__version__})."
+                )
+            return
+        self.available_update = release
+        log.info("update_available version=%s", release.version)
+        self.update_button.setText(f"Обновить до {release.version}")
+        self.update_button.show()
+        self.tray.showMessage(
+            "Вышла новая версия",
+            f"MIREA Lecture Assistant {release.version}: кнопка «Обновить» слева в окне.",
+            QSystemTrayIcon.MessageIcon.Information,
+            8000,
+        )
+        if manual:
+            self._start_update()
+
+    def _start_update(self):
+        release = self.available_update
+        if release is None:
+            return
+        if not updater.can_self_update():
+            QDesktopServices.openUrl(QUrl(updater.RELEASES_PAGE))
+            return
+        notes = f"\n\nЧто нового:\n{release.notes}" if release.notes else ""
+        if not self._ask(
+            "Обновление",
+            f"Установить версию {release.version} (сейчас {__version__})? Приложение "
+            "перезапустится; расписание, вход, пароли и настройки сохранятся." + notes,
+        ):
+            return
+        # Nothing to lose, but a fresh copy costs nothing either.
+        self._persist_session()
+        self.db.backup()
+        self.update_button.setEnabled(False)
+        self.update_button.setText("Скачиваем обновление…")
+        folder = updater.current_executable().parent
+        self._run(
+            lambda: updater.download(release, folder),
+            self._update_downloaded,
+            "Скачиваем обновление…",
+            failed=self._update_failed,
+        )
+
+    def _update_downloaded(self, new_exe):
+        try:
+            installed = updater.install(new_exe, updater.current_executable())
+            updater.start(installed)
+        except OSError as exc:
+            log.warning("update_install_failed", exc_info=True)
+            self._update_failed(
+                f"Не удалось заменить файл программы ({exc}). Новая версия сохранена: "
+                f"{new_exe} — закройте программу и запустите этот файл."
+            )
+            return
+        # The new copy asks this one to step aside as soon as it starts.
+        self.update_button.setText("Перезапускаем…")
+        self.statusBar().showMessage("Обновление установлено, запускаем новую версию…", 10000)
+
+    def _update_failed(self, message: str):
+        log.warning("update_failed message=%s", message)
+        self.update_button.setEnabled(True)
+        if self.available_update is not None:
+            self.update_button.setText(f"Обновить до {self.available_update.version}")
+        QMessageBox.warning(
+            self,
+            "Обновление",
+            f"{message}\n\nНовую версию можно скачать и вручную: {updater.RELEASES_PAGE}",
+        )
+
+    def _report_database_recovery(self):
+        report = self.db.recovery or {}
+        QMessageBox.information(
+            self,
+            "База восстановлена",
+            "Файл данных приложения был повреждён (так бывает после внезапного "
+            "выключения компьютера) и восстановлен автоматически.\n\n"
+            f"Сохранено записей: {report.get('restored', 0)}, "
+            f"отброшено повреждённых: {report.get('skipped', 0)}.\n\n"
+            "Логин, пароль и почта хранятся отдельно и не пострадали. Проверьте "
+            "группу и имя в «Настройках».\n\n"
+            f"Копия повреждённого файла: {report.get('backup', '')}",
+        )
 
     def _build_ui(self):
         central = QWidget()
@@ -634,6 +759,15 @@ class MainWindow(QMainWindow):
             side.addWidget(button)
             self.nav_buttons.append(button)
         side.addStretch()
+        # Shown only when a newer version is out: one click installs it.
+        self.update_button = QPushButton("")
+        self.update_button.setToolTip("Скачать и установить новую версию; данные и вход сохранятся")
+        self.update_button.clicked.connect(self._start_update)
+        self.update_button.hide()
+        update_row = QHBoxLayout()
+        update_row.setContentsMargins(12, 0, 12, 8)
+        update_row.addWidget(self.update_button)
+        side.addLayout(update_row)
         self.auth_status = QLabel()
         self.auth_status.setWordWrap(True)
         side.addWidget(self.auth_status)
@@ -884,6 +1018,18 @@ class MainWindow(QMainWindow):
             self.theme_choice.addItem(label, value)
         self.theme_choice.currentIndexChanged.connect(self._theme_choice_changed)
         appearance.addRow("Оформление", self.theme_choice)
+
+        updates = self._settings_section(sections, "Обновления")
+        updates.addRow("Установлена версия", QLabel(__version__))
+        self.auto_update_check = QCheckBox("Проверять обновления автоматически")
+        self.auto_update_check.setChecked(bool(self.db.get_setting("check_updates", True)))
+        self.auto_update_check.toggled.connect(
+            lambda checked: self.db.set_setting("check_updates", bool(checked))
+        )
+        updates.addRow("", self.auto_update_check)
+        check_now = QPushButton("Проверить сейчас", objectName="secondary")
+        check_now.clicked.connect(lambda: self._check_for_updates(manual=True))
+        updates.addRow("", check_now)
 
         diagnostics = self._settings_section(sections, "Диагностика")
         open_logs = QPushButton("Открыть папку журналов", objectName="secondary")
