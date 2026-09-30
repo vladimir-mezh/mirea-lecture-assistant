@@ -1467,3 +1467,23 @@ def test_a_handover_answer_survives_a_locked_response_file(tmp_path, monkeypatch
     responder.start()
     assert ask_running_copy_to_show(tmp_path, wait_seconds=3) == "handover"
     responder.join()
+
+
+def test_the_student_is_told_when_the_database_was_repaired(tmp_path, monkeypatch):
+    monkeypatch.setattr(paths, "data_dir", lambda: tmp_path)
+    monkeypatch.setattr(SessionStore, "load", lambda _self: None)
+    monkeypatch.setattr(SessionStore, "load_credentials", lambda _self: None)
+    monkeypatch.setattr(SessionStore, "load_email_credentials", lambda _self: None)
+    shown = []
+    from mirea_lecture_assistant import ui
+
+    monkeypatch.setattr(ui.QMessageBox, "information", lambda *args: shown.append(args[1]))
+    (tmp_path / "assistant.sqlite3").write_bytes(b"broken" * 1000)
+    QApplication.instance() or QApplication([])
+    window = MainWindow(Database(tmp_path / "assistant.sqlite3"))
+    try:
+        window._report_database_recovery()
+        assert shown == ["База восстановлена"]
+    finally:
+        window.force_exit = True
+        window.close()

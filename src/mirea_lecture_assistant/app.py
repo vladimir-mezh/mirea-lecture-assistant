@@ -264,6 +264,7 @@ def main() -> int:
     # traceback box before any window.
     try:
         db = Database(root / "assistant.sqlite3")
+        db.backup()
         MireaService.configure(_session_key(log))
         window = MainWindow(db)
     except Exception as exc:

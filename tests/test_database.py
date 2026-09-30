@@ -1,4 +1,5 @@
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 from mirea_lecture_assistant.database import MISSING_TOLERANCE, Database
 from mirea_lecture_assistant.domain import Lesson, RuleMode
@@ -197,3 +198,103 @@ def test_the_next_pair_survives_an_hour_long_schedule_outage(tmp_path):
 
     db.sync_lessons([], now.replace(hour=0), now=now)
     assert db.list_lessons() == []  # a real cancellation still goes away
+
+
+def test_a_file_that_is_not_a_database_is_put_aside_and_replaced(tmp_path):
+    path = tmp_path / "assistant.sqlite3"
+    path.write_bytes(b"garbage from a crash" * 500)
+
+    db = Database(path)
+
+    assert db.recovery is not None
+    backup = Path(db.recovery["backup"])
+    assert (backup / "assistant.sqlite3").read_bytes().startswith(b"garbage")
+    db.set_setting("group", "ИКБО-01-24")
+    assert db.get_setting("group") == "ИКБО-01-24"
+
+
+def test_a_damaged_file_keeps_every_readable_row(tmp_path):
+    """Codex restored a real damaged database by hand with sqlite3's .recover;
+    the app now does the same on its own at start."""
+    import sqlite3
+
+    path = tmp_path / "assistant.sqlite3"
+    db = Database(path)
+    db.set_setting("group", "ИКБО-01-24")
+    db.set_setting("student_name", "Иванов Иван")
+    for index in range(400):
+        db.add_qr_event(f"token-{index:04d}" + "x" * 200, "submitted", lesson_id=f"l{index}")
+    with db.connection() as conn:
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    db.close()
+    with sqlite3.connect(path) as conn:
+        page_size = conn.execute("PRAGMA page_size").fetchone()[0]
+        pages = conn.execute("PRAGMA page_count").fetchone()[0]
+    raw = bytearray(path.read_bytes())
+    middle = (pages // 2) * page_size
+    raw[middle : middle + page_size] = b"\xff" * page_size  # one destroyed page
+    path.write_bytes(bytes(raw))
+
+    recovered = Database(path)
+
+    assert recovered.recovery is not None
+    assert recovered.recovery["restored"] > 300
+    assert recovered.get_setting("group") == "ИКБО-01-24"
+    assert len(recovered.recent_qr_events(limit=1000)) > 300
+
+
+def test_rows_with_damaged_values_are_skipped_instead_of_crashing(tmp_path):
+    db = Database(tmp_path / "assistant.sqlite3")
+    with db.connection() as conn:
+        conn.execute(
+            "INSERT INTO qr_events(lesson_id, token_hash, detected_at, status) "
+            "VALUES ('x', 'h', 'not-a-date', 'submitted')"
+        )
+        conn.execute("INSERT INTO settings(key, value) VALUES ('group', '{broken')")
+        conn.execute(
+            "INSERT INTO lessons(external_id, subject_name, lesson_type, start_at, end_at) "
+            "VALUES ('bad', 'Физика', 'ЛК', '??', '??')"
+        )
+    db.add_qr_event("good", "submitted")
+
+    assert [event.token_hash for event in db.recent_qr_events()] == ["good"]
+    assert db.get_setting("group", "fallback") == "fallback"
+    assert db.list_lessons() == []
+    db.sync_lessons([], datetime.now().astimezone())  # drops the damaged lesson
+
+
+def test_a_daily_copy_fills_in_what_the_damaged_file_lost(tmp_path):
+    path = tmp_path / "assistant.sqlite3"
+    db = Database(path)
+    db.set_setting("group", "ИКБО-01-24")
+    assert db.backup() is not None
+    assert db.backup() == db.backup()  # once a day
+    db.close()
+    path.write_bytes(b"not a database any more" * 300)
+    for leftover in ("-wal", "-shm"):
+        path.with_name(path.name + leftover).unlink(missing_ok=True)
+
+    recovered = Database(path)
+
+    assert recovered.recovery is not None
+    assert recovered.get_setting("group") == "ИКБО-01-24"
+
+
+def test_only_the_last_days_of_copies_are_kept(tmp_path):
+    db = Database(tmp_path / "assistant.sqlite3")
+    for day in range(1, 9):
+        (db.backup_dir).mkdir(exist_ok=True)
+        (db.backup_dir / f"assistant-202601{day:02d}.sqlite3").write_bytes(b"old")
+    db.backup(keep=5)
+
+    assert len(list(db.backup_dir.glob("assistant-*.sqlite3"))) == 5
+
+
+def test_a_locked_database_is_never_taken_for_a_damaged_one():
+    import sqlite3
+
+    from mirea_lecture_assistant.database import _is_damage
+
+    assert not _is_damage(sqlite3.OperationalError("database is locked"))
+    assert _is_damage(sqlite3.DatabaseError("database disk image is malformed"))
+    assert _is_damage(sqlite3.DatabaseError("file is not a database"))

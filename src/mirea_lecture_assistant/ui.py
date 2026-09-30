@@ -612,6 +612,22 @@ class MainWindow(QMainWindow):
         self.lecture_recovery_failures = 0
         self.lecture_unstable_checks = 0
         QTimer.singleShot(0, self._startup_auth)
+        if self.db.recovery:
+            QTimer.singleShot(0, self._report_database_recovery)
+
+    def _report_database_recovery(self):
+        report = self.db.recovery or {}
+        QMessageBox.information(
+            self,
+            "База восстановлена",
+            "Файл данных приложения был повреждён (так бывает после внезапного "
+            "выключения компьютера) и восстановлен автоматически.\n\n"
+            f"Сохранено записей: {report.get('restored', 0)}, "
+            f"отброшено повреждённых: {report.get('skipped', 0)}.\n\n"
+            "Логин, пароль и почта хранятся отдельно и не пострадали. Проверьте "
+            "группу и имя в «Настройках».\n\n"
+            f"Копия повреждённого файла: {report.get('backup', '')}",
+        )
 
     def _build_ui(self):
         central = QWidget()

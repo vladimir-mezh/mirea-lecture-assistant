@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import logging
+import os
 import sqlite3
 import threading
 import time
@@ -18,6 +20,38 @@ MISSING_TOLERANCE = 15
 NEAR_FUTURE = timedelta(days=1)
 NEAR_FUTURE_TOLERANCE = 60
 
+log = logging.getLogger(__name__)
+
+# Tables worth carrying over from a damaged file, and the columns whose values
+# must still make sense for a row to be kept.
+RECOVERED_TABLES = (
+    "settings",
+    "subject_rules",
+    "lecture_links",
+    "lecture_sources",
+    "resolved_links",
+    "lessons",
+    "qr_events",
+)
+DATE_COLUMNS = {
+    "lessons": ("start_at", "end_at"),
+    "qr_events": ("detected_at",),
+    "resolved_links": ("resolved_at",),
+}
+# Errors of a busy or unreachable file: nothing in it is damaged.
+NOT_DAMAGE = ("locked", "busy", "unable to open", "readonly", "disk i/o", "full")
+
+
+def _parse_time(value) -> datetime | None:
+    try:
+        return datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _is_damage(error: sqlite3.DatabaseError) -> bool:
+    return not any(part in str(error).lower() for part in NOT_DAMAGE)
+
 
 class Database:
     def __init__(self, path: Path):
@@ -29,7 +63,134 @@ class Database:
         # fresh Python thread state, and each task leaked a connection.
         self._connections: dict[int, sqlite3.Connection] = {}
         self._connections_lock = threading.Lock()
+        # Set when a damaged file was replaced at start: what was saved and where.
+        self.recovery: dict | None = None
+        try:
+            self.migrate()
+            self._check_integrity()
+        except sqlite3.DatabaseError as error:
+            if not _is_damage(error):
+                raise
+            self.recovery = self._recover(error)
+
+    def _check_integrity(self) -> None:
+        with self.connection() as conn:
+            verdict = [row[0] for row in conn.execute("PRAGMA quick_check").fetchall()]
+        if verdict != ["ok"]:
+            raise sqlite3.DatabaseError("quick_check: " + "; ".join(map(str, verdict[:3])))
+
+    def _recover(self, error: sqlite3.DatabaseError) -> dict:
+        """Put a damaged file aside and carry every readable, sensible row over.
+
+        A damaged file used to stop the app at start (or on the history page),
+        and only a manual `.recover` with the sqlite3 tool brought the settings
+        back. The damaged files stay in a backup folder next to the new one.
+        """
+        log.error("database_damaged error=%s", error)
+        self.close()
+        backup = self.path.parent / f"db-backup-{datetime.now().astimezone():%Y%m%d-%H%M%S}"
+        backup.mkdir(parents=True, exist_ok=True)
+        for suffix in ("", "-wal", "-shm"):
+            source = self.path.with_name(self.path.name + suffix)
+            if source.exists():
+                os.replace(source, backup / source.name)
+        salvaged = self._salvage(backup / self.path.name)
+        daily = sorted(self.backup_dir.glob("assistant-*.sqlite3"))
+        if daily:
+            # Rows the damaged file lost may still be in the last daily copy; the
+            # newer rows from the damaged file are inserted first and win.
+            for table, rows in self._salvage(daily[-1]).items():
+                salvaged.setdefault(table, []).extend(rows)
         self.migrate()
+        restored = skipped = 0
+        with self.connection() as conn:
+            for table, rows in salvaged.items():
+                columns = [row[1] for row in conn.execute(f"PRAGMA table_info({table})")]
+                for row in rows:
+                    values = {key: row[key] for key in row if key in columns}
+                    if not self._row_is_sensible(table, values):
+                        skipped += 1
+                        continue
+                    names = ", ".join(values)
+                    marks = ", ".join("?" * len(values))
+                    try:
+                        conn.execute(
+                            f"INSERT OR IGNORE INTO {table}({names}) VALUES ({marks})",
+                            tuple(values.values()),
+                        )
+                        restored += 1
+                    except sqlite3.Error:
+                        skipped += 1
+        report = {"backup": str(backup), "restored": restored, "skipped": skipped}
+        log.warning(
+            "database_recovered restored=%s skipped=%s backup=%s", restored, skipped, backup
+        )
+        return report
+
+    @property
+    def backup_dir(self) -> Path:
+        return self.path.parent / "backups"
+
+    def backup(self, keep: int = 5) -> Path | None:
+        """Today's copy of the database, the last ``keep`` days kept."""
+        folder = self.backup_dir
+        target = folder / f"assistant-{datetime.now().astimezone():%Y%m%d}.sqlite3"
+        if target.exists():
+            return target
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+            destination = sqlite3.connect(target)
+            try:
+                self._thread_connection().backup(destination)
+            finally:
+                destination.close()
+        except (OSError, sqlite3.Error):
+            log.warning("database_backup_failed", exc_info=True)
+            target.unlink(missing_ok=True)
+            return None
+        for old in sorted(folder.glob("assistant-*.sqlite3"))[:-keep]:
+            old.unlink(missing_ok=True)
+        return target
+
+    @staticmethod
+    def _salvage(damaged: Path) -> dict[str, list[dict]]:
+        """Every row still readable, from the front and from the back of each table."""
+        salvaged: dict[str, list[dict]] = {}
+        try:
+            conn = sqlite3.connect(damaged, timeout=1)
+            conn.row_factory = sqlite3.Row
+        except sqlite3.Error:
+            return salvaged
+        try:
+            for table in RECOVERED_TABLES:
+                found: dict[tuple, dict] = {}
+                for order in ("ASC", "DESC"):
+                    # A bad page ends a scan; reading from the other end gets past it.
+                    try:
+                        cursor = conn.execute(f"SELECT * FROM {table} ORDER BY rowid {order}")
+                        for row in cursor:
+                            item = dict(row)
+                            found.setdefault(tuple(item.items()), item)
+                    except sqlite3.Error:
+                        continue
+                salvaged[table] = list(found.values())
+        finally:
+            conn.close()
+        return salvaged
+
+    @staticmethod
+    def _row_is_sensible(table: str, values: dict) -> bool:
+        if not values:
+            return False
+        for column in DATE_COLUMNS.get(table, ()):
+            if column in values and _parse_time(values[column]) is None:
+                return False
+        if table == "settings":
+            try:
+                json.loads(values.get("value"))
+            except (TypeError, ValueError):
+                return False
+        return True
 
     def _thread_connection(self) -> sqlite3.Connection:
         ident = threading.get_ident()
@@ -135,7 +296,14 @@ class Database:
     def get_setting(self, key: str, default=None):
         with self.connection() as conn:
             row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
-        return default if row is None else json.loads(row["value"])
+        if row is None:
+            return default
+        try:
+            return json.loads(row["value"])
+        except (TypeError, ValueError):
+            # One unreadable value must not take the whole window down with it.
+            log.warning("setting_unreadable key=%s", key)
+            return default
 
     def set_setting(self, key: str, value) -> None:
         with self.connection() as conn:
@@ -251,7 +419,10 @@ class Database:
                     "SELECT external_id, start_at, end_at, missing_count FROM lessons"
                 ).fetchall()
                 # Offsets may differ between rows, so compare datetimes, not strings.
-                if datetime.fromisoformat(row["end_at"]) < keep_from
+                # A row with an unreadable time is of no use and is dropped too.
+                if _parse_time(row["end_at"]) is None
+                or _parse_time(row["start_at"]) is None
+                or datetime.fromisoformat(row["end_at"]) < keep_from
                 or row["missing_count"] >= self._tolerance_for(row, now, missing_tolerance)
             ]
             conn.executemany(
@@ -281,21 +452,26 @@ class Database:
     def list_lessons(self) -> list[Lesson]:
         with self.connection() as conn:
             rows = conn.execute("SELECT * FROM lessons ORDER BY start_at").fetchall()
-        return [
-            Lesson(
-                external_id=row["external_id"],
-                subject_name=row["subject_name"],
-                lesson_type=row["lesson_type"],
-                teacher=row["teacher"],
-                group_name=row["group_name"],
-                start_at=datetime.fromisoformat(row["start_at"]),
-                end_at=datetime.fromisoformat(row["end_at"]),
-                room=row["room"],
-                source_url=row["source_url"],
-                is_online=bool(row["is_online"]),
+        lessons = []
+        for row in rows:
+            start, end = _parse_time(row["start_at"]), _parse_time(row["end_at"])
+            if start is None or end is None:
+                continue  # a damaged row; the next schedule refresh replaces it
+            lessons.append(
+                Lesson(
+                    external_id=row["external_id"],
+                    subject_name=row["subject_name"],
+                    lesson_type=row["lesson_type"],
+                    teacher=row["teacher"],
+                    group_name=row["group_name"],
+                    start_at=start,
+                    end_at=end,
+                    room=row["room"],
+                    source_url=row["source_url"],
+                    is_online=bool(row["is_online"]),
+                )
             )
-            for row in rows
-        ]
+        return lessons
 
     def set_rule(self, subject_name: str, mode: RuleMode) -> None:
         with self.connection() as conn:
@@ -410,11 +586,13 @@ class Database:
                 id=row["id"],
                 lesson_id=row["lesson_id"],
                 token_hash=row["token_hash"],
-                detected_at=datetime.fromisoformat(row["detected_at"]),
+                detected_at=detected,
                 status=row["status"],
                 message=row["message"],
             )
             for row in rows
+            # Damaged dates used to crash the history page and with it the start.
+            if (detected := _parse_time(row["detected_at"])) is not None
         ]
 
     def seen_recently(self, token_hash: str, after: datetime) -> bool:
