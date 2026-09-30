@@ -13,7 +13,15 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from .async_runtime import run_async
-from .cdp import Browser, CdpError, CdpTimeout, browser_id, debugger_url, endpoint_alive
+from .cdp import (
+    DEEP_ALL_JS,
+    Browser,
+    CdpError,
+    CdpTimeout,
+    browser_id,
+    debugger_url,
+    endpoint_alive,
+)
 from .moodle import looks_like_login_page
 
 log = logging.getLogger(__name__)
@@ -26,21 +34,28 @@ STATUS_LINE_MAX = 80
 # Chat and comment panes: whatever students type there is not the room's state.
 # Status banners are often aria-live regions themselves, so those are kept.
 CHAT_SELECTOR = "[class*='chat' i], [class*='comment' i], [role='log']"
-VISIBLE_TEXT_WITHOUT_CHAT = """
-selector => {
+VISIBLE_TEXT_WITHOUT_CHAT = (
+    """
+selector => {"""
+    + DEEP_ALL_JS
+    + """
   const chat = new Set();
-  for (const element of document.querySelectorAll(selector)) {
+  for (const element of deepAll(selector)) {
     for (const line of (element.innerText || '').split('\\n')) {
       const text = line.trim();
       if (text) chat.add(text);
     }
   }
-  return (document.body ? document.body.innerText || '' : '')
+  // The page and the frames of the same site, where a room may be rendered.
+  const bodies = deepAll('body').map(body => body.innerText || '');
+  return bodies.join('\\n')
     .split('\\n')
     .filter(line => !chat.has(line.trim()))
     .join('\\n');
 }
 """
+)
+CHAT_TEXT = "s => {" + DEEP_ALL_JS + " return deepAll(s).map(e => e.innerText || '').join('\\n'); }"
 
 
 class NotSignedInError(RuntimeError):
@@ -677,11 +692,7 @@ class BrowserService:
         # used to be allowed here: on 24.09 that budget lost 370 frames of 526.
         png = await page.screenshot(timeout=CAPTURE_TIMEOUT_MS)
         try:
-            visible_text = await page.evaluate(
-                "s => [...document.querySelectorAll(s)].map(e => e.innerText || '').join('\\n')",
-                CHAT_SELECTOR,
-                timeout=1,
-            )
+            visible_text = await page.evaluate(CHAT_TEXT, CHAT_SELECTOR, timeout=1)
         except Exception:  # noqa: BLE001 - text observation must not break QR capture
             visible_text = ""
         return png, visible_text

@@ -116,6 +116,13 @@ class Site(http.server.BaseHTTPRequestHandler):
             body, kind = ROOM.encode(), "text/html; charset=utf-8"
         elif self.path == "/qr.png":
             body, kind = self.qr_png, "image/png"
+        elif self.path.startswith("/framed/"):
+            # The whole room inside a frame of the same site.
+            body = (
+                b'<!doctype html><meta charset="utf-8"><body style="margin:0">'
+                b'<iframe src="/event/888" style="border:0;width:100vw;height:100vh"></iframe>'
+            )
+            kind = "text/html; charset=utf-8"
         elif self.path.startswith("/redirect/"):
             # The page replaces itself while it is still being parsed.
             body = b"<!doctype html><script>location.replace('/event/777')</script>"
@@ -262,3 +269,18 @@ def test_opening_a_lecture_never_takes_a_helper_tab(room):
     assert helper.url == helper_url
     service._helper_targets.discard(helper.target_id)
     run_async(helper.close())
+
+
+def test_a_room_rendered_inside_a_frame_is_joined_and_chatted_in(room):
+    service, http_port = room
+    service.lecture_url = None
+    service._lecture_target = None
+    service.open(f"http://mts-link.ru:{http_port}/framed/1")
+    time.sleep(0.5)  # let the frame load
+
+    assert service.lecture_state() == "waiting"
+    assert service.join_lecture("Петров Пётр") == "joined"
+    assert service.lecture_state() == "live"
+    service.send_chat_message("Петров Пётр ИКБО-01-24")
+    page = run_async(service._active_page())
+    assert run_async(page.count_text("Петров Пётр ИКБО-01-24")) == 1
