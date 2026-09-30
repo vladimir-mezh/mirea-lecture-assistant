@@ -842,3 +842,24 @@ def test_the_login_button_does_nothing_while_a_login_runs(window, monkeypatch):
     window.login()
 
     assert dialogs == []
+
+
+def test_the_theme_can_be_switched_and_is_remembered(window):
+    from mirea_lecture_assistant.ui import THEMES
+
+    window.theme_choice.setCurrentIndex(window.theme_choice.findData("dark"))
+    assert window.db.get_setting("theme") == "dark"
+    assert window.colors is THEMES["dark"]
+    assert THEMES["dark"]["bg"] in window.styleSheet()
+
+    window.theme_choice.setCurrentIndex(window.theme_choice.findData("light"))
+    assert window.colors is THEMES["light"]
+    assert THEMES["light"]["bg"] in window.styleSheet()
+
+
+def test_both_themes_define_every_colour_the_stylesheet_uses():
+    from mirea_lecture_assistant.ui import STYLE, THEMES
+
+    for name, tokens in THEMES.items():
+        STYLE.substitute(tokens)  # raises KeyError on a missing token
+        assert tokens.keys() == THEMES["light"].keys(), name

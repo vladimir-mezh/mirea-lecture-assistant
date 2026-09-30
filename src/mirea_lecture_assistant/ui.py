@@ -7,9 +7,19 @@ import threading
 import time
 from datetime import UTC, datetime, timedelta
 from functools import partial
+from string import Template
 
 from PySide6.QtCore import QObject, QRunnable, Qt, QThreadPool, QTimer, QUrl, Signal, Slot
-from PySide6.QtGui import QAction, QBrush, QColor, QDesktopServices, QKeySequence, QShortcut
+from PySide6.QtGui import (
+    QAction,
+    QBrush,
+    QColor,
+    QDesktopServices,
+    QGuiApplication,
+    QKeySequence,
+    QPalette,
+    QShortcut,
+)
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -124,51 +134,141 @@ def _email_account_from_fields(
     return EmailAccount(address, password, provider, host, port, username).normalized()
 
 
-STYLE = """
-QMainWindow, QWidget { background: #f5f7fb; color: #172033; font-family: 'Segoe UI'; font-size: 14px; }
+# Colour tokens of the two themes; the stylesheet and every coloured cell use them.
+THEMES = {
+    "light": {
+        "bg": "#f5f7fb",
+        "surface": "#ffffff",
+        "text": "#172033",
+        "title": "#111827",
+        "muted": "#64748b",
+        "border": "#e4e9f2",
+        "input_border": "#d8deea",
+        "header": "#f8fafc",
+        "grid": "#eef1f6",
+        "accent": "#3451d1",
+        "accent_hover": "#2943b3",
+        "on_accent": "#ffffff",
+        "secondary_bg": "#e8edff",
+        "secondary_fg": "#2943b3",
+        "disabled_bg": "#cbd5e1",
+        "disabled_fg": "#475569",
+        "input_disabled": "#f1f5f9",
+        "spin_button": "#eef2ff",
+        "focus": "#93c5fd",
+        "sidebar": "#172554",
+        "sidebar_hover": "#24346b",
+        "sidebar_text": "#cbd5e1",
+        "ok": "#15803d",
+        "info": "#1d4ed8",
+        "warn": "#b45309",
+        "error": "#b91c1c",
+        "past": "#94a3b8",
+        "current": "#e0e7ff",
+        "selection": "#c7d2fe",
+        "mode_auto": "#dcfce7",
+        "mode_ask": "#fef9c3",
+        "mode_ignore": "#f1f5f9",
+    },
+    "dark": {
+        "bg": "#0f1420",
+        "surface": "#182031",
+        "text": "#e5e9f2",
+        "title": "#f3f5fa",
+        "muted": "#94a3b8",
+        "border": "#2a3447",
+        "input_border": "#3a4660",
+        "header": "#1d2638",
+        "grid": "#243047",
+        "accent": "#5b76f0",
+        "accent_hover": "#4a64dd",
+        "on_accent": "#ffffff",
+        "secondary_bg": "#26315c",
+        "secondary_fg": "#c7d2fe",
+        "disabled_bg": "#334155",
+        "disabled_fg": "#94a3b8",
+        "input_disabled": "#1b2333",
+        "spin_button": "#26315c",
+        "focus": "#93c5fd",
+        "sidebar": "#0b1226",
+        "sidebar_hover": "#1a2750",
+        "sidebar_text": "#cbd5e1",
+        "ok": "#4ade80",
+        "info": "#93c5fd",
+        "warn": "#fbbf24",
+        "error": "#f87171",
+        "past": "#64748b",
+        "current": "#26315c",
+        "selection": "#34427a",
+        "mode_auto": "#14532d",
+        "mode_ask": "#713f12",
+        "mode_ignore": "#1f2937",
+    },
+}
+THEME_CHOICES = (("system", "Как в системе"), ("light", "Светлая"), ("dark", "Тёмная"))
+
+STYLE = Template("""
+QMainWindow, QWidget { background: $bg; color: $text; font-family: 'Segoe UI'; font-size: 14px; }
 QLabel { background: transparent; }
-#sidebar { background: #172554; min-width: 210px; max-width: 210px; }
+QToolTip { background: $surface; color: $text; border: 1px solid $border; padding: 4px; }
+QMenu { background: $surface; color: $text; border: 1px solid $border; }
+QMenu::item:selected { background: $selection; }
+QMenu::item:disabled { color: $muted; }
+#sidebar { background: $sidebar; min-width: 210px; max-width: 210px; }
 #brand { color: white; font-size: 17px; font-weight: 700; padding: 20px 14px; }
-#nav { text-align: left; color: #cbd5e1; border: 0; border-radius: 8px; padding: 11px 16px; margin: 2px 10px; background: transparent; }
-#nav:hover { background: #24346b; color: white; }
-#nav:checked { background: #3451d1; color: white; font-weight: 600; }
-#nav:focus { border: 2px solid #93c5fd; }
-#pageTitle { font-size: 27px; font-weight: 700; color: #111827; }
-#muted { color: #64748b; }
-#card { background: white; border: 1px solid #e4e9f2; border-radius: 12px; padding: 14px; }
-#nowCard { background: white; border: 1px solid #e4e9f2; border-left: 4px solid #3451d1; border-radius: 10px; padding: 12px 16px; font-size: 15px; }
-#dirty { color: #b45309; font-weight: 600; }
-#activity { color: #3451d1; padding: 0 8px; }
-QGroupBox#section { background: white; border: 1px solid #e4e9f2; border-radius: 12px; margin-top: 22px; padding: 16px 14px 10px 14px; font-weight: 600; }
-QGroupBox#section::title { subcontrol-origin: margin; left: 12px; padding: 0 4px; color: #3451d1; }
+#nav { text-align: left; color: $sidebar_text; border: 0; border-radius: 8px; padding: 11px 16px; margin: 2px 10px; background: transparent; }
+#nav:hover { background: $sidebar_hover; color: white; }
+#nav:checked { background: $accent; color: white; font-weight: 600; }
+#nav:focus { border: 2px solid $focus; }
+#pageTitle { font-size: 27px; font-weight: 700; color: $title; }
+#muted { color: $muted; }
+#card { background: $surface; border: 1px solid $border; border-radius: 12px; padding: 14px; }
+#nowCard { background: $surface; border: 1px solid $border; border-left: 4px solid $accent; border-radius: 10px; padding: 12px 16px; font-size: 15px; }
+#dirty { color: $warn; font-weight: 600; }
+#activity { color: $accent; padding: 0 8px; }
+QGroupBox { color: $text; }
+QGroupBox#section { background: $surface; border: 1px solid $border; border-radius: 12px; margin-top: 22px; padding: 16px 14px 10px 14px; font-weight: 600; }
+QGroupBox#section::title { subcontrol-origin: margin; left: 12px; padding: 0 4px; color: $accent; }
 QScrollArea { border: 0; background: transparent; }
-QPushButton { background: #3451d1; color: white; border: 0; border-radius: 7px; padding: 9px 15px; font-weight: 600; }
-QPushButton:hover { background: #2943b3; }
-QPushButton:focus { border: 2px solid #93c5fd; }
-QPushButton:disabled { background: #cbd5e1; color: #475569; }
-QPushButton#secondary { background: #e8edff; color: #2943b3; }
-QLineEdit, QComboBox, QSpinBox { background: white; border: 1px solid #d8deea; border-radius: 7px; padding: 8px; }
+QPushButton { background: $accent; color: $on_accent; border: 0; border-radius: 7px; padding: 9px 15px; font-weight: 600; }
+QPushButton:hover { background: $accent_hover; }
+QPushButton:focus { border: 2px solid $focus; }
+QPushButton:disabled { background: $disabled_bg; color: $disabled_fg; }
+QPushButton#secondary { background: $secondary_bg; color: $secondary_fg; }
+QLineEdit, QComboBox, QSpinBox, QPlainTextEdit { background: $surface; color: $text; border: 1px solid $input_border; border-radius: 7px; padding: 8px; selection-background-color: $selection; }
+QComboBox QAbstractItemView { background: $surface; color: $text; selection-background-color: $selection; }
 QSpinBox { padding-right: 22px; min-width: 90px; }
-QSpinBox::up-button, QSpinBox::down-button { width: 20px; border: 0; background: #eef2ff; }
+QSpinBox::up-button, QSpinBox::down-button { width: 20px; border: 0; background: $spin_button; }
 QSpinBox::up-button { border-top-right-radius: 7px; }
 QSpinBox::down-button { border-bottom-right-radius: 7px; }
+QCheckBox { color: $text; background: transparent; spacing: 8px; }
+QCheckBox::indicator { width: 16px; height: 16px; border: 1px solid $input_border; border-radius: 4px; background: $surface; }
+QCheckBox::indicator:checked { background: $accent; border: 1px solid $accent; }
+QCheckBox::indicator:focus { border: 1px solid $focus; }
+QScrollBar:vertical { background: transparent; width: 10px; margin: 2px; }
+QScrollBar:horizontal { background: transparent; height: 10px; margin: 2px; }
+QScrollBar::handle:vertical { background: $input_border; border-radius: 4px; min-height: 28px; }
+QScrollBar::handle:horizontal { background: $input_border; border-radius: 4px; min-width: 28px; }
+QScrollBar::add-line, QScrollBar::sub-line { width: 0; height: 0; }
+QScrollBar::add-page, QScrollBar::sub-page { background: transparent; }
 QTableWidget QPushButton { padding: 4px 10px; border-radius: 6px; }
 QTableWidget QLineEdit { padding: 3px 6px; border-radius: 5px; }
-QLineEdit:focus, QComboBox:focus, QSpinBox:focus { border: 1px solid #3451d1; }
-QLineEdit:disabled, QComboBox:disabled, QSpinBox:disabled { background: #f1f5f9; color: #64748b; }
-QTableWidget { background: white; border: 1px solid #e4e9f2; border-radius: 10px; gridline-color: #eef1f6; }
-QHeaderView::section { background: #f8fafc; border: 0; border-bottom: 1px solid #e4e9f2; padding: 9px; font-weight: 600; }
-"""
+QLineEdit:focus, QComboBox:focus, QSpinBox:focus { border: 1px solid $accent; }
+QLineEdit:disabled, QComboBox:disabled, QSpinBox:disabled { background: $input_disabled; color: $muted; }
+QTableWidget { background: $surface; color: $text; border: 1px solid $border; border-radius: 10px; gridline-color: $grid; selection-background-color: $selection; selection-color: $text; }
+QHeaderView::section { background: $header; color: $text; border: 0; border-bottom: 1px solid $border; padding: 9px; font-weight: 600; }
+QStatusBar { background: $bg; color: $text; }
+""")
 
 MODE_LABELS = {RuleMode.AUTO: "Авто", RuleMode.ASK: "Спрашивать", RuleMode.IGNORE: "Не открывать"}
-MODE_COLORS = {RuleMode.AUTO: "#dcfce7", RuleMode.ASK: "#fef9c3", RuleMode.IGNORE: "#f1f5f9"}
+MODE_TOKENS = {RuleMode.AUTO: "mode_auto", RuleMode.ASK: "mode_ask", RuleMode.IGNORE: "mode_ignore"}
 HISTORY_STATUS = {
-    "detected": ("Отправляется", "#1d4ed8"),
-    "retrying": ("Повторная отправка", "#b45309"),
-    "ignored": ("Пропущен", "#64748b"),
-    "submitted": ("Посещение подтверждено", "#15803d"),
-    "failed": ("Ошибка", "#b91c1c"),
-    "invalid": ("Неверный QR", "#b91c1c"),
+    "detected": ("Отправляется", "info"),
+    "retrying": ("Повторная отправка", "warn"),
+    "ignored": ("Пропущен", "muted"),
+    "submitted": ("Посещение подтверждено", "ok"),
+    "failed": ("Ошибка", "error"),
+    "invalid": ("Неверный QR", "error"),
 }
 AUTH_STATES = {
     "signed_in": ("● MIREA: вход выполнен", "#86efac"),
@@ -447,10 +547,14 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("MIREA Lecture Assistant")
         self.resize(1080, 700)
         self.setMinimumSize(880, 580)
-        self.setStyleSheet(STYLE)
+        self.colors = THEMES["light"]
         self._build_ui()
         self._build_tray()
         self._load_settings()
+        self._apply_theme()
+        hints = QGuiApplication.styleHints()
+        if hasattr(hints, "colorSchemeChanged"):
+            hints.colorSchemeChanged.connect(lambda _scheme: self._apply_theme())
         self.refresh_views()
         log.info("main_window_ready")
 
@@ -614,7 +718,7 @@ class MainWindow(QMainWindow):
         self.scan_button.clicked.connect(self.toggle_scanner)
         row.addWidget(self.scan_button)
         self.scan_state = QLabel("● Остановлен")
-        self.scan_state.setStyleSheet("color: #64748b")
+        self.scan_state.setStyleSheet(f"color: {self.colors['muted']}")
         row.addWidget(self.scan_state)
         row.addStretch()
         box.addLayout(row)
@@ -738,6 +842,13 @@ class MainWindow(QMainWindow):
         test_email.clicked.connect(self._test_email_connection)
         sign_in.addRow("", test_email)
 
+        appearance = self._settings_section(sections, "Внешний вид")
+        self.theme_choice = QComboBox()
+        for value, label in THEME_CHOICES:
+            self.theme_choice.addItem(label, value)
+        self.theme_choice.currentIndexChanged.connect(self._theme_choice_changed)
+        appearance.addRow("Оформление", self.theme_choice)
+
         diagnostics = self._settings_section(sections, "Диагностика")
         open_logs = QPushButton("Открыть папку журналов", objectName="secondary")
         open_logs.clicked.connect(self._open_logs_folder)
@@ -796,6 +907,57 @@ class MainWindow(QMainWindow):
         parent_layout.addWidget(box)
         return form
 
+    def _theme_choice_changed(self, _index: int):
+        # Cosmetic, so it is applied and kept at once rather than on «Сохранить».
+        self.db.set_setting("theme", self.theme_choice.currentData() or "system")
+        self._apply_theme()
+
+    def _theme_is_dark(self) -> bool:
+        choice = self.db.get_setting("theme", "system")
+        if choice in ("light", "dark"):
+            return choice == "dark"
+        hints = QGuiApplication.styleHints()
+        scheme = getattr(hints, "colorScheme", None)
+        if scheme is None:
+            return False
+        return scheme() == Qt.ColorScheme.Dark
+
+    def _apply_theme(self):
+        name = "dark" if self._theme_is_dark() else "light"
+        self.colors = THEMES[name]
+        self.setStyleSheet(STYLE.substitute(self.colors))
+        # Dialogs, message boxes and menus outside the stylesheet follow the palette.
+        palette = QPalette()
+        roles = {
+            QPalette.ColorRole.Window: "bg",
+            QPalette.ColorRole.WindowText: "text",
+            QPalette.ColorRole.Base: "surface",
+            QPalette.ColorRole.AlternateBase: "header",
+            QPalette.ColorRole.Text: "text",
+            QPalette.ColorRole.Button: "surface",
+            QPalette.ColorRole.ButtonText: "text",
+            QPalette.ColorRole.ToolTipBase: "surface",
+            QPalette.ColorRole.ToolTipText: "text",
+            QPalette.ColorRole.Highlight: "accent",
+            QPalette.ColorRole.HighlightedText: "on_accent",
+            QPalette.ColorRole.PlaceholderText: "muted",
+            QPalette.ColorRole.Link: "info",
+        }
+        for role, token in roles.items():
+            palette.setColor(role, QColor(self.colors[token]))
+        app = QApplication.instance()
+        if app is not None:
+            app.setPalette(palette)
+        self.scan_state.setStyleSheet(
+            f"color: {self.colors['ok' if self.scan_timer.isActive() else 'muted']}"
+            if hasattr(self, "scan_timer")
+            else f"color: {self.colors['muted']}"
+        )
+        self.schedule_signature = None
+        self._fill_schedule()
+        self._fill_history()
+        log.info("theme_applied theme=%s", name)
+
     def _settings_changed(self, *_args):
         self.settings_dirty_label.setText("● Есть несохранённые изменения")
 
@@ -852,6 +1014,10 @@ class MainWindow(QMainWindow):
         self.chat_fallback.setChecked(bool(self.db.get_setting("chat_fallback", True)))
         self.student_name.setText(self.db.get_setting("student_name", ""))
         self.auto_login.setChecked(bool(self.db.get_setting("auto_login", True)))
+        self.theme_choice.blockSignals(True)
+        index = self.theme_choice.findData(self.db.get_setting("theme", "system"))
+        self.theme_choice.setCurrentIndex(max(index, 0))
+        self.theme_choice.blockSignals(False)
         try:
             email_credentials = self.session_store.load_email_credentials()
         except Exception:  # noqa: BLE001
@@ -1983,16 +2149,16 @@ class MainWindow(QMainWindow):
                         f"{lesson.subject_name}\nПреподаватель: {lesson.teacher or 'не указан'}"
                     )
                 if lesson.end_at < now:
-                    cell.setForeground(QBrush(QColor("#94a3b8")))
+                    cell.setForeground(QBrush(QColor(self.colors["past"])))
                 elif lesson.start_at <= now:
-                    cell.setBackground(QBrush(QColor("#e0e7ff")))
+                    cell.setBackground(QBrush(QColor(self.colors["current"])))
                     cell.setToolTip(
                         "Идёт сейчас\n" + cell.toolTip() if cell.toolTip() else "Идёт сейчас"
                     )
                 self.schedule_table.setItem(row, column, cell)
             mode = rules.get(lesson.subject_name, RuleMode.ASK)
             mode_item = QTableWidgetItem(MODE_LABELS[mode])
-            mode_item.setBackground(QBrush(QColor(MODE_COLORS[mode])))
+            mode_item.setBackground(QBrush(QColor(self.colors[MODE_TOKENS[mode]])))
             mode_item.setToolTip("Общее правило предмета; изменяется над таблицей")
             mode_item.setFlags(mode_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
             self.schedule_table.setItem(row, 5, mode_item)
@@ -2056,7 +2222,7 @@ class MainWindow(QMainWindow):
             mode_item = self.schedule_table.item(row, 5)
             if item is not None and item.text() == subject and mode_item is not None:
                 mode_item.setText(MODE_LABELS[mode])
-                mode_item.setBackground(QBrush(QColor(MODE_COLORS[mode])))
+                mode_item.setBackground(QBrush(QColor(self.colors[MODE_TOKENS[mode]])))
         self._update_now_card()
         self.statusBar().showMessage(
             f"Для всех занятий «{subject}» установлен режим «{MODE_LABELS[mode]}»", 4000
@@ -2393,9 +2559,9 @@ class MainWindow(QMainWindow):
             time_item.setData(Qt.ItemDataRole.UserRole, event.detected_at.isoformat())
             time_item.setToolTip(f"{event.detected_at:%d.%m.%Y %H:%M:%S}")
             self.history_table.setItem(row, 0, time_item)
-            label, colour = HISTORY_STATUS.get(event.status, (event.status, "#172033"))
+            label, token = HISTORY_STATUS.get(event.status, (event.status, "text"))
             status_item = QTableWidgetItem(label)
-            status_item.setForeground(QBrush(QColor(colour)))
+            status_item.setForeground(QBrush(QColor(self.colors[token])))
             status_item.setToolTip(f"Отпечаток QR: {event.token_hash[:16]}…")
             self.history_table.setItem(row, 1, status_item)
             subject = subjects.get(event.lesson_id or "", "—" if event.lesson_id else "Вручную")
@@ -2427,9 +2593,9 @@ class MainWindow(QMainWindow):
             subject = lesson.subject_name if lesson else "лекция"
             until = f" · до {lesson.end_at:%H:%M}" if lesson else ""
             if self._attendance_already_marked(self.active_lecture_id):
-                state = '<span style="color:#15803d">посещение отмечено ✓</span>'
+                state = f'<span style="color:{self.colors["ok"]}">посещение отмечено ✓</span>'
             elif self.scan_timer.isActive():
-                state = '<span style="color:#1d4ed8">ищем QR…</span>'
+                state = f'<span style="color:{self.colors["info"]}">ищем QR…</span>'
             else:
                 state = "сканер выключен"
             text = f"<b>Идёт:</b> {subject}{until} · {state}"
@@ -2443,7 +2609,8 @@ class MainWindow(QMainWindow):
             if nearest is not None and nearest.external_id in self.room_lost_lessons:
                 text = (
                     f"<b>Сейчас:</b> {nearest.subject_name} · "
-                    '<span style="color:#b45309">комната закрылась — ищем новую ссылку в СДО</span>'
+                    f'<span style="color:{self.colors["warn"]}">'
+                    "комната закрылась — ищем новую ссылку в СДО</span>"
                 )
                 plain = f"{nearest.subject_name} · ищем новую комнату"
             elif nearest is None:
@@ -2478,7 +2645,7 @@ class MainWindow(QMainWindow):
             self.scan_timer.stop()
             self.scan_button.setText("Начать сканирование экрана")
             self.scan_state.setText("● Остановлен")
-            self.scan_state.setStyleSheet("color: #64748b")
+            self.scan_state.setStyleSheet(f"color: {self.colors['muted']}")
             self.pause_action.setText("Начать QR-сканирование")
             log.info("scanner_stopped")
             self._update_now_card()
@@ -2486,7 +2653,7 @@ class MainWindow(QMainWindow):
             self.scan_timer.start(self.scan_interval.value() * 1000)
             self.scan_button.setText("Остановить сканирование")
             self.scan_state.setText("● Сканирует")
-            self.scan_state.setStyleSheet("color: #16a34a")
+            self.scan_state.setStyleSheet(f"color: {self.colors['ok']}")
             self.pause_action.setText("Остановить QR-сканирование")
             log.info("scanner_started interval_seconds=%s", self.scan_interval.value())
             self._update_now_card()

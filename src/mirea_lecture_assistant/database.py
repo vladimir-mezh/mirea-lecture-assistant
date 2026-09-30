@@ -5,7 +5,7 @@ import sqlite3
 import threading
 import time
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from .domain import Lesson, QrEvent, RuleMode
@@ -14,6 +14,9 @@ from .domain import Lesson, QrEvent, RuleMode
 # Refreshes run once a minute, so this is also roughly the tolerated outage in
 # minutes: three used to drop the running pair after a three-minute Pulse hiccup.
 MISSING_TOLERANCE = 15
+# Lessons of the next day survive an hour-long outage.
+NEAR_FUTURE = timedelta(days=1)
+NEAR_FUTURE_TOLERANCE = 60
 
 
 class Database:
@@ -249,19 +252,28 @@ class Database:
                 ).fetchall()
                 # Offsets may differ between rows, so compare datetimes, not strings.
                 if datetime.fromisoformat(row["end_at"]) < keep_from
-                or (
-                    row["missing_count"] >= missing_tolerance
-                    and not (
-                        datetime.fromisoformat(row["start_at"])
-                        <= now
-                        <= datetime.fromisoformat(row["end_at"])
-                    )
-                )
+                or row["missing_count"] >= self._tolerance_for(row, now, missing_tolerance)
             ]
             conn.executemany(
                 "DELETE FROM lessons WHERE external_id = ?", [(item,) for item in stale]
             )
         return missing, len(stale)
+
+    @staticmethod
+    def _tolerance_for(row, now: datetime, tolerance: int) -> int:
+        """How many misses a lesson survives before it counts as cancelled.
+
+        A running pair is never dropped, and one within the next day needs an
+        hour of misses: a long Pulse outage used to delete the next pair before
+        it began. A real cancellation still disappears, only later.
+        """
+        start = datetime.fromisoformat(row["start_at"])
+        end = datetime.fromisoformat(row["end_at"])
+        if start <= now <= end:
+            return 1_000_000
+        if now < start <= now + NEAR_FUTURE:
+            return max(tolerance, NEAR_FUTURE_TOLERANCE)
+        return tolerance
 
     def get_lesson(self, external_id: str) -> Lesson | None:
         return next((x for x in self.list_lessons() if x.external_id == external_id), None)

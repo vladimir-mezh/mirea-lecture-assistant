@@ -179,3 +179,21 @@ def test_batch_lookups_match_single_ones(tmp_path):
     assert db.all_rules() == {"Физика": RuleMode.AUTO}
     assert db.all_links() == {"Физика": "https://example.test/room"}
     assert db.all_resolved_links() == {"lesson-1": "https://mts-link.ru/event/1"}
+
+
+def test_the_next_pair_survives_an_hour_long_schedule_outage(tmp_path):
+    from mirea_lecture_assistant.database import NEAR_FUTURE_TOLERANCE
+
+    db = Database(tmp_path / "test.sqlite3")
+    now = datetime(2026, 9, 3, 8, 0, tzinfo=UTC)
+    upcoming = Lesson(
+        "next", "Физика", "ЛЕК", now + timedelta(hours=1), now + timedelta(hours=2, minutes=30)
+    )
+    db.sync_lessons([upcoming], now.replace(hour=0), now=now)
+
+    for _ in range(NEAR_FUTURE_TOLERANCE - 1):
+        db.sync_lessons([], now.replace(hour=0), now=now)
+    assert [x.external_id for x in db.list_lessons()] == ["next"]
+
+    db.sync_lessons([], now.replace(hour=0), now=now)
+    assert db.list_lessons() == []  # a real cancellation still goes away

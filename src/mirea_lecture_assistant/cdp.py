@@ -26,12 +26,36 @@ _POLL_SECONDS = 0.1
 # Setting up a tab's session is quick when the tab is healthy.
 _ATTACH_SECONDS = 10.0
 
+# Finds elements in the page, inside open shadow roots and inside frames of the
+# same site: a platform may render its lobby or chat in either. Frames of other
+# sites stay out of reach (they only ever show up in screenshots).
+DEEP_ALL_JS = r"""
+const deepAll = selector => {
+  const found = [];
+  const visit = root => {
+    try { found.push(...root.querySelectorAll(selector)); } catch (error) { return; }
+    for (const element of root.querySelectorAll('*')) {
+      if (element.shadowRoot) visit(element.shadowRoot);
+      if (element.tagName === 'IFRAME' || element.tagName === 'FRAME') {
+        try { if (element.contentDocument) visit(element.contentDocument); }
+        catch (error) { /* another site's frame */ }
+      }
+    }
+  };
+  visit(document);
+  return found;
+};
+"""
+
 # Element helpers run inside the page. "Visible" follows what a person sees:
 # rendered with a size, not hidden by style.
-_JS_HELPERS = r"""
+_JS_HELPERS = (
+    DEEP_ALL_JS
+    + r"""
 const visible = element => {
   if (!element || !element.isConnected) return false;
-  const style = getComputedStyle(element);
+  const view = element.ownerDocument.defaultView || window;
+  const style = view.getComputedStyle(element);
   if (style.visibility === 'hidden' || style.display === 'none') return false;
   const rect = element.getBoundingClientRect();
   return rect.width > 0 && rect.height > 0;
@@ -58,11 +82,12 @@ const describe = (element, index) => ({
   label: element.getAttribute('aria-label') || element.getAttribute('title') || '',
 });
 const pick = (selector, index) => {
-  const all = [...document.querySelectorAll(selector)];
+  const all = deepAll(selector);
   if (index === null || index === undefined) return all.find(visible) || null;
   return all[index] || null;
 };
 """
+)
 
 
 class CdpError(RuntimeError):
@@ -484,16 +509,25 @@ class Page:
         user" arms the page's leave-confirmation, so reading the page must not.
         """
         call = f"({function})({json.dumps(arg, ensure_ascii=False)})"
-        result = await self.send(
-            "Runtime.evaluate",
-            {
-                "expression": call,
-                "returnByValue": True,
-                "awaitPromise": True,
-                "userGesture": user_gesture,
-            },
-            timeout=timeout,
-        )
+        try:
+            result = await self.send(
+                "Runtime.evaluate",
+                {
+                    "expression": call,
+                    "returnByValue": True,
+                    "awaitPromise": True,
+                    "userGesture": user_gesture,
+                },
+                timeout=timeout,
+            )
+        except CdpTimeout:
+            # A script stuck in the page (ours or the page's own) keeps the tab
+            # hung for everything after it; stop whatever is running there.
+            try:
+                await self.send("Runtime.terminateExecution", timeout=2)
+            except CdpError:
+                log.debug("cdp_terminate_failed", exc_info=True)
+            raise
         if "exceptionDetails" in result:
             details = result["exceptionDetails"]
             text = details.get("exception", {}).get("description") or details.get("text", "")
@@ -523,25 +557,25 @@ class Page:
     async def elements(self, selector: str) -> list[dict]:
         """Describe every match: index, visible, text, value, placeholder, label."""
         return await self.evaluate(
-            "s => {" + _JS_HELPERS + " return [...document.querySelectorAll(s)].map(describe); }",
+            "s => {" + _JS_HELPERS + " return deepAll(s).map(describe); }",
             selector,
         )
 
     async def count_text(self, text: str) -> int:
         """How many elements show exactly this text (the innermost ones only)."""
         return await self.evaluate(
-            """t => [...document.body.querySelectorAll('*')].filter(e =>
+            "t => {"
+            + DEEP_ALL_JS
+            + """ return deepAll('*').filter(e =>
                 (e.innerText || '').trim() === t
-                && ![...e.children].some(c => (c.innerText || '').trim() === t)).length""",
+                && ![...e.children].some(c => (c.innerText || '').trim() === t)).length }""",
             text,
         )
 
     async def wait_for_selector(self, selector: str, *, timeout: float = 30_000) -> None:
         """Wait until an element matching ``selector`` is visible."""
         deadline = asyncio.get_running_loop().time() + timeout / 1000
-        script = (
-            "s => {" + _JS_HELPERS + " return [...document.querySelectorAll(s)].some(visible); }"
-        )
+        script = "s => {" + _JS_HELPERS + " return deepAll(s).some(visible); }"
         while True:
             try:
                 if await self.evaluate(script, selector, timeout=5):
@@ -574,7 +608,8 @@ class Page:
                 e.scrollIntoView({block: 'center', inline: 'center'});
                 const r = e.getBoundingClientRect();
                 const x = r.x + r.width / 2, y = r.y + r.height / 2;
-                const top = document.elementFromPoint(x, y);
+                // An element inside a frame has frame-relative coordinates.
+                const top = e.ownerDocument === document ? document.elementFromPoint(x, y) : null;
                 // Covered by an overlay, or not laid out: the mouse would hit
                 // something else, so the element is clicked directly.
                 if (r.width > 0 && r.height > 0 && top && (top === e || e.contains(top))) {
