@@ -16,7 +16,6 @@ dependencies = [
   "pymirea>=0.3.3,<0.5",
   "keyring>=25,<26",
   "mss>=10,<11",
-  "numpy>=2,<3",
   "Pillow>=11,<13",
   "playwright>=1.55,<2",
   "zxing-cpp>=2.2,<3",
