@@ -77,6 +77,9 @@ BACKGROUND_FLAGS = (
 )
 
 
+LIVENESS_TIMEOUT_SECONDS = 2.0
+
+
 class BrowserService:
     """Launch a dedicated Chrome/Edge profile and access the lecture through CDP."""
 
@@ -225,7 +228,10 @@ class BrowserService:
             return int(sock.getsockname()[1])
 
     def _cdp_available(self, port: int) -> bool:
-        return endpoint_alive(port, expected_id=self._browser_id)
+        # A closed port is refused at once, so the wait only matters for a live
+        # browser that is slow to answer (a heavy page, a busy machine): with 0.3 s
+        # it passed for dead, and a second browser was started on its profile.
+        return endpoint_alive(port, LIVENESS_TIMEOUT_SECONDS, expected_id=self._browser_id)
 
     def ensure_running(self) -> str | None:
         """Start the profile's browser on a blank tab, leaving any lecture alone."""

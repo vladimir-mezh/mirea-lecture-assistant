@@ -619,3 +619,38 @@ def test_a_successful_launch_records_its_port(service, monkeypatch):
     service.open("https://my.mts-link.ru/j/1/2")
 
     assert (service.profile_dir / service.PORT_FILE).read_text(encoding="utf-8") == "49335"
+
+
+def test_a_live_browser_slow_to_answer_is_not_taken_for_dead(tmp_path):
+    """A busy Chrome answering in 0.6 s read as "not running" and a second browser
+    was started on its profile; on CI the integration tests failed the same way."""
+    import http.server
+    import json
+    import threading
+    import time
+
+    class Slow(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            time.sleep(0.6)
+            port = self.server.server_address[1]
+            body = json.dumps(
+                {"webSocketDebuggerUrl": f"ws://127.0.0.1:{port}/devtools/browser/run"}
+            ).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_args):
+            return None
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Slow)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        service = BrowserService(tmp_path / "profile")
+        service.port = server.server_address[1]
+
+        assert service.is_running
+    finally:
+        server.shutdown()
