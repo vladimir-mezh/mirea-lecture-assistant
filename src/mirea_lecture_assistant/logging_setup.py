@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import faulthandler
 import logging
 import platform
 import re
 import sys
+import threading
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -59,6 +61,29 @@ def _build_stamp() -> str:
         return "unknown"
 
 
+_crash_file = None
+
+
+def _record_hard_crashes(log_dir: Path) -> None:
+    """Python stacks of a crash inside Qt or another native library.
+
+    Such a crash ends the process before any Python handler runs; without this
+    the journal just stops. The windowed executable has no stderr for it.
+    """
+    global _crash_file
+    if _crash_file is not None:
+        return
+    try:
+        _crash_file = open(log_dir / "crash.log", "a", encoding="utf-8")  # noqa: SIM115
+        _crash_file.write(
+            f"--- start {datetime.now().astimezone():%Y-%m-%d %H:%M:%S} v{__version__}\n"
+        )
+        _crash_file.flush()
+        faulthandler.enable(file=_crash_file, all_threads=True)
+    except (OSError, RuntimeError):
+        logging.getLogger("app").warning("crash_recorder_unavailable", exc_info=True)
+
+
 def configure_logging(log_dir: Path) -> Path:
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / "app.log"
@@ -85,7 +110,18 @@ def configure_logging(log_dir: Path) -> Path:
             exc_info=(exc_type, exc_value, traceback),
         )
 
+    def thread_exception_hook(args):
+        if args.exc_type is SystemExit:
+            return
+        logging.getLogger("crash").critical(
+            "unhandled_thread_exception thread=%s",
+            getattr(args.thread, "name", "?"),
+            exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
+        )
+
     sys.excepthook = exception_hook
+    threading.excepthook = thread_exception_hook
+    _record_hard_crashes(log_dir)
     logging.getLogger("app").info(
         "application_start version=%s built=%s platform=%s python=%s frozen=%s",
         __version__,

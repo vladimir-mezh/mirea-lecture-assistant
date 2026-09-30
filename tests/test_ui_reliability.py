@@ -807,7 +807,7 @@ def test_an_authenticator_code_is_asked_for_instead_of_waiting_for_email(window,
     monkeypatch.setattr(window, "_manual_2fa", lambda challenge, reason="": asked.append(reason))
     monkeypatch.setattr(window, "_run", lambda *args, **kwargs: waited.append(args))
 
-    challenge = SimpleNamespace(kind="otp", field_name="otp")
+    challenge = SimpleNamespace(kind="otp", field_name="otp", hidden_fields={})
     window._login_finished(SimpleNamespace(challenge=challenge, success=False, message=""))
 
     assert waited == [] and len(asked) == 1
@@ -863,3 +863,45 @@ def test_both_themes_define_every_colour_the_stylesheet_uses():
     for name, tokens in THEMES.items():
         STYLE.substitute(tokens)  # raises KeyError on a missing token
         assert tokens.keys() == THEMES["light"].keys(), name
+
+
+@pytest.mark.parametrize(
+    ("challenge", "uses_email"),
+    [
+        (SimpleNamespace(kind="email_code", field_name="emailCode", hidden_fields={}), True),
+        # pymirea's classic-form fallback labels an email form "otp" too.
+        (SimpleNamespace(kind="otp", field_name="otp", hidden_fields={"session_code": "x"}), True),
+        (SimpleNamespace(kind="otp", field_name="otp", hidden_fields={}), False),  # authenticator
+        (SimpleNamespace(kind="otp", field_name="code", hidden_fields={"login": "true"}), False),
+    ],
+)
+def test_the_email_wait_is_skipped_only_for_known_non_email_codes(window, challenge, uses_email):
+    assert window._challenge_uses_email(challenge) is uses_email
+
+
+def test_tokens_renewed_during_a_schedule_refresh_are_saved_once(window, monkeypatch):
+    """Unsaved renewals made the next start use spent tokens: a new login and code."""
+    saved = []
+    monkeypatch.setattr(window.session_store, "save", lambda session: saved.append(dict(session)))
+    window.mirea.session = {"access_token": "old"}
+    window.persisted_session = window._session_fingerprint({"access_token": "old"})
+
+    window._schedule_loaded([])
+    assert saved == []  # nothing changed, nothing written
+
+    window.mirea.session["access_token"] = "renewed"
+    window._schedule_loaded([])
+    window._schedule_loaded([])
+    assert saved == [{"access_token": "renewed"}]
+
+
+def test_an_inconclusive_session_check_still_loads_the_schedule(window, monkeypatch):
+    window.mirea.session = {"cookie": "kept"}
+    started = []
+    monkeypatch.setattr(window, "_refresh_schedule_background", lambda: started.append(True))
+    monkeypatch.setattr("mirea_lecture_assistant.ui.QTimer.singleShot", lambda *_args: None)
+
+    window._session_verified(SessionState.UNKNOWN)
+
+    assert started == [True]
+    assert window.mirea.session == {"cookie": "kept"}

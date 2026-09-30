@@ -479,6 +479,8 @@ class MainWindow(QMainWindow):
             log.exception("keyring load failed")
             session = None
         self.mirea = MireaService(session)
+        # What is on disk, to save pymirea's in-place token refreshes only when they happen.
+        self.persisted_session = self._session_fingerprint(session or {})
         self.deduplicator = QrDeduplicator(database)
         self.scanner = ScreenScanner()
         from .paths import data_dir
@@ -1409,6 +1411,7 @@ class MainWindow(QMainWindow):
             return
         try:
             self.session_store.save(self.mirea.session)
+            self.persisted_session = self._session_fingerprint(dict(self.mirea.session))
         except Exception as exc:  # noqa: BLE001 - OS keyring backends expose varied failures
             # The session works for this run; only the next start has to log in again.
             log.warning("session_persist_failed error=%s", exc)
@@ -1448,9 +1451,19 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _challenge_uses_email(challenge) -> bool:
+        """Only a recognised MAX or authenticator-app code skips the email wait.
+
+        pymirea labels most forms "otp", email ones included; narrowing the wait
+        to "email_code" alone (0.2.3) sent real email codes to a manual prompt.
+        """
+        field = str(getattr(challenge, "field_name", "") or "").casefold()
+        hidden = getattr(challenge, "hidden_fields", None) or {}
         kind = str(getattr(challenge, "kind", "") or "")
-        field = str(getattr(challenge, "field_name", "") or "")
-        return kind == "email_code" or field.casefold() == "emailcode"
+        if kind == "email_code" or field == "emailcode":
+            return True
+        max_messenger = field == "code" and str(hidden.get("login", "")).lower() == "true"
+        authenticator_app = kind == "otp" and field == "otp" and not hidden
+        return not (max_messenger or authenticator_app)
 
     def _complete_2fa(self, challenge, code: str):
         self.otp_submission_attempted = True
@@ -1567,9 +1580,12 @@ class MainWindow(QMainWindow):
             if not self.session_recheck_scheduled:
                 self.session_recheck_scheduled = True
                 QTimer.singleShot(60_000, self._retry_session_verification)
+            # The check may fail where the schedule itself still loads.
+            self._refresh_schedule_background()
             return
         self._set_auth_state("signed_in")
         self.statusBar().showMessage("Сохранённый вход восстановлен", 3000)
+        self._persist_session()
         self.refresh_schedule()
         for event_id in tuple(self.pending_qr):
             if event_id not in self.retry_scheduled:
@@ -1666,6 +1682,7 @@ class MainWindow(QMainWindow):
         def checked(state: SessionState):
             self.auth_recovery_running = False
             if state is SessionState.VALID:
+                self._persist_session()
                 return
             if state is SessionState.UNKNOWN:
                 log.info("session_recovery_deferred reason=network")
@@ -1688,6 +1705,9 @@ class MainWindow(QMainWindow):
 
     def _schedule_loaded(self, lessons):
         self.schedule_refresh_running = False
+        # pymirea renewed the cookie or the tokens on the way; without saving them
+        # the next start used the spent ones and asked for a new login and code.
+        self._persist_session()
         today = datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
         missing, dropped = self.db.sync_lessons(lessons, today)
         self._fill_schedule()
@@ -2948,12 +2968,23 @@ class MainWindow(QMainWindow):
         self.attendance_failures_by_lesson.pop(lesson_id, None)
         self.attendance_first_failure_at.pop(lesson_id, None)
 
+    @staticmethod
+    def _session_fingerprint(session: dict) -> int:
+        return hash(tuple(sorted((str(key), str(value)) for key, value in session.items())))
+
     def _persist_session(self):
         """pymirea refreshes tokens in place; keep them for the next start."""
+        session = dict(self.mirea.session)
+        fingerprint = self._session_fingerprint(session)
+        if not session or fingerprint == self.persisted_session:
+            return
         try:
-            self.session_store.save(dict(self.mirea.session))
+            self.session_store.save(session)
         except Exception:
             log.warning("session_persist_failed", exc_info=True)
+            return
+        self.persisted_session = fingerprint
+        log.info("session_persisted")
 
     def _attendance_already_marked(self, lesson_id: str | None) -> bool:
         """Attendance is recorded once per lesson; scanning after that is pointless."""

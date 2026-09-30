@@ -136,9 +136,10 @@ def test_obsolete_pending_attendance_is_deleted(tmp_path, fake_keyring):
     assert not stale.exists()
 
 
-def test_a_redirect_to_the_sso_sign_in_page_means_the_session_expired():
+def test_a_cookie_only_bounce_to_sso_is_not_an_expired_session():
+    """Pulse authorises by token; the page check alone must not drop the session."""
     from mirea_lecture_assistant.domain import SessionState
     from mirea_lecture_assistant.mirea_service import classify_session_response
 
     url = "https://sso.mirea.ru/realms/mirea/protocol/openid-connect/auth?client_id=attendance-app"
-    assert classify_session_response(200, url) is SessionState.EXPIRED
+    assert classify_session_response(200, url) is SessionState.VALID

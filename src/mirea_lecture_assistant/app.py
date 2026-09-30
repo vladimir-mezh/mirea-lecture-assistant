@@ -21,6 +21,53 @@ def _session_key() -> str:
     return key
 
 
+def _use_system_certificates(log) -> None:
+    """Check HTTPS certificates against Windows' own store, as Chrome does.
+
+    Only the bundled certifi list was trusted, which lacks the roots an
+    antivirus that inspects HTTPS or the Russian national CA install into
+    Windows: MIREA then opened in Chrome but "did not answer" in the app.
+    The bundled list stays trusted as well.
+    """
+    try:
+        import truststore
+
+        truststore.inject_into_ssl()
+    except Exception:  # the bundled list alone still works
+        log.warning("system_certificates_unavailable", exc_info=True)
+    else:
+        log.info("system_certificates_enabled")
+
+
+def _smoke_check_https(log) -> int:
+    """The build's own HTTPS stack (ssl, certificates, httpx) must reach a site.
+
+    Everything MIREA-related goes through it, and the window alone says nothing
+    about whether a trimmed build can still make a verified TLS connection.
+    """
+    url = os.environ.get("MIREA_ASSISTANT_SMOKE_URL")
+    if not url:
+        return 0
+    import httpx
+
+    from .async_runtime import run_async
+
+    async def fetch() -> int:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(20.0, connect=10.0),
+            transport=httpx.AsyncHTTPTransport(retries=2),
+        ) as client:
+            return (await client.get(url)).status_code
+
+    try:
+        status = run_async(fetch(), timeout=60)
+    except Exception:
+        log.exception("smoke_https_failed")
+        return 3
+    log.info("smoke_https_ok status=%s", status)
+    return 0
+
+
 def _app_icon(icon_factory, log):
     """Prefer the multi-size .ico: a 1024px PNG scaled to a 16px title bar is mush."""
     if sys.platform == "win32":
@@ -64,6 +111,7 @@ def main() -> int:
     log_path = configure_logging(root / "logs")
     log = logging.getLogger("app")
     log.info("data_directory_ready log_path=%s", log_path)
+    _use_system_certificates(log)
     db = Database(root / "assistant.sqlite3")
     MireaService.configure(_session_key())
 
@@ -108,10 +156,13 @@ def main() -> int:
         return 0
     window = MainWindow(db)
     window.show()
-    if os.environ.get("MIREA_ASSISTANT_SMOKE_TEST") == "1":
+    smoke_test = os.environ.get("MIREA_ASSISTANT_SMOKE_TEST") == "1"
+    if smoke_test:
         window.force_exit = True
         QTimer.singleShot(500, app.quit)
     exit_code = app.exec()
+    if smoke_test and exit_code == 0:
+        exit_code = _smoke_check_https(log)
     try:
         # Leaves Chrome and its СДО session alone; only frees the driver process.
         window.browser.disconnect()

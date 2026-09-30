@@ -39,13 +39,22 @@ jobs:
         run: .venv\Scripts\python -m PyInstaller --clean --noconfirm MireaLectureAssistant.spec
       - name: Smoke test
         shell: pwsh
-        # The executable must start, open its window and exit on its own.
+        # The executable must start on a student's data (lessons, one of them
+        # running now, history, the dark theme), open its window, make a verified
+        # HTTPS request with its own TLS stack and exit on its own.
         run: |
+          $env:LOCALAPPDATA = Join-Path $env:RUNNER_TEMP "smoke"
+          .venv\Scripts\python scripts\smoke_data.py
           $env:MIREA_ASSISTANT_SMOKE_TEST = "1"
+          $env:MIREA_ASSISTANT_SMOKE_URL = "https://github.com"
           Remove-Item Env:QT_QPA_PLATFORM
           $process = Start-Process -FilePath dist\MireaLectureAssistant.exe -PassThru
-          if (-not $process.WaitForExit(90000)) { $process.Kill(); throw "The executable did not exit" }
+          $finished = $process.WaitForExit(120000)
+          $log = Join-Path $env:LOCALAPPDATA "MireaLectureAssistant\logs\app.log"
+          if (Test-Path $log) { Get-Content $log }
+          if (-not $finished) { $process.Kill(); throw "The executable did not exit" }
           if ($process.ExitCode -ne 0) { throw "Exit code $($process.ExitCode)" }
+          if (-not (Select-String -Path $log -Pattern "smoke_https_ok" -Quiet)) { throw "No HTTPS check in the log" }
       - name: Version
         id: version
         shell: pwsh
