@@ -1453,8 +1453,9 @@ class MainWindow(QMainWindow):
     def _challenge_uses_email(challenge) -> bool:
         """Only a recognised MAX or authenticator-app code skips the email wait.
 
-        pymirea labels most forms "otp", email ones included; narrowing the wait
-        to "email_code" alone (0.2.3) sent real email codes to a manual prompt.
+        pymirea labels every form it recognises only by its HTML "otp", email
+        ones included; narrowing the wait to "email_code" alone (0.2.3) sent such
+        emailed codes to a manual prompt.
         """
         field = str(getattr(challenge, "field_name", "") or "").casefold()
         hidden = getattr(challenge, "hidden_fields", None) or {}
