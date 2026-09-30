@@ -5,6 +5,8 @@ import sys
 from pathlib import Path
 
 APP_DIR_NAME = "MireaLectureAssistant"
+# A second launch leaves this in the data directory; the running copy shows its window.
+SHOW_REQUEST_FILE = "show-window.request"
 
 
 def resource_path(relative_path: str) -> Path:

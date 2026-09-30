@@ -4,11 +4,13 @@ import base64
 import logging
 import os
 import sys
+import time
+from pathlib import Path
 
 from .async_runtime import shutdown_async_runtime
 from .database import Database
 from .logging_setup import configure_logging
-from .paths import data_dir, resource_path
+from .paths import SHOW_REQUEST_FILE, data_dir, resource_path
 
 
 def _session_key() -> str:
@@ -37,6 +39,34 @@ def _use_system_certificates(log) -> None:
         log.warning("system_certificates_unavailable", exc_info=True)
     else:
         log.info("system_certificates_enabled")
+
+
+def ask_running_copy_to_show(root: Path, wait_seconds: float = 3.0) -> bool:
+    """Bring forward the copy that is already running, usually hidden in the tray.
+
+    Only "Приложение уже запущено" used to appear, with no window anywhere; a
+    copy that never picks the request up is hung, and the caller says so.
+    """
+    if sys.platform == "win32":
+        import ctypes
+
+        # Windows lets a background process take the foreground only when allowed.
+        try:
+            ctypes.windll.user32.AllowSetForegroundWindow(-1)
+        except OSError:
+            pass
+    request = root / SHOW_REQUEST_FILE
+    try:
+        request.write_text(str(os.getpid()), encoding="ascii")
+    except OSError:
+        return False
+    deadline = time.monotonic() + wait_seconds
+    while time.monotonic() < deadline:
+        if not request.exists():
+            return True
+        time.sleep(0.1)
+    request.unlink(missing_ok=True)
+    return False
 
 
 def _smoke_check_https(log) -> int:
@@ -152,7 +182,16 @@ def main() -> int:
         log.info("second_instance_blocked")
         if os.environ.get("MIREA_ASSISTANT_SMOKE_TEST") == "1":
             return 0
-        QMessageBox.information(None, "MIREA Lecture Assistant", "Приложение уже запущено.")
+        if ask_running_copy_to_show(root):
+            log.info("second_instance_showed_running_copy")
+            return 0
+        log.warning("running_copy_unresponsive")
+        QMessageBox.warning(
+            None,
+            "MIREA Lecture Assistant",
+            "Приложение уже запущено, но не отвечает. Завершите MireaLectureAssistant.exe "
+            "в диспетчере задач (Ctrl+Shift+Esc) и запустите его снова.",
+        )
         return 0
     window = MainWindow(db)
     window.show()

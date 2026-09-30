@@ -905,3 +905,37 @@ def test_an_inconclusive_session_check_still_loads_the_schedule(window, monkeypa
 
     assert started == [True]
     assert window.mirea.session == {"cookie": "kept"}
+
+
+def test_a_second_launch_brings_the_hidden_window_back(window):
+    window.hide()
+    window.show_request.write_text("123", encoding="ascii")
+
+    window._check_show_request()
+
+    assert window.isVisible()
+    assert not window.show_request.exists()
+
+
+def test_a_second_launch_learns_whether_the_running_copy_answered(tmp_path):
+    import threading
+
+    from mirea_lecture_assistant.app import ask_running_copy_to_show
+    from mirea_lecture_assistant.paths import SHOW_REQUEST_FILE
+
+    # Nobody picks the request up: a hung copy, reported to the user.
+    assert ask_running_copy_to_show(tmp_path, wait_seconds=0.3) is False
+    assert not (tmp_path / SHOW_REQUEST_FILE).exists()
+
+    def running_copy():
+        request = tmp_path / SHOW_REQUEST_FILE
+        for _ in range(50):
+            if request.exists():
+                request.unlink()
+                return
+            threading.Event().wait(0.02)
+
+    responder = threading.Thread(target=running_copy)
+    responder.start()
+    assert ask_running_copy_to_show(tmp_path, wait_seconds=2) is True
+    responder.join()

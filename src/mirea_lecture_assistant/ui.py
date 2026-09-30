@@ -483,7 +483,7 @@ class MainWindow(QMainWindow):
         self.persisted_session = self._session_fingerprint(session or {})
         self.deduplicator = QrDeduplicator(database)
         self.scanner = ScreenScanner()
-        from .paths import data_dir
+        from .paths import SHOW_REQUEST_FILE, data_dir
 
         self.browser = BrowserService(data_dir() / "browser-profile")
         self.pending_qr: dict[int, PendingAttendance] = {}
@@ -563,6 +563,10 @@ class MainWindow(QMainWindow):
         self.clock = QTimer(self)
         self.clock.timeout.connect(self._refresh_relative_times)
         self.clock.start(30_000)
+        self.show_request = data_dir() / SHOW_REQUEST_FILE
+        self.show_request_timer = QTimer(self)
+        self.show_request_timer.timeout.connect(self._check_show_request)
+        self.show_request_timer.start(1_000)
         self.scan_timer = QTimer(self)
         self.scan_timer.timeout.connect(self._scan_tick)
         self.schedule_timer = QTimer(self)
@@ -3093,6 +3097,17 @@ class MainWindow(QMainWindow):
         self.showNormal()
         self.activateWindow()
         self.raise_()
+
+    def _check_show_request(self):
+        """A second launch asks for the window of this, the running copy."""
+        try:
+            if not self.show_request.exists():
+                return
+            self.show_request.unlink()
+        except OSError:
+            return
+        log.info("window_shown_for_second_launch")
+        self._restore()
 
     def _quit(self):
         log.info("quit_requested")
