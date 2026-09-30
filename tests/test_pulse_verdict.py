@@ -99,7 +99,19 @@ def test_pulse_refusing_the_session_and_its_refresh_token_means_expired(pulse):
     pulse.handle = _refusing_pulse
     service = MireaService({"access_token": "stale", "refresh_token": "spent"})
 
-    assert asyncio.run(service.pulse_verdict()) is SessionState.EXPIRED
+    # The recovery after a failed refresh asks exactly this; before 0.2.5 a page
+    # check answered "valid" here and the dead session was never renewed.
+    assert asyncio.run(service.verify_state()) is SessionState.EXPIRED
+
+
+def test_a_maintenance_page_behind_a_saved_cookie_is_not_an_expired_session(pulse):
+    def maintenance(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, html="<html><h1>Технические работы</h1></html>")
+
+    pulse.handle = maintenance
+    service = MireaService({".AspNetCore.Cookies": "saved", "access_token": "a"})
+
+    assert asyncio.run(service.verify_state()) is SessionState.UNKNOWN
 
 
 def test_pulse_accepting_the_session_on_a_free_day_means_valid(pulse):

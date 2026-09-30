@@ -5,21 +5,12 @@ import httpx
 import pytest
 
 from mirea_lecture_assistant.domain import SessionState
-from mirea_lecture_assistant.mirea_service import MireaService, classify_session_response
+from mirea_lecture_assistant.mirea_service import MireaService
 from mirea_lecture_assistant.reliability import (
     attendance_failure_counts_for_chat,
     login_retry_delay,
     should_retry_login,
 )
-
-
-def test_session_response_distinguishes_expiry_from_server_outage():
-    assert classify_session_response(200, "https://attendance.mirea.ru/") is SessionState.VALID
-    assert (
-        classify_session_response(200, "https://login.mirea.ru/realms/mirea/login")
-        is SessionState.EXPIRED
-    )
-    assert classify_session_response(503, "https://attendance.mirea.ru/") is SessionState.UNKNOWN
 
 
 def test_login_backoff_is_bounded():
@@ -41,23 +32,34 @@ def test_network_and_auth_failures_do_not_trigger_public_chat_fallback():
     assert attendance_failure_counts_for_chat("QR больше не действует")
 
 
-def test_network_timeout_keeps_session_state_unknown(monkeypatch):
-    class Client:
-        async def __aenter__(self):
-            return self
+def test_a_network_failure_keeps_the_session_and_its_state_unknown(pulse):
+    async def offline():
+        raise httpx.ConnectTimeout("offline")
 
-        async def __aexit__(self, *_args):
-            return None
-
-        async def get(self, url):
-            raise httpx.ConnectTimeout("offline", request=httpx.Request("GET", url))
-
-    monkeypatch.setattr(httpx, "AsyncHTTPTransport", lambda **_kwargs: object())
-    monkeypatch.setattr(httpx, "AsyncClient", lambda **_kwargs: Client())
+    pulse._ensure_aspnet_cookie = lambda self: offline()
     service = MireaService({"session-cookie": "preserved"})
 
     assert asyncio.run(service.verify_state()) is SessionState.UNKNOWN
     assert service.session == {"session-cookie": "preserved"}
+
+
+def test_a_refusal_of_a_saved_cookie_is_checked_again_without_it(pulse):
+    """With a saved cookie pymirea skips the bootstrap, and a firewall page on the
+    lesson call reads as "session expired"; a fresh bootstrap decides instead."""
+    calls = []
+
+    async def lesson_call(self, _url, _payload):
+        calls.append(dict(self.session_cookies))
+        if ".AspNetCore.Cookies" in self.session_cookies and len(calls) == 1:
+            return None, "Сессия МИРЭА истекла. Перелогиньтесь."
+        return b"", None
+
+    pulse._grpc_unary = lesson_call
+    service = MireaService({".AspNetCore.Cookies": "saved", "access_token": "a"})
+
+    assert asyncio.run(service.verify_state()) is SessionState.VALID
+    assert len(calls) == 2
+    assert ".AspNetCore.Cookies" not in calls[1]
 
 
 class FakeGrades:
@@ -101,23 +103,7 @@ def pulse(monkeypatch):
     return Grades
 
 
-def _page_client(monkeypatch, final_url="https://login.mirea.ru/realms/mirea/login"):
-    class Client:
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *_args):
-            return None
-
-        async def get(self, _url):
-            return httpx.Response(200, request=httpx.Request("GET", final_url))
-
-    monkeypatch.setattr(httpx, "AsyncHTTPTransport", lambda **_kwargs: object())
-    monkeypatch.setattr(httpx, "AsyncClient", lambda **_kwargs: Client())
-
-
-def test_login_redirect_is_confirmed_as_expired(monkeypatch, pulse):
-    _page_client(monkeypatch)
+def test_a_session_pulse_refuses_is_expired(pulse):
     pulse.bootstrap = (False, "Сессия истекла. Перелогиньтесь в МИРЭА.")
 
     service = MireaService({"session-cookie": "expired"})
@@ -125,9 +111,8 @@ def test_login_redirect_is_confirmed_as_expired(monkeypatch, pulse):
     assert asyncio.run(service.verify_state()) is SessionState.EXPIRED
 
 
-def test_a_session_pulse_still_accepts_is_kept_even_on_a_free_day(monkeypatch, pulse):
+def test_a_session_pulse_still_accepts_is_kept_even_on_a_free_day(pulse):
     """0.2.3 threw working sessions away on a page check alone: new login, new code."""
-    _page_client(monkeypatch)
     pulse.unary = (b"", None)  # a day without lessons is an empty, successful answer
 
     assert asyncio.run(MireaService({"c": "fine"}).verify_state()) is SessionState.VALID
@@ -142,8 +127,7 @@ def test_a_session_pulse_still_accepts_is_kept_even_on_a_free_day(monkeypatch, p
         (False, "Не удалось получить cookie (.AspNetCore.Cookies). Перелогиньтесь."),
     ],
 )
-def test_an_unreachable_or_blocked_pulse_is_not_an_expired_session(monkeypatch, pulse, bootstrap):
-    _page_client(monkeypatch)
+def test_an_unreachable_or_blocked_pulse_is_not_an_expired_session(pulse, bootstrap):
     pulse.bootstrap = bootstrap
 
     assert asyncio.run(MireaService({"c": "fine"}).verify_state()) is SessionState.UNKNOWN
@@ -159,8 +143,7 @@ def test_an_unreachable_or_blocked_pulse_is_not_an_expired_session(monkeypatch, 
         ((None, "Сервер не отвечает"), SessionState.UNKNOWN),
     ],
 )
-def test_the_lesson_call_decides_after_a_bootstrap(monkeypatch, pulse, answer, state):
-    _page_client(monkeypatch)
+def test_the_lesson_call_decides_after_a_bootstrap(pulse, answer, state):
     pulse.unary = answer
 
     assert asyncio.run(MireaService({"c": "x"}).verify_state()) is state

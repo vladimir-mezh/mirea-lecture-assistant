@@ -61,6 +61,7 @@ from .qr import QrDeduplicator, ScreenScanner, validate_qr
 from .relative_time import format_relative_time
 from .reliability import (
     attendance_failure_counts_for_chat,
+    should_retry_login,
 )
 from .security import SessionStore
 
@@ -89,6 +90,11 @@ ROOM_LOST_RECHECK_SECONDS = 60
 # How long such a room is left out of the search. A teacher may restart a
 # session behind the same link, so it becomes eligible again afterwards.
 REJECTED_ROOM_SECONDS = 300
+# A session Pulse refuses minutes after it was issued is not "expired": logging in
+# again would only email another code into the same refusal.
+FRESH_SESSION_SECONDS = 600
+# Later attempts of an automatic login that failed before any code was requested.
+AUTO_LOGIN_RETRY_MINUTES = (2, 5, 15)
 
 
 def _fill_email_providers(combo: QComboBox, selected: str = "auto") -> None:
@@ -545,6 +551,9 @@ class MainWindow(QMainWindow):
         self.session_recheck_scheduled = False
         self.remember_login_requested = False
         self.login_started_at = datetime.now(UTC)
+        self.session_obtained_at: float | None = None
+        # Whether the last СДО sign-in actually ran and worked (lookups waiting for it reuse it).
+        self.sdo_last_sign_in_ok = False
 
         self.setWindowTitle("MIREA Lecture Assistant")
         self.resize(1080, 700)
@@ -1314,6 +1323,9 @@ class MainWindow(QMainWindow):
                 30_000, lambda: self._run_initial_login(username, password, busy_text)
             )
             return
+        # Codes are matched from this moment on. Set earlier, a login that waited
+        # behind the СДО sign-in took that sign-in's code from the spam folder.
+        self.login_started_at = datetime.now(UTC)
         self._set_auth_state("checking")
 
         def operation():
@@ -1338,10 +1350,35 @@ class MainWindow(QMainWindow):
         self._set_auth_state("signed_out")
         log.warning("automatic_login_failed message=%s", message)
         if self.automatic_login_cycle:
-            self.statusBar().showMessage("Автовход временно недоступен; повторим попытку", 8000)
-            self._schedule_login_retry(message)
+            self.automatic_login_cycle = False
+            self._retry_automatic_login_later(message)
         else:
             self._operation_failed(message)
+
+    def _retry_automatic_login_later(self, reason: str):
+        """A few later attempts after an automatic login failed before any code.
+
+        A server that did not answer is not a wrong password, and the stale
+        session was already dropped: without this nothing signed in again that
+        day. Codes stay safe, as this runs only when no code was requested.
+        """
+        attempt = self.login_retry_attempt
+        if not should_retry_login(reason) or attempt >= len(AUTO_LOGIN_RETRY_MINUTES):
+            self._schedule_login_retry(reason)
+            self._background_problem(
+                "Автовход не удался", f"{reason}\n\nВойдите вручную: «Войти в MIREA»."
+            )
+            return
+        minutes = AUTO_LOGIN_RETRY_MINUTES[attempt]
+        self.login_retry_attempt += 1
+        self.login_retry_scheduled = True
+        log.info("automatic_login_retry_scheduled attempt=%s minutes=%s", attempt + 1, minutes)
+        self.statusBar().showMessage(
+            f"Автовход не удался: {reason.splitlines()[0] if reason else 'ошибка'} "
+            f"Повторим через {minutes} мин.",
+            15000,
+        )
+        QTimer.singleShot(minutes * 60_000, self._run_scheduled_login)
 
     def _initial_login_finished(self, payload):
         self.login_in_progress = False
@@ -1411,6 +1448,17 @@ class MainWindow(QMainWindow):
             self._set_auth_state("signed_out")
             diagnostic_id = secrets.token_hex(4)
             log.error("login_rejected id=%s message=%s", diagnostic_id, result.message)
+            if self.automatic_login_cycle:
+                # Nobody is at the screen for a modal dialog.
+                self.automatic_login_cycle = False
+                if self.otp_submission_attempted:
+                    self._background_problem(
+                        "Автовход не удался",
+                        f"{result.message}\n\nКод диагностики: {diagnostic_id}",
+                    )
+                else:
+                    self._retry_automatic_login_later(result.message or "")
+                return
             self._operation_failed(f"{result.message}\n\nКод диагностики: {diagnostic_id}")
             return
         try:
@@ -1445,6 +1493,7 @@ class MainWindow(QMainWindow):
         self.login_retry_scheduled = False
         self.automatic_login_cycle = False
         self.session_recheck_scheduled = False
+        self.session_obtained_at = time.monotonic()
         self._set_auth_state("signed_in")
         log.info("login_success")
         self.statusBar().showMessage("Вход выполнен", 3000)
@@ -1477,8 +1526,19 @@ class MainWindow(QMainWindow):
             lambda: run_async(self.mirea.complete_2fa(challenge, code)),
             self._login_finished,
             "Проверяем код…",
-            lambda message: self._otp_wait_failed(challenge, message),
+            lambda message: self._code_check_failed(challenge, message),
         )
+
+    def _code_check_failed(self, challenge, message: str):
+        """The code was there; sending it to MIREA failed."""
+        if self.automatic_login_cycle:
+            log.warning("automatic_code_check_failed message=%s", message)
+            self.login_in_progress = False
+            self.automatic_login_cycle = False
+            self._set_auth_state("signed_out")
+            self._background_problem("Код не удалось проверить", message)
+            return
+        self._manual_2fa(challenge, message)
 
     def _manual_2fa(self, challenge, reason: str = ""):
         prompt = "Не удалось получить код автоматически. Введите код из письма:"
@@ -1560,16 +1620,24 @@ class MainWindow(QMainWindow):
         # A valid saved session must not generate a fresh OTP on every launch.
         if self.mirea.session:
             self._set_auth_state("checking")
-            self._run(
-                lambda: run_async(self.mirea.verify_state()),
-                self._session_verified,
-                "Проверяем сохранённый вход…",
-                lambda _message: self._session_verified(SessionState.UNKNOWN),
-            )
+            self._verify_stored_session("Проверяем сохранённый вход…")
         else:
             self._auto_login()
 
-    def _session_verified(self, state: SessionState):
+    def _verify_stored_session(self, busy_text: str):
+        session = self.mirea.session
+        self._run(
+            lambda: run_async(self.mirea.verify_state()),
+            lambda state: self._session_verified(state, session),
+            busy_text,
+            lambda _message: self._session_verified(SessionState.UNKNOWN, session),
+        )
+
+    def _session_verified(self, state: SessionState, session: dict | None = None):
+        if session is not None and (session is not self.mirea.session or self.login_in_progress):
+            # A new login replaced (or is replacing) the session this was about.
+            log.info("stored_session_verdict_dropped state=%s", state.value)
+            return
         log.info("stored_session_verified state=%s", state.value)
         if state is SessionState.EXPIRED:
             # A kept stale session makes the background schedule refresh fail and
@@ -1602,12 +1670,7 @@ class MainWindow(QMainWindow):
         self.session_recheck_scheduled = False
         if self.login_in_progress or not self.mirea.session:
             return
-        self._run(
-            lambda: run_async(self.mirea.verify_state()),
-            self._session_verified,
-            "Повторно проверяем MIREA…",
-            lambda _message: self._session_verified(SessionState.UNKNOWN),
-        )
+        self._verify_stored_session("Повторно проверяем MIREA…")
 
     def _auto_login(self):
         if self.login_in_progress:
@@ -1666,8 +1729,14 @@ class MainWindow(QMainWindow):
             failed=self._schedule_refresh_failed,
         )
 
+    def _session_is_fresh(self) -> bool:
+        obtained = self.session_obtained_at
+        return obtained is not None and time.monotonic() - obtained < FRESH_SESSION_SECONDS
+
     def _schedule_refresh_failed(self, message: str):
         self.schedule_refresh_running = False
+        # A failed refresh may still have renewed the tokens on the way.
+        self._persist_session()
         log.warning("schedule_refresh_failed message=%s", message)
         self.statusBar().showMessage(
             "Расписание пока недоступно; повторим проверку через минуту: " + message,
@@ -1681,11 +1750,18 @@ class MainWindow(QMainWindow):
         """Re-enter automatically when a saved session expires while the app is running."""
         if self.login_in_progress or self.auth_recovery_running or not self.mirea.session:
             return
+        if self._session_is_fresh():
+            log.info("session_recovery_skipped reason=fresh_session trigger=%s", reason)
+            return
         self.auth_recovery_running = True
         log.info("session_recovery_check reason=%s", reason)
+        session = self.mirea.session
 
         def checked(state: SessionState):
             self.auth_recovery_running = False
+            if session is not self.mirea.session or self.login_in_progress:
+                log.info("session_recovery_verdict_dropped state=%s", state.value)
+                return
             if state is SessionState.VALID:
                 self._persist_session()
                 return
@@ -1878,9 +1954,12 @@ class MainWindow(QMainWindow):
             if not self.sdo_sign_in_lock.acquire(timeout=240):
                 return False
             self.sdo_sign_in_lock.release()
-            return not self._sdo_sign_in_backing_off()
+            # A deferred or skipped sign-in is no reason to read again and back off.
+            return self.sdo_last_sign_in_ok and not self._sdo_sign_in_backing_off()
         try:
-            return self._sign_in_to_sdo_locked()
+            self.sdo_last_sign_in_ok = False
+            self.sdo_last_sign_in_ok = self._sign_in_to_sdo_locked()
+            return self.sdo_last_sign_in_ok
         except Exception:
             self.sdo_sign_in_failed_at = time.monotonic()
             raise
@@ -2897,6 +2976,7 @@ class MainWindow(QMainWindow):
             self._schedule_retry(event_id)
 
     def _attendance_exception(self, event_id: int, message: str):
+        self._persist_session()
         self.attendance_inflight.discard(event_id)
         pending = self.pending_qr.get(event_id)
         if pending is None:
@@ -3111,6 +3191,7 @@ class MainWindow(QMainWindow):
 
     def _quit(self):
         log.info("quit_requested")
+        self._persist_session()
         self.force_exit = True
         self.tray.hide()
         try:

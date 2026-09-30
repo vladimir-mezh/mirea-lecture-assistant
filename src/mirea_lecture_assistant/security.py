@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from pathlib import Path
 
 from .email_otp import EmailAccount
@@ -50,11 +51,15 @@ class SessionStore:
     def save(self, session: dict) -> None:
         payload = self._cipher().encrypt(json.dumps(session).encode("utf-8"))
         path = self.session_path
-        path.write_bytes(payload)
+        # Saved whenever the tokens change: a crash half way through a direct
+        # overwrite left an unreadable file, and with it a new login and code.
+        partial = path.with_name(path.name + ".tmp")
+        partial.write_bytes(payload)
         try:
-            path.chmod(0o600)
+            partial.chmod(0o600)
         except OSError:  # best effort: filesystems without POSIX permissions
             pass
+        os.replace(partial, path)
         self._clear_legacy_session()
 
     def load(self) -> dict | None:

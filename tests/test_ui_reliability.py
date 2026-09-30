@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 
@@ -939,3 +940,125 @@ def test_a_second_launch_learns_whether_the_running_copy_answered(tmp_path):
     responder.start()
     assert ask_running_copy_to_show(tmp_path, wait_seconds=2) is True
     responder.join()
+
+
+def test_a_verdict_about_a_replaced_session_is_dropped(window, monkeypatch):
+    """A slow check of the old session must not throw away the one just signed in."""
+    old = {"cookie": "old"}
+    window.mirea.session = {"cookie": "new"}
+    logins = []
+    monkeypatch.setattr(window, "_auto_login", lambda: logins.append(True))
+
+    window._session_verified(SessionState.EXPIRED, old)
+
+    assert window.mirea.session == {"cookie": "new"}
+    assert logins == []
+
+
+def test_a_recovery_verdict_about_a_replaced_session_is_dropped(window, monkeypatch):
+    window.mirea.session = {"cookie": "old"}
+    pending = []
+    monkeypatch.setattr(
+        window, "_run", lambda _function, done, _busy, failed=None: pending.append(done)
+    )
+    logins = []
+    monkeypatch.setattr(window, "_auto_login", lambda: logins.append(True))
+
+    window._recover_expired_session("schedule_refresh")
+    window.mirea.session = {"cookie": "new"}  # the student signed in meanwhile
+    pending[0](SessionState.EXPIRED)
+
+    assert window.mirea.session == {"cookie": "new"}
+    assert logins == [] and not window.auth_recovery_running
+
+
+def test_a_session_issued_minutes_ago_is_not_logged_in_again(window, monkeypatch):
+    """Pulse refusing a brand-new session would otherwise mean a code every few minutes."""
+    window.mirea.session = {"cookie": "fresh"}
+    window.session_obtained_at = time.monotonic()
+    checks = []
+    monkeypatch.setattr(window, "_run", lambda *args, **kwargs: checks.append(args))
+
+    window._recover_expired_session("schedule_refresh")
+
+    assert checks == []
+
+
+def _failed_automatic_login(window, monkeypatch, message, *, code_sent=False):
+    from mirea_lecture_assistant import ui
+
+    timers, problems, modals = [], [], []
+    monkeypatch.setattr(ui.QTimer, "singleShot", lambda delay, callback: timers.append(delay))
+    monkeypatch.setattr(window, "_background_problem", lambda title, text: problems.append(title))
+    monkeypatch.setattr(window, "_operation_failed", lambda text: modals.append(text))
+    window.automatic_login_cycle = True
+    window.otp_submission_attempted = code_sent
+    window._login_finished(SimpleNamespace(challenge=None, success=False, message=message))
+    return timers, problems, modals
+
+
+def test_an_automatic_login_that_met_a_silent_server_is_tried_again_later(window, monkeypatch):
+    timers, problems, modals = _failed_automatic_login(
+        window, monkeypatch, "Сервер МИРЭА не отвечает"
+    )
+
+    assert timers == [2 * 60_000] and window.login_retry_scheduled
+    assert problems == [] and modals == []
+
+
+def test_a_wrong_password_or_a_refused_code_is_never_retried_on_its_own(window, monkeypatch):
+    timers, problems, modals = _failed_automatic_login(
+        window, monkeypatch, "Неверный логин или пароль"
+    )
+    assert timers == [] and problems == ["Автовход не удался"] and modals == []
+
+    timers, problems, modals = _failed_automatic_login(
+        window, monkeypatch, "Сервер МИРЭА не отвечает", code_sent=True
+    )
+    assert timers == [] and problems == ["Автовход не удался"] and modals == []
+
+
+def test_automatic_login_retries_are_limited(window, monkeypatch):
+    window.login_retry_attempt = 3
+    timers, problems, _modals = _failed_automatic_login(
+        window, monkeypatch, "Сервер МИРЭА не отвечает"
+    )
+
+    assert timers == [] and problems == ["Автовход не удался"]
+
+
+def test_codes_count_from_the_moment_a_deferred_login_really_starts(window, monkeypatch):
+    from mirea_lecture_assistant import ui
+
+    monkeypatch.setattr(window, "_run", lambda *args, **kwargs: None)
+    monkeypatch.setattr(ui.QTimer, "singleShot", lambda *_args: None)
+    window.login_started_at = datetime(2020, 1, 1, tzinfo=ui.UTC)
+
+    window._run_initial_login("user", "password", "Вход…")
+
+    assert window.login_started_at > datetime.now(ui.UTC) - timedelta(seconds=5)
+
+
+def test_a_lookup_waiting_for_a_deferred_sdo_sign_in_does_not_back_off(window, monkeypatch):
+    import threading
+
+    started, release = threading.Event(), threading.Event()
+    results = {}
+
+    def holder():
+        started.set()
+        release.wait(5)
+        return False  # deferred: a Pulse login held the mailbox
+
+    monkeypatch.setattr(window, "_sign_in_to_sdo_locked", holder)
+    first = threading.Thread(target=lambda: results.setdefault("holder", window._sign_in_to_sdo()))
+    first.start()
+    started.wait(5)
+    second = threading.Thread(target=lambda: results.setdefault("waiter", window._sign_in_to_sdo()))
+    second.start()
+    release.set()
+    first.join(5)
+    second.join(5)
+
+    assert results == {"holder": False, "waiter": False}
+    assert window.sdo_sign_in_failed_at is None

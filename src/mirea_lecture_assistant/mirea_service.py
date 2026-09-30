@@ -5,7 +5,6 @@ import logging
 import re
 import sys
 from datetime import datetime
-from urllib.parse import urlparse
 
 from .domain import Lesson, SessionState
 
@@ -18,6 +17,14 @@ SESSION_EXPIRED_MESSAGE = re.compile(
     r"сессия[^.]*истекла|unauthenticated|unauthori[sz]ed|\b401\b", re.IGNORECASE
 )
 NO_LESSONS_MESSAGE = "Нет пар в ближайшие дни"
+PULSE_COOKIE = ".AspNetCore.Cookies"
+# pymirea's wording where it misleads: this one advises a new login that cannot help.
+PLAIN_MESSAGES = {
+    "Не удалось получить cookie (.AspNetCore.Cookies). Перелогиньтесь.": (
+        "«Пульс» ответил, но не открыл сессию: он не пускает с этого адреса (VPN?) "
+        "или на нём идут работы."
+    ),
+}
 UNREACHABLE_MESSAGE = re.compile(r"не\s+отвечает|временно\s+недоступна|не\s+вернул", re.IGNORECASE)
 
 # pymirea turns every exception of a request into "МИРЭА не отвечает" and logs the
@@ -84,21 +91,6 @@ def _with_reason(message: str) -> str:
     return f"{message} Причина: {reason}."
 
 
-def classify_session_response(status_code: int, final_url: str) -> SessionState:
-    """Classify an actual HTTP response without conflating it with transport failure."""
-    if status_code >= 500:
-        return SessionState.UNKNOWN
-    lowered = final_url.lower()
-    host = (urlparse(lowered).hostname or "").lower()
-    # The same rule as pymirea's verify_session. Pulse is an app authorised by its
-    # bearer token: a cookie-only request may well end on sso.mirea.ru with a
-    # perfectly good session, so that alone must not count as expired (0.2.3
-    # did, and threw the working session away at every start).
-    if status_code in {401, 403} or "/login" in lowered or host == "login.mirea.ru":
-        return SessionState.EXPIRED
-    return SessionState.VALID
-
-
 class MireaService:
     """Small compatibility boundary around pymirea 0.3/0.4."""
 
@@ -140,42 +132,16 @@ class MireaService:
         return await self.verify_state() is SessionState.VALID
 
     async def verify_state(self) -> SessionState:
-        """Distinguish an expired session from an unreachable MIREA service."""
+        """Distinguish an expired session from an unreachable MIREA service.
+
+        Only Pulse's API can say. A page check of pulse.mirea.ru lands on the SSO
+        page both with a dead session and with a working one whose SSO browser
+        session is over: 0.2.3 took every such start for an expiry, and before
+        that a dead session passed as valid and was never renewed.
+        """
         if not self.session:
             return SessionState.EXPIRED
-        import httpx
-        from pymirea import MireaAuth
-
-        filtered_cookies = {
-            name: value
-            # A copy: pymirea may refresh the tokens from another thread meanwhile.
-            for name, value in dict(self.session).items()
-            if name not in {"access_token", "token_type", "refresh_token", "expires_in"}
-            and not str(name).startswith("__")
-        }
-        try:
-            async with httpx.AsyncClient(
-                follow_redirects=True,
-                timeout=httpx.Timeout(15.0, connect=8.0),
-                transport=httpx.AsyncHTTPTransport(retries=2),
-                cookies=filtered_cookies,
-            ) as client:
-                response = await client.get(MireaAuth.ATTENDANCE_URL)
-        except httpx.HTTPError as exc:
-            log.info(
-                "session_verify_unknown reason=network kind=%s detail=%s",
-                type(exc).__name__,
-                failure_reason(exc),
-            )
-            return SessionState.UNKNOWN
-        state = classify_session_response(response.status_code, str(response.url))
-        if state is SessionState.EXPIRED:
-            # A page check is only a hint. The session is thrown away (which
-            # means a new login and an emailed code) only if Pulse itself refuses it.
-            state = await self.pulse_verdict()
-            if state is SessionState.VALID:
-                log.info("session_page_check_overruled reason=api_accepts_session")
-        return state
+        return await self.pulse_verdict()
 
     async def pulse_verdict(self) -> SessionState:
         """Whether Pulse's API itself accepts the session.
@@ -184,6 +150,16 @@ class MireaService:
         bootstrap and one day of lessons. Unlike ``get_schedule`` it keeps that
         day's own answer, so a free day is not taken for a refusal.
         """
+        state = await self._pulse_verdict_once()
+        if state is SessionState.EXPIRED and self.session.pop(PULSE_COOKIE, None) is not None:
+            # pymirea sends a saved cookie as is and never replaces it, and with one
+            # any HTML answer (a firewall or maintenance page) reads as a refusal.
+            # Only a fresh bootstrap through the SSO can tell.
+            log.info("session_verify_retry reason=saved_cookie_refused")
+            state = await self._pulse_verdict_once()
+        return state
+
+    async def _pulse_verdict_once(self) -> SessionState:
         from pymirea.grades import MireaGrades
 
         _upstream_failure.set(None)
@@ -202,7 +178,11 @@ class MireaService:
                 if raw is not None:
                     return SessionState.VALID
         except Exception as exc:  # noqa: BLE001 - trouble reaching Pulse is not a verdict
-            log.info("session_verify_unknown reason=api_exception kind=%s", type(exc).__name__)
+            log.info(
+                "session_verify_unknown reason=api_exception kind=%s detail=%s",
+                type(exc).__name__,
+                failure_reason(exc),
+            )
             return SessionState.UNKNOWN
         finally:
             await api.close()
@@ -222,7 +202,7 @@ class MireaService:
         log.info("session_verify_unknown reason=api_error message=%s", _with_reason(message or ""))
         return SessionState.UNKNOWN
 
-    async def get_schedule(self, days: int = 14) -> list[Lesson]:
+    async def get_schedule(self, days: int = 14, *, _retried: bool = False) -> list[Lesson]:
         from pymirea.grades import MireaGrades
 
         _upstream_failure.set(None)
@@ -236,13 +216,18 @@ class MireaService:
             if message == NO_LESSONS_MESSAGE:
                 # pymirea says this both for free days and when every request
                 # failed. Ask once more: an accepted session means truly no pairs.
+                cookie = self.session.get(PULSE_COOKIE)
                 state = await self.pulse_verdict()
                 if state is SessionState.VALID:
+                    if self.session.get(PULSE_COOKIE) != cookie and not _retried:
+                        # The saved cookie was stale and got replaced: the empty
+                        # answer came from it, so ask with the new one.
+                        return await self.get_schedule(days, _retried=True)
                     return []
                 if state is SessionState.EXPIRED:
                     raise RuntimeError("Сессия истекла. Перелогиньтесь в МИРЭА.")
                 message = "Пульс не вернул расписание."
-            raise RuntimeError(_with_reason(message))
+            raise RuntimeError(_with_reason(PLAIN_MESSAGES.get(message, message)))
         lessons = []
         for item in result.lessons or []:
             if item.start_epoch is None or item.end_epoch is None:
