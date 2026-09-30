@@ -48,7 +48,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from . import __version__, updater
+from . import __version__, autostart, updater
 from .async_runtime import run_async
 from .browser_service import CAPTURE_TIMEOUT_MS, BrowserService, NotSignedInError
 from .chat_detection import chat_baseline, classmates_report_attendance_issue
@@ -642,6 +642,7 @@ class MainWindow(QMainWindow):
         self.lecture_recovery_failures = 0
         self.lecture_unstable_checks = 0
         QTimer.singleShot(0, self._startup_auth)
+        self._sync_autostart()
         self.available_update: updater.Release | None = None
         self.update_check_running = False
         self.update_timer = QTimer(self)
@@ -749,6 +750,39 @@ class MainWindow(QMainWindow):
             self,
             "Обновление",
             f"{message}\n\nНовую версию можно скачать и вручную: {updater.RELEASES_PAGE}",
+        )
+
+    def _sync_autostart(self):
+        """On by default; the registered path follows the program if it was moved."""
+        if not autostart.available() or os.environ.get("MIREA_ASSISTANT_SMOKE_TEST") == "1":
+            return
+        enabled = bool(self.db.get_setting("autostart", True))
+        self.db.set_setting("autostart", enabled)
+        try:
+            wanted = autostart.command(updater.current_executable())
+            current = autostart.registered()
+            if enabled and current != wanted:
+                autostart.set_enabled(True, updater.current_executable())
+            elif not enabled and current is not None:
+                autostart.set_enabled(False, updater.current_executable())
+        except OSError:
+            log.warning("autostart_sync_failed", exc_info=True)
+
+    def _autostart_toggled(self, checked: bool):
+        self.db.set_setting("autostart", bool(checked))
+        if not autostart.available():
+            return
+        try:
+            autostart.set_enabled(bool(checked), updater.current_executable())
+        except OSError as exc:
+            log.warning("autostart_toggle_failed", exc_info=True)
+            QMessageBox.warning(self, "Автозапуск", f"Не удалось изменить автозапуск: {exc}")
+            return
+        self.statusBar().showMessage(
+            "Приложение будет запускаться вместе с Windows"
+            if checked
+            else "Автозапуск с Windows выключен",
+            5000,
         )
 
     def _report_database_recovery(self):
@@ -1045,6 +1079,15 @@ class MainWindow(QMainWindow):
             self.theme_choice.addItem(label, value)
         self.theme_choice.currentIndexChanged.connect(self._theme_choice_changed)
         appearance.addRow("Оформление", self.theme_choice)
+
+        startup = self._settings_section(sections, "Запуск")
+        self.autostart_check = QCheckBox("Запускать вместе с Windows (сразу в трей)")
+        self.autostart_check.setEnabled(autostart.available())
+        if not autostart.available():
+            self.autostart_check.setToolTip("Работает в собранной программе для Windows")
+        self.autostart_check.setChecked(bool(self.db.get_setting("autostart", True)))
+        self.autostart_check.toggled.connect(self._autostart_toggled)
+        startup.addRow("", self.autostart_check)
 
         updates = self._settings_section(sections, "Обновления")
         updates.addRow("Установлена версия", QLabel(__version__))

@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import time
 from datetime import datetime, timedelta
+from pathlib import Path
 from types import SimpleNamespace
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -1580,3 +1581,23 @@ def test_a_session_that_cannot_be_replaced_is_never_signed_out(window, monkeypat
 
     assert "logout" not in calls
     assert window.mirea.session
+
+
+def test_start_with_windows_is_on_by_default_and_follows_the_program(window, monkeypatch):
+    from mirea_lecture_assistant import autostart, updater
+
+    calls = []
+    monkeypatch.delenv("MIREA_ASSISTANT_SMOKE_TEST", raising=False)
+    monkeypatch.setattr(autostart, "available", lambda: True)
+    monkeypatch.setattr(autostart, "registered", lambda: None)
+    monkeypatch.setattr(
+        autostart, "set_enabled", lambda enabled, exe: calls.append((enabled, exe.name))
+    )
+    monkeypatch.setattr(updater, "current_executable", lambda: Path("C:/x/App.exe"))
+
+    window._sync_autostart()
+    assert calls == [(True, "App.exe")]
+
+    window._autostart_toggled(False)
+    assert calls[-1] == (False, "App.exe")
+    assert window.db.get_setting("autostart") is False

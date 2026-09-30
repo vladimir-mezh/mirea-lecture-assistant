@@ -158,8 +158,15 @@ def start(executable: Path) -> None:
     flags = 0
     if sys.platform == "win32":
         flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+    from .supervisor import child_environment
+
     subprocess.Popen(
-        [str(executable)], close_fds=True, creationflags=flags, cwd=str(executable.parent)
+        [str(executable)],
+        close_fds=True,
+        creationflags=flags,
+        cwd=str(executable.parent),
+        # A separate copy with its own watchdog, not a child of this one's.
+        env=child_environment(),
     )
 
 
