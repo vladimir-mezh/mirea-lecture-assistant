@@ -359,6 +359,10 @@ class Database:
                 (lesson_id, url, stamp),
             )
 
+    def forget_resolved_link(self, lesson_id: str) -> None:
+        with self.connection() as conn:
+            conn.execute("DELETE FROM resolved_links WHERE lesson_id = ?", (lesson_id,))
+
     def get_resolved_link(self, lesson_id: str) -> str:
         with self.connection() as conn:
             row = conn.execute(

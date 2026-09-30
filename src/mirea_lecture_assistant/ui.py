@@ -63,6 +63,20 @@ LOOKUP_RETRY_FAILED_SECONDS = 300
 SDO_SIGN_IN_BACKOFF_SECONDS = 600
 # Rotating QR tokens are short-lived; retrying a stale one only produces noise.
 ATTENDANCE_RETRY_WINDOW = timedelta(minutes=10)
+# The pair is left only this long after its scheduled end. A room that says it
+# is over before then was the wrong room, or the teacher closed it and is about
+# to open another one.
+LEAVE_AFTER_END = timedelta(minutes=5)
+# While a pair runs, the СДО is checked again for a newer room of this group:
+# often at the start, when teachers recreate rooms, rarely later.
+RECHECK_EARLY_WINDOW = timedelta(minutes=20)
+RECHECK_EARLY_SECONDS = 120
+RECHECK_LATE_SECONDS = 300
+# After a room closed early, the replacement is looked for every minute.
+ROOM_LOST_RECHECK_SECONDS = 60
+# How long such a room is left out of the search. A teacher may restart a
+# session behind the same link, so it becomes eligible again afterwards.
+REJECTED_ROOM_SECONDS = 300
 
 
 def _fill_email_providers(combo: QComboBox, selected: str = "auto") -> None:
@@ -395,6 +409,8 @@ class MainWindow(QMainWindow):
         self.retry_scheduled: set[int] = set()
         self.submit_attempts: dict[int, int] = {}
         self.lookup_not_before: dict[str, float] = {}
+        # Lessons whose room closed before the pair was over: waiting for a new one.
+        self.room_lost_lessons: set[str] = set()
         self.sdo_sign_in_lock = threading.Lock()
         self.sdo_sign_in_failed_at: float | None = None
         self.schedule_redraw_pending = False
@@ -1494,16 +1510,23 @@ class MainWindow(QMainWindow):
                 <= lesson.end_at + timedelta(minutes=90)
             ):
                 continue
+            if lesson.external_id == self.active_lecture_id:
+                # Teachers recreate rooms mid-pair; keep an eye on the СДО.
+                if now < lesson.end_at:
+                    self._resolve_from_sources(lesson)
+                continue
             if lesson.external_id in self.joined_lessons:
                 continue
             mode = self.db.get_rule(lesson.subject_name)
             if mode is RuleMode.IGNORE:
                 continue
             url = self.db.get_resolved_link(lesson.external_id) or lesson.source_url
+            if url and url in self._rejected_rooms(lesson.external_id):
+                url = ""
             if not url:
                 # The webinar is often created after the pair has begun, so this
                 # runs again (with a pause between attempts) until the room shows up.
-                if now <= lesson.end_at + timedelta(minutes=15):
+                if now <= lesson.end_at + LEAVE_AFTER_END + timedelta(minutes=10):
                     self._resolve_from_sources(lesson)
                 continue
             if mode is RuleMode.AUTO:
@@ -1617,6 +1640,7 @@ class MainWindow(QMainWindow):
             return
         group = self.group_edit.text().strip()
         saved = self.db.get_sources(lesson.subject_name)
+        excluded = self._rejected_rooms(lesson.external_id)
         self.resolving_lessons.add(lesson.external_id)
         log.info(
             "webinar_lookup_started lesson_id=%s saved_sources=%s",
@@ -1639,6 +1663,9 @@ class MainWindow(QMainWindow):
                 end_at=lesson.end_at,
                 group=group,
                 teacher=lesson.teacher,
+                # Rooms whose scheduled end has passed are over, not the one to join.
+                now=datetime.now().astimezone(),
+                excluded=excluded,
             )
             # Automatically discovered courses are refreshed each pass. Do not
             # mix them permanently with explicitly configured manual sources.
@@ -1651,14 +1678,24 @@ class MainWindow(QMainWindow):
             failed=lambda message: self._source_lookup_failed(lesson, message),
         )
 
+    def _lookup_pause(self, lesson) -> float:
+        """Seconds until the next СДО lookup for this lesson."""
+        if lesson.external_id in self.room_lost_lessons:
+            return ROOM_LOST_RECHECK_SECONDS
+        if lesson.external_id == self.active_lecture_id:
+            now = datetime.now().astimezone()
+            early = now < lesson.start_at + RECHECK_EARLY_WINDOW
+            return RECHECK_EARLY_SECONDS if early else RECHECK_LATE_SECONDS
+        return LOOKUP_RETRY_EMPTY_SECONDS
+
     def _source_resolved(self, lesson, webinar, discovered: list[str]):
         self.resolving_lessons.discard(lesson.external_id)
+        self.lookup_not_before[lesson.external_id] = time.monotonic() + self._lookup_pause(lesson)
         if webinar is None or not webinar.is_joinable:
-            self.lookup_not_before[lesson.external_id] = (
-                time.monotonic() + LOOKUP_RETRY_EMPTY_SECONDS
-            )
+            if lesson.external_id == self.active_lecture_id:
+                return  # still in the room we have; nothing newer yet
             legacy = self.db.get_link(lesson.subject_name)
-            if legacy:
+            if legacy and legacy not in self._rejected_rooms(lesson.external_id):
                 # A permanent room set for the whole subject by an older version:
                 # used only when the СДО has nothing for this particular lesson.
                 self._room_found(lesson, legacy)
@@ -1684,8 +1721,31 @@ class MainWindow(QMainWindow):
                 8000,
             )
             return
+        if lesson.external_id == self.active_lecture_id:
+            if webinar.join_url == self.active_lecture_url:
+                return
+            # A newer room for this pair: the teacher closed the first one.
+            log.warning(
+                "lecture_room_replaced lesson_id=%s webinar_id=%s",
+                lesson.external_id,
+                webinar.webinar_id,
+            )
+            self.db.set_resolved_link(lesson.external_id, webinar.join_url)
+            self.statusBar().showMessage(
+                f"«{lesson.subject_name}»: в СДО новая комната — переходим в неё", 8000
+            )
+            self._open_lecture(webinar.join_url, lesson.external_id, force=True)
+            return
+        self.room_lost_lessons.discard(lesson.external_id)
         self.db.set_resolved_link(lesson.external_id, webinar.join_url)
-        log.info("webinar_resolved lesson_id=%s", lesson.external_id)
+        log.info(
+            "webinar_resolved lesson_id=%s title=%s start=%s end=%s groups=%s",
+            lesson.external_id,
+            webinar.title[:80],
+            f"{webinar.start_at:%d.%m %H:%M}",
+            f"{webinar.end_at:%H:%M}" if webinar.end_at else "-",
+            ",".join(webinar.groups) or "-",
+        )
         self._room_found(lesson, webinar.join_url)
 
     def _room_found(self, lesson, url: str):
@@ -1703,7 +1763,12 @@ class MainWindow(QMainWindow):
 
     def _source_lookup_failed(self, lesson, message: str):
         self.resolving_lessons.discard(lesson.external_id)
-        self.lookup_not_before[lesson.external_id] = time.monotonic() + LOOKUP_RETRY_FAILED_SECONDS
+        # A pair in progress keeps its own cadence; otherwise back off further.
+        in_progress = lesson.external_id in self.room_lost_lessons or (
+            lesson.external_id == self.active_lecture_id
+        )
+        pause = self._lookup_pause(lesson) if in_progress else LOOKUP_RETRY_FAILED_SECONDS
+        self.lookup_not_before[lesson.external_id] = time.monotonic() + pause
         log.warning("webinar_lookup_failed lesson_id=%s message=%s", lesson.external_id, message)
         self.statusBar().showMessage("Вебинар в СДО пока не найден: " + message, 6000)
 
@@ -1835,6 +1900,11 @@ class MainWindow(QMainWindow):
     def _save_lesson_link(self, lesson_id: str, url: str):
         if url and url != self.db.get_resolved_link(lesson_id):
             self.db.set_resolved_link(lesson_id, url)
+            # A link the student typed in is trusted even if a room there ended before.
+            rejected = self.db.get_setting("rejected_rooms", {})
+            if url in rejected.get(lesson_id, {}):
+                del rejected[lesson_id][url]
+                self.db.set_setting("rejected_rooms", rejected)
             log.info("lesson_link_saved lesson_id=%s", lesson_id)
 
     def _schedule_filter_changed(self, index: int):
@@ -1953,7 +2023,7 @@ class MainWindow(QMainWindow):
                 self.lecture_recovery_failures = 0
                 return
             if state == "ended":
-                self._finish_active_lecture("room_ended")
+                self._room_ended(lesson)
                 return
             if state == "waiting":
                 # The room is up but we are still in its lobby; pressing the
@@ -2006,7 +2076,64 @@ class MainWindow(QMainWindow):
             failed=failed,
         )
 
-    def _finish_active_lecture(self, reason: str):
+    def _room_ended(self, lesson):
+        """A room that closes long before the pair ends is not the end of the pair.
+
+        It was the wrong room (a past webinar of the subject) or the teacher closed
+        it and opened another. The cached link used to keep the app on that dead
+        room, with a blank tab, for the rest of the pair; now the room is dropped
+        and the СДО is searched again.
+        """
+        lesson_id = self.active_lecture_id
+        now = datetime.now().astimezone()
+        # The pair is left only after its scheduled end: a room closed minutes in
+        # is followed by a new one, and being out of it means being absent.
+        early = lesson is not None and now < lesson.end_at + LEAVE_AFTER_END
+        if not early or not lesson_id:
+            self._finish_active_lecture("room_ended")
+            return
+        minutes_left = max(0, int((lesson.end_at - now).total_seconds() // 60))
+        log.warning(
+            "lecture_room_ended_early lesson_id=%s minutes_left=%s", lesson_id, minutes_left
+        )
+        for url in {self.active_lecture_url, self.db.get_resolved_link(lesson_id)}:
+            if url:
+                self._reject_room(lesson_id, url)
+        self.db.forget_resolved_link(lesson_id)
+        # The tab stays: the next room opens in it instead of in a new one.
+        self._finish_active_lecture("room_ended_early", close_tab=False)
+        self.joined_lessons.discard(lesson_id)
+        self.prompted_lessons.discard(lesson_id)
+        self.lookup_not_before.pop(lesson_id, None)
+        self.room_lost_lessons.add(lesson_id)
+        self._fill_schedule()
+        self._background_problem(
+            "Комната закрылась раньше конца пары",
+            f"«{lesson.subject_name}»: до конца пары {minutes_left} мин — "
+            "ищем новую комнату в СДО каждую минуту",
+        )
+        self._resolve_from_sources(lesson)
+
+    def _rejected_rooms(self, lesson_id: str) -> frozenset[str]:
+        now = time.time()
+        rooms = self.db.get_setting("rejected_rooms", {}).get(lesson_id, {})
+        return frozenset(
+            url for url, rejected_at in rooms.items() if now - rejected_at < REJECTED_ROOM_SECONDS
+        )
+
+    def _reject_room(self, lesson_id: str, url: str):
+        now = time.time()
+        rejected = self.db.get_setting("rejected_rooms", {})
+        rejected.setdefault(lesson_id, {})[url] = now
+        # Keep only the last day: the lesson ids of older pairs will not come back.
+        rejected = {
+            lesson: rooms
+            for lesson, rooms in rejected.items()
+            if any(now - stamp < 86_400 for stamp in rooms.values())
+        }
+        self.db.set_setting("rejected_rooms", rejected)
+
+    def _finish_active_lecture(self, reason: str, *, close_tab: bool = True):
         lesson_id = self.active_lecture_id
         log.info("lecture_monitoring_finished lesson_id=%s reason=%s", lesson_id, reason)
         self._clear_pending_for_lesson(lesson_id)
@@ -2016,7 +2143,7 @@ class MainWindow(QMainWindow):
         if self.scan_timer.isActive():
             self.toggle_scanner()
         self.active_lesson = None
-        if self.close_tab_after.isChecked() and self.browser.probably_running:
+        if close_tab and self.close_tab_after.isChecked() and self.browser.probably_running:
             self._run(
                 self.browser.close_lecture_tab,
                 lambda closed: log.info("lecture_tab_close_result closed=%s", closed),
@@ -2126,7 +2253,13 @@ class MainWindow(QMainWindow):
             upcoming = [x for x in lessons if x.end_at >= now]
             current = next((x for x in upcoming if x.start_at <= now), None)
             nearest = current or (upcoming[0] if upcoming else None)
-            if nearest is None:
+            if nearest is not None and nearest.external_id in self.room_lost_lessons:
+                text = (
+                    f"<b>Сейчас:</b> {nearest.subject_name} · "
+                    '<span style="color:#b45309">комната закрылась — ищем новую ссылку в СДО</span>'
+                )
+                plain = f"{nearest.subject_name} · ищем новую комнату"
+            elif nearest is None:
                 text = plain = "Ближайших пар в расписании нет"
             else:
                 mode = MODE_LABELS[self.db.get_rule(nearest.subject_name)]

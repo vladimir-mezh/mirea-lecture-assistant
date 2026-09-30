@@ -39,6 +39,8 @@ COURSES_URL = "https://online-edu.mirea.ru/my/courses.php"
 COURSE_LINK_RE = re.compile(r"/course/view\.php\?id=\d+")
 # How far a webinar's scheduled start may sit from the lesson's start.
 DEFAULT_TOLERANCE = timedelta(minutes=20)
+# A webinar whose scheduled end passed this long ago is over, not the room to join.
+FINISHED_GRACE = timedelta(minutes=5)
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,6 +53,8 @@ class Webinar:
     action: str
     is_recording: bool = False
     actions_html: str = ""
+    # The СДО numbers webinars as they are created: a larger id is a newer room.
+    webinar_id: int | None = None
 
     @property
     def is_joinable(self) -> bool:
@@ -99,6 +103,7 @@ def parse_webinars(html: str, base_url: str = "") -> list[Webinar]:
         join_url = urljoin(base_url, raw_href) if raw_href else None
         classes = " ".join((control.get("class") or []) if control is not None else [])
         text = actions.get_text(" ", strip=True) if actions else ""
+        raw_id = str(control.get("data-id") or "") if control is not None else ""
         recording = bool(
             RECORDING_RE.search(classes)
             or RECORDING_RE.search(raw_href or "")
@@ -114,6 +119,7 @@ def parse_webinars(html: str, base_url: str = "") -> list[Webinar]:
                 action=text,
                 is_recording=recording,
                 actions_html="" if (raw_href or actions is None) else str(actions),
+                webinar_id=int(raw_id) if raw_id.isdigit() else None,
             )
         )
     return webinars
@@ -173,9 +179,15 @@ def _slot_matches(
     end_at: datetime,
     group: str,
     tolerance: timedelta,
+    now: datetime | None = None,
+    excluded: frozenset[str] = frozenset(),
 ) -> bool:
     wanted_group = normalize_group(group)
     if webinar.is_recording:
+        return False
+    if webinar.join_url and webinar.join_url in excluded:
+        return False  # this room already turned out to be over or wrong
+    if now is not None and webinar.end_at is not None and webinar.end_at < now - FINISHED_GRACE:
         return False
     if webinar.groups and wanted_group and wanted_group not in webinar.groups:
         return False
@@ -190,6 +202,8 @@ def webinar_candidates(
     end_at: datetime,
     group: str,
     tolerance: timedelta = DEFAULT_TOLERANCE,
+    now: datetime | None = None,
+    excluded: frozenset[str] = frozenset(),
 ) -> list[Webinar]:
     """Webinars that could belong to one lesson: same group, same slot, same subject."""
     candidates = []
@@ -200,6 +214,8 @@ def webinar_candidates(
             end_at=end_at,
             group=group,
             tolerance=tolerance,
+            now=now,
+            excluded=excluded,
         ):
             continue
         if not _subject_matches(webinar, subject):
@@ -209,7 +225,12 @@ def webinar_candidates(
 
 
 def _best(candidates: list[Webinar], start_at: datetime, group: str) -> Webinar | None:
-    """A room you can actually enter beats an exact time slot with no link."""
+    """A room you can actually enter beats an exact time slot with no link.
+
+    Among enterable rooms of this group the newest one wins: when a teacher
+    closes a room minutes into the pair and opens another, the old row stays
+    in the table, sits closer to the bell and used to be chosen again.
+    """
     if not candidates:
         return None
     wanted_group = normalize_group(group)
@@ -218,6 +239,7 @@ def _best(candidates: list[Webinar], start_at: datetime, group: str) -> Webinar 
         key=lambda w: (
             not w.is_joinable,
             not (wanted_group and wanted_group in w.groups),
+            -(w.webinar_id or 0),
             abs(w.start_at - start_at),
         ),
     )
@@ -347,6 +369,8 @@ def resolve_lecture_url(
     teacher: str | None = None,
     tolerance: timedelta = DEFAULT_TOLERANCE,
     max_pages: int = MAX_MODULE_PAGES,
+    now: datetime | None = None,
+    excluded: frozenset[str] = frozenset(),
 ) -> Webinar | None:
     """Walk every configured source and return the best room found for one lesson.
 
@@ -356,6 +380,9 @@ def resolve_lecture_url(
     webinars for one lesson — the one at the exact time carrying no link, and a
     later one that is the room actually used. Stopping at the first match would
     return the dead one. A page that fails to load never stops the others.
+
+    With ``now`` given, webinars whose scheduled end has passed are skipped, and
+    ``excluded`` rooms (ones that already turned out to be over) are never chosen.
     """
     visited: set[str] = set()
     queue = list(dict.fromkeys(sources))
@@ -398,6 +425,8 @@ def resolve_lecture_url(
                 end_at=end_at,
                 group=group,
                 tolerance=tolerance,
+                now=now,
+                excluded=excluded,
             )
         )
         slot_candidates.extend(
@@ -409,6 +438,8 @@ def resolve_lecture_url(
                 end_at=end_at,
                 group=group,
                 tolerance=tolerance,
+                now=now,
+                excluded=excluded,
             )
         )
         for title, module_url in find_webinar_modules(html, url):
