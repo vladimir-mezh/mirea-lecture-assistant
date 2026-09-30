@@ -384,6 +384,7 @@ class MainWindow(QMainWindow):
         self.lecture_watch_timer.timeout.connect(self._lecture_watch_tick)
         self.lecture_watch_timer.start()
         self.lecture_health_check_running = False
+        self.entering_lecture_room = False
         self.lecture_recovery_failures = 0
         QTimer.singleShot(0, self._startup_auth)
 
@@ -1602,6 +1603,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"Лекция открыта в {browser_name}", 4000)
         if self.minimize_on_open.isChecked():
             self._run(self.browser.minimize, lambda _: None, "Сворачиваем окно лекции…")
+        self._enter_lecture_room()
         if self._attendance_already_marked(lesson_id):
             log.info("scanner_not_started reason=already_marked lesson_id=%s", lesson_id)
             self.statusBar().showMessage("Посещение уже отмечено, сканирование не нужно", 6000)
@@ -1633,6 +1635,12 @@ class MainWindow(QMainWindow):
             if state == "ended":
                 self._finish_active_lecture("room_ended")
                 return
+            if state == "waiting":
+                # The room is up but we are still in its lobby; pressing the
+                # platform's own control is the only way in.
+                self.lecture_recovery_failures = 0
+                self._enter_lecture_room()
+                return
             self.lecture_recovery_failures += 1
             log.warning("lecture_tab_lost lesson_id=%s", self.active_lecture_id)
             self.statusBar().showMessage("Вкладка лекции отключилась — открываем заново…", 5000)
@@ -1651,6 +1659,30 @@ class MainWindow(QMainWindow):
             self.browser.lecture_state,
             checked,
             "Проверяем вкладку лекции…",
+            failed=failed,
+        )
+
+    def _enter_lecture_room(self):
+        """Press the platform's entry control, with the student's name if asked for."""
+        if self.entering_lecture_room:
+            return
+        self.entering_lecture_room = True
+        name = self.student_name.text().strip()
+
+        def entered(result: str):
+            self.entering_lecture_room = False
+            log.info("lecture_join_result result=%s", result)
+            if result == "joined":
+                self.statusBar().showMessage("Подключились к комнате лекции", 5000)
+
+        def failed(message: str):
+            self.entering_lecture_room = False
+            log.warning("lecture_join_failed message=%s", message)
+
+        self._run(
+            lambda: self.browser.join_lecture(name),
+            entered,
+            "Подключаемся к комнате…",
             failed=failed,
         )
 

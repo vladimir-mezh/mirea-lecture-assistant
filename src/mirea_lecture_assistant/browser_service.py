@@ -31,10 +31,18 @@ class BrowserService:
 
     WINDOW_MARKER = "[MIREA Lecture]"
     PORT_FILE = ".mirea-cdp-port"
+    LAUNCH_TIMEOUT_SECONDS = 12
     BLANK_PAGE = "about:blank"
     DISCONNECTED_RE = re.compile(
         r"соединение\s+(?:потеряно|прервано)|переподключ|connection\s+lost|disconnected|"
         r"страница\s+недоступна|не\s+уда[её]тся\s+получить\s+доступ|err_(?:connection|network)",
+        re.IGNORECASE,
+    )
+    # The /j/ invitation lands on an entry page, not inside the room: until its
+    # control is pressed the scanner would be watching a waiting screen.
+    JOIN_RE = re.compile(
+        r"подключ|присоедин|вступ|войти\s+в\s+(?:комнат|меропр|вебинар)|"
+        r"начать\s+(?:просмотр|трансл)|\bjoin\b|\benter\b",
         re.IGNORECASE,
     )
     ENDED_RE = re.compile(
@@ -175,7 +183,9 @@ class BrowserService:
             width,
             height,
         )
-        if self.is_running and self.muted != muted:
+        # A browser adopted from an earlier run has an unknown sound mode; killing
+        # it on that guess left the profile locked and no tab controllable at all.
+        if self.is_running and self.muted is not None and self.muted != muted:
             self.close()
         if not self.is_running:
             self.port = self._free_port()
@@ -193,14 +203,17 @@ class BrowserService:
             args.append(url)
             self.process = subprocess.Popen(args, close_fds=True)
             self.muted = muted
-            self._remember_port(self.port)
-            deadline = time.monotonic() + 12
+            deadline = time.monotonic() + self.LAUNCH_TIMEOUT_SECONDS
             while time.monotonic() < deadline:
                 if self._cdp_available(self.port):
                     break
                 time.sleep(0.15)
             else:
+                # Recording the port before this point overwrote a working one with
+                # a dead guess, and the next run could no longer find the browser.
+                self.port = None
                 raise RuntimeError(f"{browser_name} запущен, но управление вкладкой недоступно")
+            self._remember_port(self.port)
         elif not blank:
             self._navigate(url, force_navigation=force_navigation)
         if not blank:
@@ -295,11 +308,11 @@ class BrowserService:
             return current_room == wanted_room
         if current == wanted:
             return True
+        return self.is_mts(current) and self.is_mts(wanted)
 
-        def is_mts(host: str) -> bool:
-            return host == "mts-link.ru" or host.endswith(".mts-link.ru")
-
-        return is_mts(current) and is_mts(wanted)
+    @staticmethod
+    def is_mts(host: str) -> bool:
+        return host == "mts-link.ru" or host.endswith(".mts-link.ru")
 
     def lecture_is_open(self) -> bool:
         """Whether the current lecture still has a live, connected browser tab."""
@@ -327,7 +340,65 @@ class BrowserService:
             return "live"
         if self.ENDED_RE.search(text):
             return "ended"
-        return "lost" if self.DISCONNECTED_RE.search(text) else "live"
+        if self.DISCONNECTED_RE.search(text):
+            return "lost"
+        control, label = await self._entry_control(page)
+        if control is not None:
+            log.info("lecture_entry_pending label=%s", label)
+            return "waiting"
+        return "live"
+
+    async def _entry_control(self, page):
+        """Find the visible control that takes this page from the lobby into the room."""
+        for handle in await page.query_selector_all(
+            "button, a, [role='button'], input[type='submit'], input[type='button']"
+        ):
+            try:
+                if not await handle.is_visible():
+                    continue
+                label = (await handle.inner_text()) or (await handle.get_attribute("value")) or ""
+            except Exception:  # the lobby re-renders while being read
+                log.debug("entry_control_unreadable", exc_info=True)
+                continue
+            label = label.strip()
+            if label and self.JOIN_RE.search(label):
+                return handle, label[:60]
+        return None, ""
+
+    def join_lecture(self, display_name: str = "") -> str:
+        """Press the platform's own entry control. Returns joined / already / refused."""
+        return run_async(self._join_lecture_async(display_name))
+
+    async def _join_lecture_async(self, display_name: str) -> str:
+        page = await self._active_page()
+        host = (urlparse(page.url).hostname or "").lower()
+        if not self.is_mts(host):
+            # Clicking unknown controls on an unknown page is never worth the risk.
+            log.info("lecture_join_skipped host=%s", host or "unknown")
+            return "refused"
+        control, label = await self._entry_control(page)
+        if control is None:
+            return "already"
+        if display_name:
+            await self._fill_display_name(page, display_name)
+        await control.click()
+        log.info("lecture_join_clicked label=%s", label)
+        await page.wait_for_timeout(2_000)
+        return "joined"
+
+    async def _fill_display_name(self, page, display_name: str) -> None:
+        """Lobbies ask who is entering; an empty field keeps the button disabled."""
+        for handle in await page.query_selector_all("input[type='text'], input:not([type])"):
+            try:
+                if not await handle.is_visible() or await handle.input_value():
+                    continue
+                await handle.fill(display_name)
+            except Exception:  # a read-only or decorative field is fine to skip
+                log.debug("entry_name_field_skipped", exc_info=True)
+                continue
+            else:
+                log.info("lecture_join_name_filled")
+                return
 
     async def _connected_browser(self):
         """One CDP connection for the whole session, reconnected only when it breaks.

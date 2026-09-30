@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 import pytest
 
+from mirea_lecture_assistant import browser_service
 from mirea_lecture_assistant.browser_service import BrowserService
 
 LECTURE = "https://mts-link.ru/event/12345"
@@ -417,3 +418,58 @@ def test_releasing_twice_is_harmless(service):
 
     asyncio.run(service._release_connection())
     asyncio.run(service._release_connection())
+
+
+def test_an_adopted_browser_is_not_killed_over_an_unknown_sound_mode(service, monkeypatch):
+    """Restarting it left the profile locked and every tab uncontrollable."""
+    monkeypatch.setattr(type(service), "is_running", property(lambda _self: True))
+    closed = []
+    monkeypatch.setattr(type(service), "close", lambda _self: closed.append(True))
+    monkeypatch.setattr(type(service), "_navigate", lambda _self, _url, **_kw: None)
+    monkeypatch.setattr(type(service), "_find_browser", lambda _self: ("Google Chrome", "chrome"))
+
+    service.muted = None  # adopted from a previous run
+    service.open("https://my.mts-link.ru/j/1/2", muted=True)
+
+    assert closed == []
+
+
+def test_a_known_different_sound_mode_still_restarts_the_browser(service, monkeypatch):
+    monkeypatch.setattr(type(service), "is_running", property(lambda _self: True))
+    closed = []
+    monkeypatch.setattr(type(service), "close", lambda _self: closed.append(True))
+    monkeypatch.setattr(type(service), "_navigate", lambda _self, _url, **_kw: None)
+    monkeypatch.setattr(type(service), "_find_browser", lambda _self: ("Google Chrome", "chrome"))
+
+    service.muted = False
+    service.open("https://my.mts-link.ru/j/1/2", muted=True)
+
+    assert closed == [True]
+
+
+def test_a_failed_launch_does_not_overwrite_a_working_port(service, monkeypatch):
+    """A dead port in the file made the next run unable to find the live browser."""
+    (service.profile_dir / service.PORT_FILE).write_text("62167", encoding="utf-8")
+    monkeypatch.setattr(type(service), "is_running", property(lambda _self: False))
+    monkeypatch.setattr(type(service), "_find_browser", lambda _self: ("Google Chrome", "chrome"))
+    monkeypatch.setattr(type(service), "_free_port", staticmethod(lambda: 49335))
+    monkeypatch.setattr(type(service), "_cdp_available", staticmethod(lambda _port: False))
+    monkeypatch.setattr(type(service), "LAUNCH_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(browser_service.subprocess, "Popen", lambda *_a, **_kw: None)
+
+    with pytest.raises(RuntimeError, match="недоступно"):
+        service.open("https://my.mts-link.ru/j/1/2")
+
+    assert (service.profile_dir / service.PORT_FILE).read_text(encoding="utf-8") == "62167"
+    assert service.port is None
+
+
+def test_a_successful_launch_records_its_port(service, monkeypatch):
+    monkeypatch.setattr(type(service), "_find_browser", lambda _self: ("Google Chrome", "chrome"))
+    monkeypatch.setattr(type(service), "_free_port", staticmethod(lambda: 49335))
+    monkeypatch.setattr(type(service), "_cdp_available", staticmethod(lambda port: port == 49335))
+    monkeypatch.setattr(browser_service.subprocess, "Popen", lambda *_a, **_kw: None)
+
+    service.open("https://my.mts-link.ru/j/1/2")
+
+    assert (service.profile_dir / service.PORT_FILE).read_text(encoding="utf-8") == "49335"
