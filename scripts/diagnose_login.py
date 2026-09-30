@@ -23,9 +23,9 @@ def main() -> None:
     configure_logging(data_dir() / "logs")
     store = SessionStore()
     mirea_credentials = store.load_credentials()
-    gmail_credentials = store.load_email_credentials()
-    print("credentials configured:", bool(mirea_credentials), bool(gmail_credentials))
-    if not mirea_credentials or not gmail_credentials:
+    email_credentials = store.load_email_credentials()
+    print("credentials configured:", bool(mirea_credentials), bool(email_credentials))
+    if not mirea_credentials or not email_credentials:
         return
 
     MireaService.configure(_session_key())
@@ -33,7 +33,7 @@ def main() -> None:
     reader = ImapOtpReader()
     # A fresh pool thread per stage, exactly like QThreadPool in the UI.
     with ThreadPoolExecutor(max_workers=3) as pool:
-        latest_uid = pool.submit(reader.latest_uid, *gmail_credentials).result()
+        latest_uid = pool.submit(reader.latest_uid, email_credentials).result()
         started = datetime.now(UTC)
         first = pool.submit(run_async, service.login(*mirea_credentials)).result()
         print("first stage:", first.success, bool(first.challenge), first.message)
@@ -42,7 +42,7 @@ def main() -> None:
 
         code = pool.submit(
             reader.wait_for_code,
-            *gmail_credentials,
+            email_credentials,
             started,
             120,
             after_uid=latest_uid,

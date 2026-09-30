@@ -44,7 +44,16 @@ def _app_icon(icon_factory, log):
 
 
 def main() -> int:
-    from PySide6.QtCore import QLockFile, QStandardPaths, QTimer, QtMsgType, qInstallMessageHandler
+    from PySide6.QtCore import (
+        QLibraryInfo,
+        QLocale,
+        QLockFile,
+        QStandardPaths,
+        QTimer,
+        QtMsgType,
+        QTranslator,
+        qInstallMessageHandler,
+    )
     from PySide6.QtGui import QIcon
     from PySide6.QtWidgets import QApplication, QMessageBox
 
@@ -59,6 +68,17 @@ def main() -> int:
     MireaService.configure(_session_key())
 
     app = QApplication(sys.argv)
+    # Standard buttons (Cancel, Yes/No) and dialogs in Russian, like the rest of the UI.
+    translator = QTranslator(app)
+    if translator.load(
+        QLocale(QLocale.Language.Russian),
+        "qtbase",
+        "_",
+        QLibraryInfo.path(QLibraryInfo.LibraryPath.TranslationsPath),
+    ):
+        app.installTranslator(translator)
+    else:
+        log.info("qt_translation_missing")
 
     def qt_message_handler(message_type, _context, message):
         levels = {
@@ -71,6 +91,8 @@ def main() -> int:
         logging.getLogger("qt").log(levels.get(message_type, logging.INFO), "%s", message)
 
     qInstallMessageHandler(qt_message_handler)
+    # The "А" here is Cyrillic. QLockFile records the application name and checks a
+    # crashed owner's lock against it, so it stays as released to keep that working.
     app.setApplicationName("MIREА Lecture Assistant")
     app.setOrganizationName("MIREA Lecture Assistant")
     app.setStyle("Fusion")

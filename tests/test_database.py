@@ -1,6 +1,6 @@
 from datetime import UTC, datetime, timedelta
 
-from mirea_lecture_assistant.database import Database
+from mirea_lecture_assistant.database import MISSING_TOLERANCE, Database
 from mirea_lecture_assistant.domain import Lesson, RuleMode
 
 
@@ -39,13 +39,13 @@ def test_a_day_missing_from_one_refresh_keeps_its_lessons(tmp_path):
     assert len(db.list_lessons()) == 3
 
 
-def test_a_lesson_absent_from_three_refreshes_is_dropped(tmp_path):
+def test_a_lesson_absent_from_many_refreshes_is_dropped(tmp_path):
     db = Database(tmp_path / "test.sqlite3")
     keep_from = datetime(2026, 9, 3, tzinfo=UTC)
     full = [_lesson(1), _lesson(2)]
     db.sync_lessons(full, keep_from)
 
-    for _ in range(2):
+    for _ in range(MISSING_TOLERANCE - 1):
         db.sync_lessons([full[0]], keep_from)
     assert len(db.list_lessons()) == 2
 
@@ -133,3 +133,49 @@ def test_a_room_found_again_replaces_the_previous_one(tmp_path):
     db.set_resolved_link("lesson-1", "https://my.mts-link.ru/j/1/12")
 
     assert db.get_resolved_link("lesson-1") == "https://my.mts-link.ru/j/1/12"
+
+
+def test_a_running_lesson_survives_a_long_schedule_outage(tmp_path):
+    """A Pulse outage used to delete the running pair and close its lecture."""
+    db = Database(tmp_path / "test.sqlite3")
+    now = datetime(2026, 9, 3, 11, 0, tzinfo=UTC)
+    running = Lesson(
+        "running", "Физика", "ЛЕК", now - timedelta(minutes=30), now + timedelta(hours=1)
+    )
+    db.sync_lessons([running], now.replace(hour=0), now=now)
+
+    for _ in range(MISSING_TOLERANCE * 2):
+        db.sync_lessons([], now.replace(hour=0), now=now)
+
+    assert [x.external_id for x in db.list_lessons()] == ["running"]
+
+
+def test_rows_with_different_offsets_are_compared_as_moments(tmp_path):
+    from datetime import timezone
+
+    db = Database(tmp_path / "test.sqlite3")
+    msk = timezone(timedelta(hours=3))
+    lesson = Lesson(
+        "late",
+        "Физика",
+        "ЛЕК",
+        datetime(2026, 9, 3, 1, 0, tzinfo=msk),
+        datetime(2026, 9, 3, 2, 30, tzinfo=msk),
+    )
+    db.sync_lessons([lesson], datetime(2026, 9, 2, tzinfo=UTC))
+
+    # 02:30 MSK is 23:30 UTC on the 2nd: already over when the 3rd begins in UTC.
+    _missing, dropped = db.sync_lessons([lesson], datetime(2026, 9, 3, tzinfo=UTC))
+
+    assert dropped == 1
+
+
+def test_batch_lookups_match_single_ones(tmp_path):
+    db = Database(tmp_path / "test.sqlite3")
+    db.set_rule("Физика", RuleMode.AUTO)
+    db.set_link("Физика", "https://example.test/room")
+    db.set_resolved_link("lesson-1", "https://mts-link.ru/event/1")
+
+    assert db.all_rules() == {"Физика": RuleMode.AUTO}
+    assert db.all_links() == {"Физика": "https://example.test/room"}
+    assert db.all_resolved_links() == {"lesson-1": "https://mts-link.ru/event/1"}

@@ -271,7 +271,187 @@ def test_capture_override_sends_the_configured_size(service):
 
     assert sent["Emulation.setDeviceMetricsOverride"]["width"] == 1600
     assert sent["Emulation.setDeviceMetricsOverride"]["height"] == 900
-    assert sent["detached"]
+    # The session is kept so the override stays in force for the next frames.
+    assert "detached" not in sent
+
+
+def test_capture_override_is_sent_once_per_tab_and_again_on_a_size_change(service):
+    import asyncio
+
+    sent = []
+
+    class Session:
+        async def send(self, method, params):
+            sent.append((method, params))
+
+        async def detach(self):
+            sent.append(("detach", None))
+
+    class Page:
+        def is_closed(self):
+            return False
+
+        class context:
+            @staticmethod
+            async def new_cdp_session(_page):
+                return Session()
+
+    page = Page()
+
+    async def frames():
+        for _ in range(5):
+            await service._apply_capture_size(page)
+        service.capture_size = (1280, 720)
+        await service._apply_capture_size(page)
+
+    asyncio.run(frames())
+
+    overrides = [
+        params for method, params in sent if method == "Emulation.setDeviceMetricsOverride"
+    ]
+    assert [(item["width"], item["height"]) for item in overrides] == [(1920, 1080), (1280, 720)]
+    assert ("Emulation.clearDeviceMetricsOverride", {}) in sent
+
+
+@pytest.mark.parametrize(
+    ("text", "state"),
+    [
+        ("Вебинар завершён\nСпасибо", "ended"),
+        ("Мероприятие окончено", "ended"),
+        ("Соединение потеряно", "lost"),
+        ("Идёт лекция\nСлайд 3", None),
+        # Chat messages: a question, or a long typed sentence, is not a banner.
+        ("Иванов Иван: вебинар завершён?", None),
+        ("Петров: у меня соединение прервано, ребята, переподключитесь пожалуйста кто может", None),
+        ("встреча завершена?", None),
+    ],
+)
+def test_room_state_ignores_what_students_type(text, state):
+    assert BrowserService.room_state_from_text(text) == state
+
+
+@pytest.mark.parametrize(
+    ("label", "expected"),
+    [
+        ("Подключиться", True),
+        ("Войти в вебинар", True),
+        ("Join", True),
+        ("Подключить микрофон", False),
+        ("Подключить камеру", False),
+        ("Подключиться к звуку через браузер", False),
+        ("", False),
+    ],
+)
+def test_only_room_entry_controls_are_pressed(label, expected):
+    assert BrowserService.is_entry_label(label) is expected
+
+
+def test_an_already_open_chat_is_not_toggled_closed(service):
+    import asyncio
+
+    clicks = []
+
+    class Editor:
+        async def count(self):
+            return 1
+
+        def nth(self, _index):
+            return self
+
+        async def is_visible(self):
+            return True
+
+        async def fill(self, text):
+            typed.append(text)
+
+        async def press(self, _key):
+            delivered.append(1)
+
+    class Delivered:
+        async def count(self):
+            return len(delivered)
+
+    class Buttons:
+        async def count(self):
+            return 1
+
+        def nth(self, _index):
+            return self
+
+        async def is_visible(self):
+            return True
+
+        async def click(self):
+            clicks.append(1)
+
+    class Page:
+        url = LECTURE
+
+        def get_by_placeholder(self, _pattern):
+            return Editor()
+
+        def get_by_role(self, *_args, **_kwargs):
+            return Buttons()
+
+        def get_by_text(self, *_args, **_kwargs):
+            return Delivered()
+
+        async def wait_for_timeout(self, _ms):
+            return None
+
+    typed, delivered = [], []
+
+    async def active_page():
+        return Page()
+
+    service._active_page = active_page
+    asyncio.run(service._send_chat_message_async("Иванов Иван ИКБО-01-24"))
+
+    assert clicks == []
+    assert typed == ["Иванов Иван ИКБО-01-24"]
+
+
+def test_concurrent_reconnects_start_a_single_driver(service, monkeypatch):
+    import asyncio
+    import sys
+    import types
+
+    started = []
+
+    class Browser:
+        def is_connected(self):
+            return True
+
+    class Chromium:
+        async def connect_over_cdp(self, *_args, **_kwargs):
+            await asyncio.sleep(0.01)
+            return Browser()
+
+    class Driver:
+        chromium = Chromium()
+
+        async def stop(self):
+            return None
+
+    class Starter:
+        async def start(self):
+            started.append(1)
+            await asyncio.sleep(0.01)
+            return Driver()
+
+    fake = types.ModuleType("playwright.async_api")
+    fake.async_playwright = Starter
+    monkeypatch.setitem(sys.modules, "playwright.async_api", fake)
+    monkeypatch.setattr(type(service), "is_running", property(lambda _self: True))
+    service.port = 9222
+
+    async def many():
+        return await asyncio.gather(*(service._connected_browser() for _ in range(4)))
+
+    browsers = asyncio.run(many())
+
+    assert len(started) == 1
+    assert len({id(browser) for browser in browsers}) == 1
 
 
 def test_browser_restart_terminates_a_stuck_owned_process(service, monkeypatch):

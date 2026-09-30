@@ -12,7 +12,7 @@ from PySide6.QtWidgets import QApplication
 
 from mirea_lecture_assistant import paths
 from mirea_lecture_assistant.database import Database
-from mirea_lecture_assistant.domain import Lesson, PendingAttendance, SessionState
+from mirea_lecture_assistant.domain import Lesson, PendingAttendance, RuleMode, SessionState
 from mirea_lecture_assistant.security import SessionStore
 from mirea_lecture_assistant.ui import MainWindow
 
@@ -113,7 +113,11 @@ def test_automatic_2fa_rejection_does_not_request_another_code(window, monkeypat
     failures = []
     monkeypatch.setattr(window, "_run_initial_login", lambda *args: retries.append(args))
     monkeypatch.setattr(window, "_schedule_login_retry", lambda *_: retries.append("retry"))
-    monkeypatch.setattr(window, "_operation_failed", failures.append)
+    # Unattended: reported through the tray, not a modal dialog nobody sees.
+    monkeypatch.setattr(
+        window, "_background_problem", lambda _title, message: failures.append(message)
+    )
+    monkeypatch.setattr(window, "_operation_failed", lambda message: failures.append("modal"))
 
     window._login_finished(SimpleNamespace(challenge=object(), success=False, message="rejected"))
 
@@ -250,3 +254,243 @@ def test_finishing_a_room_discards_its_in_memory_qr(window):
 
     assert not window.pending_qr
     assert not window.latest_qr_event_by_lesson
+
+
+def test_session_recovery_does_not_start_a_second_login_while_the_code_is_awaited(
+    window, monkeypatch
+):
+    """Slow mail (Яндекс, Mail.ru) used to let the minute timer start another SSO flow."""
+    from mirea_lecture_assistant.email_otp import EmailAccount
+
+    window.pending_email_credentials = EmailAccount("student@mail.ru", "app-password")
+    window.mirea.session = {"cookie": "stale"}
+    started = []
+    monkeypatch.setattr(
+        window, "_run", lambda function, *_args, **_kwargs: started.append(function)
+    )
+    monkeypatch.setattr(window, "_auto_login", lambda: started.append("second-login"))
+
+    window._login_finished(SimpleNamespace(challenge="challenge", success=False, message=""))
+    window._recover_expired_session("schedule_refresh")
+
+    assert window.login_in_progress
+    assert "second-login" not in started
+    assert len(started) == 1  # only the email wait itself
+
+
+def test_expired_saved_session_is_dropped_before_automatic_login(window, monkeypatch):
+    window.mirea.session = {"cookie": "expired"}
+    sessions_at_login = []
+    monkeypatch.setattr(
+        window, "_auto_login", lambda: sessions_at_login.append(dict(window.mirea.session))
+    )
+
+    window._session_verified(SessionState.EXPIRED)
+
+    assert sessions_at_login == [{}]
+
+
+def _running_lesson(external_id: str = "running") -> Lesson:
+    now = datetime.now().astimezone()
+    return Lesson(
+        external_id=external_id,
+        subject_name="Надёжность",
+        lesson_type="ЛК",
+        start_at=now - timedelta(minutes=10),
+        end_at=now + timedelta(minutes=60),
+    )
+
+
+def test_lecture_keeps_running_while_its_lesson_is_missing_from_the_schedule(window, monkeypatch):
+    lesson = _running_lesson()
+    window.active_lesson = lesson
+    window.active_lecture_id = lesson.external_id
+    window.active_lecture_url = "https://mts-link.ru/event/running"
+    checks = []
+    monkeypatch.setattr(window, "_run", lambda function, done, *_a, **_k: checks.append(done))
+
+    window._lecture_watch_tick()
+
+    assert window.active_lecture_id == lesson.external_id
+    assert len(checks) == 1  # the room is still being watched
+
+
+def test_a_rejected_token_is_not_resent(window, monkeypatch):
+    window.mirea.session = {"cookie": "ok"}
+    event_id = window.db.add_qr_event("fingerprint", "detected", lesson_id="lesson")
+    window.pending_qr[event_id] = PendingAttendance(
+        raw_data="qr",
+        lesson_id="lesson",
+        lecture_url=None,
+        detected_at=datetime.now().astimezone(),
+    )
+    window.latest_qr_event_by_lesson["lesson"] = event_id
+    scheduled = []
+    monkeypatch.setattr(window, "_schedule_retry", scheduled.append)
+
+    window._attendance_finished(
+        event_id, SimpleNamespace(success=False, message="Токен недействителен"), "lesson"
+    )
+
+    assert scheduled == []
+    assert event_id not in window.pending_qr
+    assert window.db.recent_qr_events()[0].status == "failed"
+    assert window.attendance_failures_by_lesson["lesson"] == 1
+
+
+def test_only_one_retry_timer_runs_per_event(window, monkeypatch):
+    from mirea_lecture_assistant import ui
+
+    timers = []
+    monkeypatch.setattr(ui.QTimer, "singleShot", lambda delay, callback: timers.append(delay))
+    event_id = window.db.add_qr_event("fingerprint", "retrying", lesson_id="lesson")
+    window.pending_qr[event_id] = PendingAttendance(
+        raw_data="qr", lesson_id="lesson", lecture_url=None, detected_at=datetime.now().astimezone()
+    )
+
+    window._schedule_retry(event_id)
+    window._schedule_retry(event_id)
+
+    assert timers == [5_000]
+
+
+def test_network_failures_back_off_and_stale_codes_are_dropped(window, monkeypatch):
+    from mirea_lecture_assistant import ui
+
+    timers = []
+    monkeypatch.setattr(ui.QTimer, "singleShot", lambda delay, callback: timers.append(delay))
+    event_id = window.db.add_qr_event("fingerprint", "retrying", lesson_id="lesson")
+    window.pending_qr[event_id] = PendingAttendance(
+        raw_data="qr", lesson_id="lesson", lecture_url=None, detected_at=datetime.now().astimezone()
+    )
+    for _ in range(9):
+        window._schedule_retry(event_id)
+        window.retry_scheduled.discard(event_id)
+    assert timers[0] == 5_000 and timers[-1] == 120_000
+
+    window.pending_qr[event_id].detected_at -= timedelta(hours=1)
+    window._schedule_retry(event_id)
+    assert event_id not in window.pending_qr
+
+
+def test_link_typed_in_a_row_belongs_to_that_lesson_only(window):
+    window._save_lesson_link("lesson-1", "https://mts-link.ru/event/1")
+
+    assert window.db.get_resolved_link("lesson-1") == "https://mts-link.ru/event/1"
+    assert window.db.get_link("Надёжность") == ""
+
+
+def test_failed_sdo_sign_in_pauses_further_attempts(window, monkeypatch):
+    calls = []
+
+    def locked():
+        calls.append(1)
+        raise RuntimeError("SSO failed")
+
+    monkeypatch.setattr(window, "_sign_in_to_sdo_locked", locked)
+
+    with pytest.raises(RuntimeError):
+        window._sign_in_to_sdo()
+    assert window._sign_in_to_sdo() is False
+    assert calls == [1]
+
+
+def test_webinar_lookup_is_not_repeated_every_minute(window, monkeypatch):
+    lesson = _running_lesson()
+    runs = []
+    monkeypatch.setattr(window, "_run", lambda *args, **kwargs: runs.append(args))
+
+    window._resolve_from_sources(lesson)
+    window._source_resolved(lesson, None, [])
+    window._resolve_from_sources(lesson)
+
+    assert len(runs) == 1
+
+
+def test_schedule_failure_still_opens_an_already_found_room(window, monkeypatch):
+    lesson = _running_lesson()
+    today = datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
+    window.db.sync_lessons([lesson], today)
+    window.db.set_rule(lesson.subject_name, RuleMode.AUTO)
+    window.db.set_resolved_link(lesson.external_id, "https://mts-link.ru/event/running")
+    opened = []
+    monkeypatch.setattr(window, "_open_lecture", lambda url, lesson_id: opened.append(url))
+    monkeypatch.setattr(window, "_recover_expired_session", lambda _reason: None)
+
+    window._schedule_refresh_failed("Пульс недоступен")
+
+    assert opened == ["https://mts-link.ru/event/running"]
+
+
+def test_auth_indicator_follows_the_session(window, monkeypatch):
+    window.mirea.session = {"cookie": "expired"}
+    monkeypatch.setattr(window, "_auto_login", lambda: None)
+    monkeypatch.setattr(window, "refresh_schedule", lambda: None)
+    monkeypatch.setattr(window.session_store, "save", lambda _session: None)
+
+    window._session_verified(SessionState.EXPIRED)
+
+    assert "истекла" in window.auth_status.text()
+    window._login_finished(SimpleNamespace(challenge=None, success=True, message="", tokens={}))
+    assert "вход выполнен" in window.auth_status.text()
+
+
+def test_now_card_names_the_next_pair_and_its_mode(window):
+    now = datetime.now().astimezone()
+    lesson = Lesson(
+        external_id="next",
+        subject_name="Матанализ",
+        lesson_type="ЛК",
+        start_at=now + timedelta(minutes=30),
+        end_at=now + timedelta(minutes=120),
+    )
+    window.db.sync_lessons([lesson], now.replace(hour=0, minute=0, second=0, microsecond=0))
+    window.db.set_rule("Матанализ", RuleMode.AUTO)
+
+    window._update_now_card()
+
+    assert "Матанализ" in window.now_card.text()
+    assert "Авто" in window.now_card.text()
+    assert "Матанализ" in window.tray.toolTip()
+
+
+def test_background_results_are_not_wiped_by_other_operations(window):
+    window.statusBar().showMessage("Посещение отмечено", 8000)
+    worker_done = []
+
+    class FakeWorker:
+        signals = SimpleNamespace(
+            done=SimpleNamespace(connect=worker_done.append),
+            failed=SimpleNamespace(connect=lambda _handler: None),
+        )
+
+        def setAutoDelete(self, _flag):
+            return None
+
+    window._start_worker(
+        FakeWorker(),
+        lambda _value: None,
+        lambda _message: None,
+        busy_text="Проверяем вкладку лекции…",
+        pool=SimpleNamespace(start=lambda _worker: None),
+    )
+    assert "Проверяем вкладку" in window.activity_label.text()
+
+    worker_done[0](None)
+
+    assert window.activity_label.text() == ""
+    assert window.statusBar().currentMessage() == "Посещение отмечено"
+
+
+def test_schedule_modes_are_shown_in_russian(window):
+    now = datetime.now().astimezone()
+    lesson = Lesson("l1", "Физика", "ЛК", now + timedelta(hours=1), now + timedelta(hours=2))
+    window.db.sync_lessons([lesson], now.replace(hour=0, minute=0, second=0, microsecond=0))
+    window.db.set_rule("Физика", RuleMode.IGNORE)
+
+    window._fill_schedule()
+
+    assert window.schedule_table.item(0, 5).text() == "Не открывать"
+    window.subject_rule_subject.setCurrentText("Физика")
+    window.subject_rule_mode.setCurrentIndex(window.subject_rule_mode.findData("AUTO"))
+    assert window.db.get_rule("Физика") is RuleMode.AUTO
