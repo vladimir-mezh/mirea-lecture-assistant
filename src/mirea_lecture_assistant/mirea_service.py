@@ -146,6 +146,31 @@ class MireaService:
             return await self._validate_completed_login(result)
         return result
 
+    async def logout(self) -> None:
+        """End the SSO session on the server as well (best effort).
+
+        A fresh login after this starts from nothing on MIREA's side too: no
+        half-dead SSO session for Keycloak to resume, no stale Pulse cookie.
+        """
+        import httpx
+        from pymirea import MireaAuth
+
+        refresh = str(self.session.get("refresh_token") or "").strip()
+        if not refresh:
+            return
+        url = MireaAuth.TOKEN_URL.rsplit("/", 1)[0] + "/logout"
+        try:
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(15.0, connect=8.0),
+                transport=httpx.AsyncHTTPTransport(retries=1),
+            ) as client:
+                response = await client.post(
+                    url, data={"client_id": MireaAuth.CLIENT_ID, "refresh_token": refresh}
+                )
+            log.info("sso_logout status=%s", response.status_code)
+        except httpx.HTTPError as exc:
+            log.info("sso_logout_failed kind=%s", type(exc).__name__)
+
     async def complete_2fa(self, challenge, code: str):
         if self._auth is None:
             raise RuntimeError("Сценарий входа уже завершён; начните вход заново")

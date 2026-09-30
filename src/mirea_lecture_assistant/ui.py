@@ -103,6 +103,29 @@ LESSON_CHECK_MS = 15_000
 # New releases are looked for this often, and the first time soon after start.
 UPDATE_CHECK_MS = 6 * 60 * 60 * 1000
 FIRST_UPDATE_CHECK_MS = 20_000
+# When nothing else helps: after this long without a schedule (with the internet
+# up), sign out of MIREA completely and sign in again; at most this often.
+HARD_RELOGIN_AFTER_SECONDS = 20 * 60
+HARD_RELOGIN_EVERY_SECONDS = 2 * 60 * 60
+# Failures that mean "no connection" (see mirea_service.failure_reason), which a
+# new login cannot fix, and the circuit breaker that follows them.
+NETWORK_TROUBLE = (
+    "не ответил вовремя",
+    "не находится",
+    "не удалось подключиться",
+    "оборвал соединение",
+    "прокси",
+    "временно недоступна",
+)
+
+
+def is_network_trouble(message: str) -> bool:
+    if any(part in message for part in NETWORK_TROUBLE):
+        return True
+    # "не отвечает" with no reason found: nothing suggests the login is at fault.
+    return "не отвечает" in message and "Причина" not in message
+
+
 # The chat fallback: a few spaced attempts per pair, not one per scanned frame.
 CHAT_MAX_ATTEMPTS = 3
 CHAT_RETRY_SECONDS = 60
@@ -567,6 +590,10 @@ class MainWindow(QMainWindow):
         self.session_obtained_at: float | None = None
         # Whether the last СДО sign-in actually ran and worked (lookups waiting for it reuse it).
         self.sdo_last_sign_in_ok = False
+        # Since when the schedule keeps failing, and when the app last signed out
+        # and in again because of it.
+        self.schedule_failing_since: float | None = None
+        self.last_hard_relogin: float | None = None
         # ASK pairs the student agreed to open: retried like AUTO ones if opening fails.
         self.accepted_lessons: set[str] = set()
         self.chat_attempts: dict[str, tuple[int, float]] = {}
@@ -1927,9 +1954,55 @@ class MainWindow(QMainWindow):
             "Расписание пока недоступно; повторим проверку через минуту: " + message,
             6000,
         )
-        self._recover_expired_session("schedule_refresh")
+        if self._hard_relogin_due(message):
+            self._hard_relogin(message)
+        else:
+            self._recover_expired_session("schedule_refresh")
         # A room already found needs no Pulse session to be opened.
         self._evaluate_current_lessons(self.db.list_lessons())
+
+    def _hard_relogin_due(self, message: str) -> bool:
+        """Whether the schedule has failed long enough, for reasons a login might fix."""
+        now = time.monotonic()
+        if is_network_trouble(message):
+            self.schedule_failing_since = None
+            return False
+        if self.schedule_failing_since is None:
+            self.schedule_failing_since = now
+            return False
+        last = self.last_hard_relogin
+        return (
+            now - self.schedule_failing_since >= HARD_RELOGIN_AFTER_SECONDS
+            and (last is None or now - last >= HARD_RELOGIN_EVERY_SECONDS)
+            and not self.login_in_progress
+        )
+
+    def _hard_relogin(self, reason: str):
+        """Sign out of MIREA completely and sign in again, when nothing else helped."""
+        try:
+            credentials = self.session_store.load_credentials()
+        except Exception:  # noqa: BLE001 - without them there is nothing to sign in with
+            credentials = None
+        if not credentials or not bool(self.db.get_setting("auto_login", True)):
+            return  # never sign out a session that cannot be replaced automatically
+        self.last_hard_relogin = time.monotonic()
+        self.schedule_failing_since = None
+        log.warning("hard_relogin reason=%s", reason)
+        self.statusBar().showMessage(
+            "Расписание не загружается 20 минут — выходим из MIREA и входим заново", 10000
+        )
+
+        def sign_in_again(_result=None):
+            self._discard_expired_session()
+            self._set_auth_state("expired")
+            self._auto_login()
+
+        self._run(
+            lambda: run_async(self.mirea.logout()),
+            sign_in_again,
+            "Выходим из MIREA…",
+            failed=lambda _message: sign_in_again(),
+        )
 
     def _recover_expired_session(self, reason: str):
         """Re-enter automatically when a saved session expires while the app is running."""
@@ -1971,6 +2044,7 @@ class MainWindow(QMainWindow):
 
     def _schedule_loaded(self, lessons):
         self.schedule_refresh_running = False
+        self.schedule_failing_since = None
         if self.pending_pulse_login is not None:
             result = self.pending_pulse_login
             result.success = True
