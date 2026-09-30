@@ -1,0 +1,70 @@
+name: Release
+
+# A version bump merged into master builds the Windows executable and publishes
+# it as a GitHub Release named after the version. It can also be run by hand.
+on:
+  push:
+    branches: [master]
+    paths: [src/mirea_lecture_assistant/__init__.py]
+    tags: ["v*"]
+  # Pull requests build and smoke-test the executable without publishing it.
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    env:
+      QT_QPA_PLATFORM: offscreen
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        shell: pwsh
+        # The spec takes Qt's VC runtime from .venv, so the venv lives in the project.
+        run: |
+          python -m venv .venv
+          .venv\Scripts\python -m pip install --upgrade pip
+          .venv\Scripts\python -m pip install -e ".[dev,build]"
+      - name: Tests
+        shell: pwsh
+        run: .venv\Scripts\python -m pytest -q
+      - name: Build
+        shell: pwsh
+        run: .venv\Scripts\python -m PyInstaller --clean --noconfirm MireaLectureAssistant.spec
+      - name: Smoke test
+        shell: pwsh
+        # The executable must start, open its window and exit on its own.
+        run: |
+          $env:MIREA_ASSISTANT_SMOKE_TEST = "1"
+          Remove-Item Env:QT_QPA_PLATFORM
+          $process = Start-Process -FilePath dist\MireaLectureAssistant.exe -PassThru
+          if (-not $process.WaitForExit(90000)) { $process.Kill(); throw "The executable did not exit" }
+          if ($process.ExitCode -ne 0) { throw "Exit code $($process.ExitCode)" }
+      - name: Version
+        id: version
+        shell: pwsh
+        run: |
+          $version = .venv\Scripts\python -c "import mirea_lecture_assistant as m; print(m.__version__)"
+          "tag=v$version" >> $env:GITHUB_OUTPUT
+          Compress-Archive -Path dist\MireaLectureAssistant.exe -DestinationPath "dist\MireaLectureAssistant-v$version-windows.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MireaLectureAssistant-windows
+          path: dist/MireaLectureAssistant.exe
+      - name: Publish release
+        if: github.event_name != 'pull_request'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || steps.version.outputs.tag }}
+          name: MIREA Lecture Assistant ${{ github.ref_type == 'tag' && github.ref_name || steps.version.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          body_path: CHANGELOG.md
+          files: |
+            dist/MireaLectureAssistant.exe
+            dist/MireaLectureAssistant-*-windows.zip
