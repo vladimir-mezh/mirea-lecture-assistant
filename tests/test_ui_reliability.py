@@ -219,13 +219,18 @@ def test_new_rotating_qr_replaces_an_old_pending_code(window):
 
 
 def test_rejections_are_counted_across_rotating_codes(window, monkeypatch):
+    from mirea_lecture_assistant import ui
+
     window.active_lecture_id = "lesson"
     sent = []
     monkeypatch.setattr(
         window, "_send_chat_fallback", lambda reason, lesson: sent.append((reason, lesson))
     )
+    clock = [1000.0]
+    monkeypatch.setattr(ui.time, "monotonic", lambda: clock[0])
 
     for number in range(5):
+        clock[0] += 40  # rotating codes rejected over more than two minutes
         event_id = window.db.add_qr_event(f"fingerprint-{number}", "detected", lesson_id="lesson")
         window.pending_qr[event_id] = PendingAttendance(
             raw_data=f"qr-{number}",
@@ -270,7 +275,8 @@ def test_session_recovery_does_not_start_a_second_login_while_the_code_is_awaite
     )
     monkeypatch.setattr(window, "_auto_login", lambda: started.append("second-login"))
 
-    window._login_finished(SimpleNamespace(challenge="challenge", success=False, message=""))
+    challenge = SimpleNamespace(kind="email_code", field_name="emailCode")
+    window._login_finished(SimpleNamespace(challenge=challenge, success=False, message=""))
     window._recover_expired_session("schedule_refresh")
 
     assert window.login_in_progress
@@ -629,7 +635,7 @@ def _active(window, lesson, url):
     window.joined_lessons.add(lesson.external_id)
 
 
-def _webinar(url):
+def _webinar(url, webinar_id=9):
     return SimpleNamespace(
         join_url=url,
         is_joinable=True,
@@ -637,7 +643,7 @@ def _webinar(url):
         start_at=datetime.now().astimezone(),
         end_at=None,
         groups=("ИКБО-01-24",),
-        webinar_id=9,
+        webinar_id=webinar_id,
     )
 
 
@@ -670,6 +676,169 @@ def test_a_newer_room_found_mid_pair_replaces_the_current_one(window, monkeypatc
     window._source_resolved(lesson, _webinar("https://my.mts-link.ru/j/1/2"), [])
     assert opened == []  # the same room: stay
 
-    window._source_resolved(lesson, _webinar("https://my.mts-link.ru/j/1/5"), [])
+    window._source_resolved(lesson, _webinar("https://my.mts-link.ru/j/1/5", 10), [])
     assert opened == [("https://my.mts-link.ru/j/1/5", True)]
     assert window.db.get_resolved_link("live") == "https://my.mts-link.ru/j/1/5"
+
+
+def test_an_older_room_never_pulls_the_pair_back(window, monkeypatch):
+    """A closed room's row came back after its rejection lapsed: stay in the live one."""
+    lesson = _running_lesson("live")
+    _active(window, lesson, "https://my.mts-link.ru/j/1/5")
+    window.room_webinar_ids["https://my.mts-link.ru/j/1/5"] = 10
+    opened = []
+    monkeypatch.setattr(window, "_open_lecture", lambda *args, **kwargs: opened.append(args))
+
+    window._source_resolved(lesson, _webinar("https://my.mts-link.ru/j/1/2", 9), [])
+
+    assert opened == []
+
+
+def _pair(external_id, start, subject="Надёжность"):
+    return Lesson(external_id, subject, "ЛК", start, start + timedelta(minutes=90))
+
+
+def test_the_previous_pair_never_takes_the_tab_of_the_next_one(window, monkeypatch):
+    """A closed at the bell, B opened, then A's dead room came back on top of B."""
+    now = datetime.now().astimezone()
+    a = _pair("A", now - timedelta(minutes=96), subject="Физика")  # ended 6 min ago
+    b = _pair("B", now + timedelta(minutes=4), subject="Химия")  # starts in 4 min
+    window.db.sync_lessons([a, b], now.replace(hour=0, minute=0, second=0, microsecond=0))
+    window.db.set_rule("Физика", RuleMode.AUTO)
+    window.db.set_resolved_link("A", "https://my.mts-link.ru/j/a")
+    window.active_lecture_id = "B"
+    window.active_lecture_url = "https://my.mts-link.ru/j/b"
+    window.joined_lessons.add("B")
+    runs = []
+    monkeypatch.setattr(window, "_run", lambda *args, **kwargs: runs.append(args))
+    monkeypatch.setattr(window, "_resolve_from_sources", lambda lesson: None)
+
+    window._evaluate_current_lessons(window.db.list_lessons())
+    window._room_found(a, "https://my.mts-link.ru/j/a")
+
+    assert runs == []  # nothing navigated B's tab to A's room
+
+
+def test_a_large_lead_does_not_leave_the_running_pair_early(window, monkeypatch):
+    now = datetime.now().astimezone()
+    a = _pair("A", now - timedelta(minutes=88), subject="Физика")  # ends in 2 min
+    b = _pair("B", now + timedelta(minutes=8), subject="Химия")
+    window.join_before.setValue(15)
+    window.db.sync_lessons([a, b], now.replace(hour=0, minute=0, second=0, microsecond=0))
+    window.db.set_rule("Химия", RuleMode.AUTO)
+    window.db.set_resolved_link("B", "https://my.mts-link.ru/j/b")
+    window.active_lecture_id = "A"
+    window.active_lecture_url = "https://my.mts-link.ru/j/a"
+    opened = []
+    monkeypatch.setattr(window, "_open_lecture", lambda url, lesson_id: opened.append(lesson_id))
+    monkeypatch.setattr(window, "_resolve_from_sources", lambda lesson: None)
+
+    window._evaluate_current_lessons(window.db.list_lessons())
+
+    assert opened == []  # A keeps the tab until its end + 5 min
+
+
+def test_a_double_pair_in_one_room_scans_the_second_pair_too(window, monkeypatch):
+    now = datetime.now().astimezone()
+    first = _pair("first", now - timedelta(minutes=100))
+    second = _pair("second", now - timedelta(minutes=1))
+    window.db.sync_lessons([first, second], now.replace(hour=0, minute=0, second=0, microsecond=0))
+    window.db.set_rule("Надёжность", RuleMode.AUTO)
+    window.db.set_setting("marked_lessons", ["first"])
+    window.active_lecture_id = "first"
+    window.active_lecture_url = "https://my.mts-link.ru/j/room"
+    monkeypatch.setattr(window, "_resolve_from_sources", lambda lesson: None)
+    monkeypatch.setattr(window, "_scan_tick", lambda: None)
+
+    window._evaluate_current_lessons(window.db.list_lessons())
+
+    assert window.active_lecture_id == "second"
+    assert window.db.get_resolved_link("second") == "https://my.mts-link.ru/j/room"
+    assert window.scan_timer.isActive()
+    window.scan_timer.stop()
+
+
+def test_a_lookup_started_before_the_rejection_does_not_reopen_the_room(window, monkeypatch):
+    lesson = _running_lesson("lost")
+    today = datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
+    window.db.sync_lessons([lesson], today)
+    window.db.set_rule(lesson.subject_name, RuleMode.AUTO)
+    window._reject_room("lost", "https://my.mts-link.ru/j/dead")
+    opened = []
+    monkeypatch.setattr(window, "_open_lecture", lambda *args, **kwargs: opened.append(args))
+
+    window._source_resolved(lesson, _webinar("https://my.mts-link.ru/j/dead"), [])
+
+    assert opened == []
+
+
+def test_an_automatic_open_is_refused_after_the_pair(window):
+    now = datetime.now().astimezone()
+    over = _pair("over", now - timedelta(minutes=100))
+    window.db.sync_lessons([over], now.replace(hour=0, minute=0, second=0, microsecond=0))
+
+    assert window._may_open("https://my.mts-link.ru/j/x", "over") is False
+
+
+def test_five_quick_rejections_do_not_post_to_the_public_chat(window, monkeypatch):
+    """Rotating codes fail five times in twenty seconds; the next one often works."""
+    window.active_lecture_id = "lesson"
+    sent = []
+    monkeypatch.setattr(window, "_send_chat_fallback", lambda *args: sent.append(args))
+
+    for number in range(5):
+        event_id = window.db.add_qr_event(f"fingerprint-{number}", "detected", lesson_id="lesson")
+        window.pending_qr[event_id] = PendingAttendance(
+            raw_data=f"qr-{number}",
+            lesson_id="lesson",
+            lecture_url=None,
+            detected_at=datetime.now().astimezone(),
+        )
+        window._record_attendance_failure(event_id)
+
+    assert sent == []
+
+
+def test_an_authenticator_code_is_asked_for_instead_of_waiting_for_email(window, monkeypatch):
+    from mirea_lecture_assistant.email_otp import EmailAccount
+
+    window.pending_email_credentials = EmailAccount("student@mail.ru", "app-password")
+    asked, waited = [], []
+    monkeypatch.setattr(window, "_manual_2fa", lambda challenge, reason="": asked.append(reason))
+    monkeypatch.setattr(window, "_run", lambda *args, **kwargs: waited.append(args))
+
+    challenge = SimpleNamespace(kind="otp", field_name="otp")
+    window._login_finished(SimpleNamespace(challenge=challenge, success=False, message=""))
+
+    assert waited == [] and len(asked) == 1
+
+
+def test_a_pulse_login_waits_while_the_sdo_sign_in_holds_the_mailbox(window, monkeypatch):
+    from mirea_lecture_assistant import ui
+
+    timers, runs = [], []
+    monkeypatch.setattr(ui.QTimer, "singleShot", lambda delay, callback: timers.append(delay))
+    monkeypatch.setattr(window, "_run", lambda *args, **kwargs: runs.append(args))
+
+    with window.sdo_sign_in_lock:
+        window._run_initial_login("user", "password", "Вход…")
+
+    assert runs == [] and timers == [30_000]
+    assert not window.login_in_progress
+
+
+def test_the_sdo_sign_in_waits_while_a_pulse_login_awaits_its_code(window):
+    window.login_in_progress = True
+    assert window._sign_in_to_sdo_locked() is False
+
+
+def test_the_login_button_does_nothing_while_a_login_runs(window, monkeypatch):
+    from mirea_lecture_assistant import ui
+
+    window.login_in_progress = True
+    dialogs = []
+    monkeypatch.setattr(ui, "LoginDialog", lambda *args: dialogs.append(args))
+
+    window.login()
+
+    assert dialogs == []

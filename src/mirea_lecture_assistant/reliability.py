@@ -8,9 +8,14 @@ PERMANENT_LOGIN_ERROR = re.compile(
     r"(?:gmail|яндекс|mail\.ru|microsoft|outlook|почт).*?(?:отклонил|парол|способ входа)",
     re.IGNORECASE,
 )
+# Not a verdict on this QR: the network, the session, or MIREA itself. pymirea
+# reports a failed connection as the generic "Ошибка отметки посещаемости", and
+# "Отметка пока недоступна" means the teacher has not opened attendance yet.
 TRANSIENT_ATTENDANCE_ERROR = re.compile(
     r"временно\s+недоступ|ошибка\s+(?:сети|соединения)|тайм.?аут|timeout|network|"
-    r"соединени|сессия\s+истек|перелог|needs_auth|авторизац|\b(?:429|5\d\d)\b",
+    r"соединени|сессия\s+истек|перелог|needs_auth|авторизац|\b(?:429|5\d\d)\b|"
+    r"^ошибка\s+отметки\s+посещаемости\.?$|сервер\s+вернул\s+spa|"
+    r"неизвестный\s+ответ\s+сервера|пока\s+недоступн",
     re.IGNORECASE,
 )
 

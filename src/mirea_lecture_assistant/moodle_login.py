@@ -63,7 +63,15 @@ async def _skip_optional_max(page, timeout_ms: int) -> None:
     await page.evaluate("selector => document.querySelector(selector).click()", MAX_SKIP)
 
 
-async def sign_in(page, *, username: str, password: str, request_code, timeout_ms: int = 20_000):
+async def sign_in(
+    page,
+    *,
+    username: str,
+    password: str,
+    request_code,
+    timeout_ms: int = 20_000,
+    reserve_attempt=None,
+):
     """Walk the SSO forms in `page`. `request_code` is called only if a code is asked for.
 
     Returns the stage the flow ended on, so the caller can log what happened
@@ -77,6 +85,14 @@ async def sign_in(page, *, username: str, password: str, request_code, timeout_m
             log.info("sdo_sign_in_not_needed")
             return "already"
         raise SignInFailed("Страница входа МИРЭА не открылась")
+    host = (urlparse(page.url).hostname or "").lower()
+    if host != "mirea.ru" and not host.endswith(".mirea.ru"):
+        # The password is typed only into MIREA's own sign-in form.
+        raise SignInFailed("Форма входа открылась не на сайте МИРЭА")
+    # The shared SSO budget is spent only when credentials are actually sent;
+    # a live session that needs no form costs nothing.
+    if reserve_attempt is not None and not reserve_attempt():
+        raise SignInFailed("Лимит попыток входа исчерпан; повторим позже")
     await page.fill(USERNAME_FIELD, username)
     await page.fill(PASSWORD_FIELD, password)
     log.info("sdo_sign_in_credentials_submitted")

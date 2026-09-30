@@ -1,6 +1,7 @@
 import asyncio
 
 import httpx
+import pytest
 
 from mirea_lecture_assistant.domain import SessionState
 from mirea_lecture_assistant.mirea_service import MireaService, classify_session_response
@@ -75,3 +76,18 @@ def test_login_redirect_is_confirmed_as_expired(monkeypatch):
     service = MireaService({"session-cookie": "expired"})
 
     assert asyncio.run(service.verify_state()) is SessionState.EXPIRED
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Ошибка отметки посещаемости",
+        "Сервер вернул SPA вместо ответа",
+        "Неизвестный ответ сервера",
+        "Отметка пока недоступна",
+    ],
+)
+def test_server_side_and_network_failures_are_not_rejections(message):
+    from mirea_lecture_assistant.reliability import attendance_failure_counts_for_chat
+
+    assert not attendance_failure_counts_for_chat(message)

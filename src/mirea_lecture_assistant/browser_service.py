@@ -13,7 +13,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from .async_runtime import run_async
-from .cdp import Browser, CdpError, CdpTimeout, endpoint_alive
+from .cdp import Browser, CdpError, CdpTimeout, browser_id, debugger_url, endpoint_alive
 from .moodle import looks_like_login_page
 
 log = logging.getLogger(__name__)
@@ -75,10 +75,13 @@ class BrowserService:
         re.IGNORECASE,
     )
     # The /j/ invitation lands on an entry page, not inside the room: until its
-    # control is pressed the scanner would be watching a waiting screen.
+    # control is pressed the scanner would be watching a waiting screen. Only a
+    # whole short label counts: "Подключиться по телефону", "Вступить в группу"
+    # or a chat link ending in /join are not the way into the room.
     JOIN_RE = re.compile(
-        r"подключ|присоедин|вступ|войти\s+в\s+(?:комнат|меропр|вебинар)|"
-        r"начать\s+(?:просмотр|трансл)|\bjoin\b|\benter\b",
+        r"(?:подключиться|присоединиться|войти|вступить)"
+        r"(?:\s+(?:в|к)\s+(?:комнату|мероприятию|мероприятие|вебинару|вебинар|трансляции))?|"
+        r"начать\s+(?:просмотр|трансляцию)|join(?:\s+(?:now|event|webinar|meeting))?|enter",
         re.IGNORECASE,
     )
     # "Подключить микрофон" also says "подключ"; pressing it would switch on the mic.
@@ -106,6 +109,12 @@ class BrowserService:
         # far too small to decode.
         self.capture_size: tuple[int, int] | None = (1920, 1080)
         self._browser: Browser | None = None
+        # The lecture tab by its DevTools id: never "whatever tab is newest".
+        self._lecture_target: str | None = None
+        # Tabs the service opened to read the СДО; never taken for the lecture.
+        self._helper_targets: set[str] = set()
+        # Chrome's id for the browser run this service launched or adopted.
+        self._browser_id: str | None = None
         self._connect_lock: asyncio.Lock | None = None
         self._connect_lock_loop = None
         # (page, size, CDP session) of the viewport override currently in force.
@@ -141,8 +150,15 @@ class BrowserService:
             except (OSError, IndexError):
                 continue
             port = first_line.strip()
-            if port.isdigit() and self._cdp_available(int(port)):
+            if not port.isdigit():
+                continue
+            # The browser run recorded with the port must be the one answering:
+            # another Chrome or an Electron app reusing the port must never get
+            # our clicks and typing.
+            previous, self._browser_id = self._browser_id, self._recorded_browser_id(name)
+            if self._cdp_available(int(port)):
                 return int(port)
+            self._browser_id = previous
         return None
 
     def _find_browser(self) -> tuple[str, str]:
@@ -193,9 +209,8 @@ class BrowserService:
             sock.bind(("127.0.0.1", 0))
             return int(sock.getsockname()[1])
 
-    @staticmethod
-    def _cdp_available(port: int) -> bool:
-        return endpoint_alive(port)
+    def _cdp_available(self, port: int) -> bool:
+        return endpoint_alive(port, expected_id=self._browser_id)
 
     def ensure_running(self) -> str | None:
         """Start the profile's browser on a blank tab, leaving any lecture alone."""
@@ -203,9 +218,23 @@ class BrowserService:
             return None
         return self.open(self.BLANK_PAGE, muted=True, width=1100, height=760)
 
+    def _recorded_browser_id(self, name: str) -> str | None:
+        try:
+            lines = (self.profile_dir / name).read_text(encoding="utf-8").splitlines()
+        except OSError:
+            return None
+        if len(lines) < 2 or not lines[1].strip():
+            return None
+        return lines[1].strip().rsplit("/", 1)[-1]
+
     def _remember_port(self, port: int) -> None:
         try:
-            (self.profile_dir / self.PORT_FILE).write_text(str(port), encoding="utf-8")
+            self._browser_id = browser_id(debugger_url(port))
+        except (OSError, CdpError, ValueError, KeyError):
+            self._browser_id = None
+        record = f"{port}\n{self._browser_id}" if self._browser_id else str(port)
+        try:
+            (self.profile_dir / self.PORT_FILE).write_text(record, encoding="utf-8")
         except OSError:
             log.debug("cdp_port_not_recorded", exc_info=True)
 
@@ -310,16 +339,17 @@ class BrowserService:
         return None
 
     async def _navigate_async(self, url: str, *, force_navigation: bool = False) -> None:
-        page = await self._active_page()
+        browser = await self._connected_browser()
         room_key = self._room_key(url)
         if room_key is not None:
             matching = [
                 candidate
-                for candidate in (await self._connected_browser()).pages
+                for candidate in browser.pages
                 if not candidate.is_closed() and self._room_key(candidate.url) == room_key
             ]
             if matching:
                 existing = matching[-1]
+                self._lecture_target = existing.target_id
                 if force_navigation:
                     # Reload the actual webinar instead of reopening its /j/
                     # invitation, which makes MTS Link spawn another tab.
@@ -328,6 +358,20 @@ class BrowserService:
                 else:
                     log.info("lecture_tab_reused room=%s", room_key[1])
                 return
+        # The previous lecture's tab, a blank tab of ours, or a new one — never
+        # a helper tab reading the СДО or a tab the student opened.
+        page = self._pick_lecture_page(browser.pages) or next(
+            (
+                candidate
+                for candidate in browser.pages
+                if candidate.url in ("", self.BLANK_PAGE)
+                and candidate.target_id not in self._helper_targets
+            ),
+            None,
+        )
+        if page is None:
+            page = await browser.new_page()
+        self._lecture_target = page.target_id
         await page.goto(url)
 
     def _pick_lecture_page(self, pages: list):
@@ -339,11 +383,16 @@ class BrowserService:
         """
         if not pages:
             return None
+        if self._lecture_target:
+            for page in pages:
+                if getattr(page, "target_id", None) == self._lecture_target:
+                    return page
         if self.lecture_url:
             matching = [page for page in pages if self._matches_lecture_url(page.url)]
             if matching:
+                self._lecture_target = getattr(matching[-1], "target_id", None)
                 return matching[-1]
-        return pages[-1]
+        return None
 
     def _matches_lecture_url(self, url: str) -> bool:
         current = (urlparse(url).hostname or "").lower()
@@ -377,14 +426,21 @@ class BrowserService:
             return "lost"
 
     async def _lecture_state_async(self) -> str:
-        page = await self._active_page()
-        if page.is_closed() or not self._matches_lecture_url(page.url):
+        browser = await self._connected_browser()
+        page = self._pick_lecture_page(browser.pages)
+        if page is None or page.is_closed() or not self._matches_lecture_url(page.url):
             return "lost"
         try:
-            text = await page.evaluate(VISIBLE_TEXT_WITHOUT_CHAT, CHAT_SELECTOR)
+            text = await page.evaluate(VISIBLE_TEXT_WITHOUT_CHAT, CHAT_SELECTOR, timeout=4)
+        except CdpTimeout:
+            return "lost"  # the page does not answer at all
         except CdpError:  # a transient DOM update is not proof that the tab died
             return "live"
         state = self.room_state_from_text(text)
+        if state == "lost":
+            # "Переподключение…" is often over in seconds; the caller acts on it
+            # only when it is still there at the next check.
+            return "unstable"
         if state is not None:
             return state
         index, label = await self._entry_control(page)
@@ -413,18 +469,20 @@ class BrowserService:
 
     @classmethod
     def is_entry_label(cls, label: str) -> bool:
-        label = " ".join(label.split())
+        label = " ".join(label.split()).strip(" .!→>»")
         return (
             bool(label)
             and len(label) <= cls.JOIN_LABEL_MAX
-            and bool(cls.JOIN_RE.search(label))
+            and bool(cls.JOIN_RE.fullmatch(label))
             and not cls.DEVICE_RE.search(label)
         )
 
     async def _entry_control(self, page) -> tuple[int | None, str]:
         """Find the visible control that takes this page from the lobby into the room."""
         for element in await page.elements(ENTRY_CONTROLS):
-            if not element["visible"]:
+            # Controls in the chat, and links leaving the site, are what other
+            # people wrote or linked to — not the platform's own way in.
+            if not element["visible"] or element.get("chat") or element.get("external"):
                 continue
             label = (element["text"] or element["value"]).strip()
             if self.is_entry_label(label):
@@ -447,7 +505,7 @@ class BrowserService:
             return "already"
         if display_name:
             await self._fill_display_name(page, display_name)
-        await page.click(ENTRY_CONTROLS, index=index)
+        await page.click(ENTRY_CONTROLS, index=index, expect_label=label)
         log.info("lecture_join_clicked label=%s", label)
         await page.wait_for_timeout(2_000)
         return "joined"
@@ -511,7 +569,15 @@ class BrowserService:
 
     async def _active_page(self):
         browser = await self._connected_browser()
-        return self._pick_lecture_page(browser.pages) or await browser.new_page()
+        page = self._pick_lecture_page(browser.pages)
+        if page is None:
+            raise RuntimeError("Вкладка лекции не открыта")
+        return page
+
+    async def _helper_page(self, browser):
+        page = await browser.new_page(background=True)
+        self._helper_targets.add(page.target_id)
+        return page
 
     def read_html(self, url: str, *, timeout_ms: int = 20_000) -> str:
         """Read a page in a background tab of the same profile, then close it.
@@ -536,16 +602,17 @@ class BrowserService:
 
     async def _run_on_new_page(self, action):
         browser = await self._connected_browser()
-        page = await browser.new_page()
+        page = await self._helper_page(browser)
         try:
             return await action(page)
         finally:
+            self._helper_targets.discard(page.target_id)
             await page.close()
 
     async def _read_html_async(self, url: str, timeout_ms: int) -> str:
         log.info("page_read_requested host=%s", urlparse(url).hostname or "unknown")
         browser = await self._connected_browser()
-        page = await browser.new_page()
+        page = await self._helper_page(browser)
         try:
             await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
             try:
@@ -562,6 +629,7 @@ class BrowserService:
                     log.debug("page_read_no_table host=%s", urlparse(url).hostname)
             return await self._settled_content(page)
         finally:
+            self._helper_targets.discard(page.target_id)
             await page.close()
 
     async def capture_png(self) -> bytes:
@@ -598,14 +666,22 @@ class BrowserService:
         self._capture_override = (page, self.capture_size)
 
     async def capture_page_state(self) -> tuple[bytes, str]:
-        """Capture pixels plus currently visible page text for chat signal detection."""
+        """Capture pixels plus the chat's visible text for roll-call detection.
+
+        Only the chat panes are read: the participant list shows classmates'
+        display names ("Иванов Иван ИКБО-01-24"), which looked like a roll call.
+        """
         page = await self._active_page()
         await self._apply_capture_size(page)
         # A 1920x1080 frame of a live lecture needs more than the 3.5s that
         # used to be allowed here: on 24.09 that budget lost 370 frames of 526.
         png = await page.screenshot(timeout=CAPTURE_TIMEOUT_MS)
         try:
-            visible_text = await page.inner_text("body", timeout=1_000)
+            visible_text = await page.evaluate(
+                "s => [...document.querySelectorAll(s)].map(e => e.innerText || '').join('\\n')",
+                CHAT_SELECTOR,
+                timeout=1,
+            )
         except Exception:  # noqa: BLE001 - text observation must not break QR capture
             visible_text = ""
         return png, visible_text
@@ -635,6 +711,7 @@ class BrowserService:
             await browser.new_page()
         await page.close()
         self.lecture_url = None
+        self._lecture_target = None
         log.info("lecture_tab_closed")
         return True
 

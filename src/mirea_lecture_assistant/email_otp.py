@@ -13,10 +13,11 @@ from email.header import decode_header
 from email.message import Message
 from email.utils import parsedate_to_datetime
 
+# Whole words only: "промокод AUTUMN2026" and "раскодируйте … 15000" are not codes.
 CONTEXT_CODE = re.compile(
-    r"(?:код(?:а|ом)?(?:\s+(?:подтверждения|авторизации|входа))?|"
-    r"verification\s+code|one[- ]time\s+(?:code|password)|otp)"
-    r"[^0-9]{0,80}([0-9]{4,8})",
+    r"(?<![а-яёa-z])(?:код(?:а|ом)?(?:\s+(?:подтверждения|авторизации|входа))?|"
+    r"verification\s+code|one[- ]time\s+(?:code|password)|otp)(?![а-яёa-z])"
+    r"[^0-9]{0,80}(?<!\d)([0-9]{4,8})(?!\d)",
     re.IGNORECASE,
 )
 SIX_DIGITS = re.compile(r"(?<!\d)(\d{6})(?!\d)")
@@ -262,19 +263,26 @@ def _message_text(message: Message) -> str:
     return "\n".join(chunks)
 
 
-def _otp_candidate(raw_message: bytes, not_before: datetime) -> tuple[str, bool] | None:
-    """Return (code, sent by MIREA) for a fresh code letter, otherwise None."""
+def _otp_candidate(
+    raw_message: bytes, not_before: datetime, *, check_date: bool = True
+) -> tuple[str, bool] | None:
+    """Return (code, sent by MIREA) for a fresh code letter, otherwise None.
+
+    ``check_date`` is off when the letter is known to be new by its UID: a
+    sender whose clock lags a few seconds must not hide the real code.
+    """
     message = email.message_from_bytes(raw_message)
-    try:
-        sent_at = parsedate_to_datetime(message.get("Date", ""))
-    except (TypeError, ValueError, OverflowError):
-        return None
-    if sent_at is None:
-        return None
-    if sent_at.tzinfo is None:
-        sent_at = sent_at.replace(tzinfo=UTC)
-    if sent_at.astimezone(UTC) < not_before.astimezone(UTC) - timedelta(seconds=5):
-        return None
+    if check_date:
+        try:
+            sent_at = parsedate_to_datetime(message.get("Date", ""))
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if sent_at is None:
+            return None
+        if sent_at.tzinfo is None:
+            sent_at = sent_at.replace(tzinfo=UTC)
+        if sent_at.astimezone(UTC) < not_before.astimezone(UTC) - timedelta(seconds=5):
+            return None
 
     subject = _decode_header(message.get("Subject"))
     sender = _decode_header(message.get("From"))
@@ -348,7 +356,16 @@ class ImapOtpReader:
                     raise RuntimeError(
                         f"Не удалось открыть входящие письма {account.provider_name}"
                     )
-                status, data = mailbox.uid("search", None, "ALL")
+                # "UID *" names only the newest letter; ALL returned every UID
+                # and overflowed imaplib's line limit on very large mailboxes.
+                try:
+                    status, data = mailbox.uid("search", None, "UID *")
+                except imaplib.IMAP4.error as exc:
+                    if _is_authentication_error(exc) or isinstance(exc, imaplib.IMAP4.abort):
+                        raise
+                    status, data = "NO", []
+                if status != "OK" or not data or not data[0].split():
+                    status, data = mailbox.uid("search", None, "ALL")
                 if status != "OK" or not data or not data[0].split():
                     return 0
                 return int(data[0].split()[-1])
@@ -389,6 +406,7 @@ class ImapOtpReader:
         after_uid: int | None,
         checked: set[tuple[str, bytes]],
         foreign: dict[str, float],
+        accept_foreign: bool = False,
     ) -> str | None:
         for folder in folders:
             # A UID snapshot only exists for the inbox; UIDs differ per folder.
@@ -405,7 +423,9 @@ class ImapOtpReader:
                     if not (isinstance(row, tuple) and isinstance(row[1], bytes)):
                         continue
                     try:
-                        candidate = _otp_candidate(row[1], not_before)
+                        candidate = _otp_candidate(
+                            row[1], not_before, check_date=folder_after is None
+                        )
                     except Exception:  # one broken letter must not stop the wait
                         log.debug("email_otp_letter_unreadable", exc_info=True)
                         continue
@@ -415,6 +435,8 @@ class ImapOtpReader:
                     if from_mirea:
                         return code
                     foreign.setdefault(code, time.monotonic())
+        if not accept_foreign:
+            return None
         now = time.monotonic()
         for code, first_seen in foreign.items():
             if now - first_seen >= FOREIGN_CODE_GRACE_SECONDS:
@@ -429,6 +451,7 @@ class ImapOtpReader:
         timeout: int = 120,
         *,
         after_uid: int | None = None,
+        accept_foreign: bool = False,
     ) -> str:
         """Wait for the emailed code over one IMAP connection.
 
@@ -453,7 +476,15 @@ class ImapOtpReader:
                     )
                     while time.monotonic() < deadline:
                         poll_number += 1
-                        code = self._poll(mailbox, folders, not_before, after_uid, checked, foreign)
+                        code = self._poll(
+                            mailbox,
+                            folders,
+                            not_before,
+                            after_uid,
+                            checked,
+                            foreign,
+                            accept_foreign,
+                        )
                         if code:
                             log.info(
                                 "email_otp_found provider=%s poll=%s",
