@@ -912,37 +912,139 @@ def test_an_inconclusive_session_check_still_loads_the_schedule(window, monkeypa
 
 
 def test_a_second_launch_brings_the_hidden_window_back(window):
+    from mirea_lecture_assistant import __version__
+
     window.hide()
-    window.show_request.write_text("123", encoding="ascii")
+    window.show_request.write_text(__version__, encoding="ascii")
 
     window._check_show_request()
 
     assert window.isVisible()
     assert not window.show_request.exists()
+    assert window.show_response.read_text(encoding="ascii") == "shown"
 
 
-def test_a_second_launch_learns_whether_the_running_copy_answered(tmp_path):
+def test_a_newer_version_launched_over_this_one_takes_its_place(window, monkeypatch):
+    handed = []
+    monkeypatch.setattr(window, "_hand_over", lambda: handed.append(True))
+    window.show_request.write_text("99.0.0", encoding="ascii")
+
+    window._check_show_request()
+
+    assert handed == [True]
+    assert window.show_response.read_text(encoding="ascii") == "handover"
+
+
+def test_a_second_launch_learns_what_the_running_copy_did(tmp_path):
     import threading
 
     from mirea_lecture_assistant.app import ask_running_copy_to_show
-    from mirea_lecture_assistant.paths import SHOW_REQUEST_FILE
+    from mirea_lecture_assistant.paths import SHOW_REQUEST_FILE, SHOW_RESPONSE_FILE
 
-    # Nobody picks the request up: a hung copy, reported to the user.
-    assert ask_running_copy_to_show(tmp_path, wait_seconds=0.3) is False
+    # Nobody picks the request up: an older version or a hung copy.
+    assert ask_running_copy_to_show(tmp_path, wait_seconds=0.3) is None
     assert not (tmp_path / SHOW_REQUEST_FILE).exists()
 
-    def running_copy():
+    def running_copy(answer):
         request = tmp_path / SHOW_REQUEST_FILE
-        for _ in range(50):
+        for _ in range(100):
             if request.exists():
+                (tmp_path / SHOW_RESPONSE_FILE).write_text(answer, encoding="ascii")
                 request.unlink()
                 return
             threading.Event().wait(0.02)
 
-    responder = threading.Thread(target=running_copy)
-    responder.start()
-    assert ask_running_copy_to_show(tmp_path, wait_seconds=2) is True
-    responder.join()
+    for answer in ("shown", "handover"):
+        responder = threading.Thread(target=running_copy, args=(answer,))
+        responder.start()
+        assert ask_running_copy_to_show(tmp_path, wait_seconds=3) == answer
+        responder.join()
+
+
+class _Lock:
+    def __init__(self, pid, frees_after):
+        self.pid, self.tries, self.frees_after = pid, 0, frees_after
+
+    def getLockInfo(self):
+        return (self.pid, "host", "MireaLectureAssistant.exe")
+
+    def tryLock(self, _timeout):
+        self.tries += 1
+        return self.tries >= self.frees_after
+
+
+def test_an_old_copy_in_the_tray_is_ended_when_the_student_agrees(monkeypatch):
+    import logging
+
+    from mirea_lecture_assistant import app
+
+    killed = []
+    monkeypatch.setattr(app.os, "kill", lambda pid, sig: killed.append(pid))
+    lock = _Lock(pid=4242, frees_after=3)
+
+    assert app.replace_running_copy(lock, logging.getLogger("t"), lambda _text: True) is True
+    assert killed == [4242]
+
+
+def test_an_old_copy_is_left_alone_without_consent(monkeypatch):
+    import logging
+
+    from mirea_lecture_assistant import app
+
+    killed = []
+    monkeypatch.setattr(app.os, "kill", lambda pid, sig: killed.append(pid))
+
+    assert (
+        app.replace_running_copy(_Lock(4242, 1), logging.getLogger("t"), lambda _t: False) is False
+    )
+    assert killed == []
+
+
+def test_quitting_does_not_wait_forever_for_a_worker_blocked_on_the_loop():
+    """Workers waiting in run_async kept the process alive after «Выход»."""
+    import asyncio
+    import threading
+
+    from mirea_lecture_assistant.async_runtime import AsyncRuntime
+
+    runtime = AsyncRuntime()
+    outcome = []
+
+    def worker():
+        try:
+            runtime.run(asyncio.sleep(3600))
+        except BaseException as exc:  # noqa: BLE001 - the outcome is what is checked
+            outcome.append(type(exc).__name__)
+
+    thread = threading.Thread(target=worker)
+    thread.start()
+    threading.Event().wait(0.3)
+    started = time.monotonic()
+
+    runtime.shutdown()
+    thread.join(5)
+
+    assert outcome == ["CancelledError"]
+    assert time.monotonic() - started < 5
+
+
+def test_database_connections_are_reused_by_qt_pool_threads(tmp_path):
+    from PySide6.QtCore import QRunnable, QThreadPool
+
+    db = Database(tmp_path / "pool.sqlite3")
+
+    class Task(QRunnable):
+        def run(self):
+            db.get_setting("theme", "system")
+
+    pool = QThreadPool()
+    pool.setMaxThreadCount(2)
+    for _ in range(40):
+        pool.start(Task())
+    pool.waitForDone(10_000)
+
+    assert len(db._connections) <= 3  # this thread and at most two pool threads
+    db.close()
 
 
 def test_a_verdict_about_a_replaced_session_is_dropped(window, monkeypatch):

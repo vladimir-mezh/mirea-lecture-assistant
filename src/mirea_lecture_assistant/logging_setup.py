@@ -76,7 +76,8 @@ def _record_hard_crashes(log_dir: Path) -> None:
     try:
         _crash_file = open(log_dir / "crash.log", "a", encoding="utf-8")  # noqa: SIM115
         _crash_file.write(
-            f"--- start {datetime.now().astimezone():%Y-%m-%d %H:%M:%S} v{__version__}\n"
+            f"--- start {datetime.now().astimezone():%Y-%m-%d %H:%M:%S} v{__version__} "
+            "(Windows lists handled exceptions here too: a crash is only where app.log stops)\n"
         )
         _crash_file.flush()
         faulthandler.enable(file=_crash_file, all_threads=True)

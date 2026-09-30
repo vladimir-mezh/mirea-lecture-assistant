@@ -48,6 +48,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from . import __version__
 from .async_runtime import run_async
 from .browser_service import CAPTURE_TIMEOUT_MS, BrowserService, NotSignedInError
 from .chat_detection import chat_baseline, classmates_report_attendance_issue
@@ -495,7 +496,7 @@ class MainWindow(QMainWindow):
         self.persisted_session = self._session_fingerprint(session or {})
         self.deduplicator = QrDeduplicator(database)
         self.scanner = ScreenScanner()
-        from .paths import SHOW_REQUEST_FILE, data_dir
+        from .paths import SHOW_REQUEST_FILE, SHOW_RESPONSE_FILE, data_dir
 
         self.browser = BrowserService(data_dir() / "browser-profile")
         self.pending_qr: dict[int, PendingAttendance] = {}
@@ -574,7 +575,8 @@ class MainWindow(QMainWindow):
         self._apply_theme()
         hints = QGuiApplication.styleHints()
         if hasattr(hints, "colorSchemeChanged"):
-            hints.colorSchemeChanged.connect(lambda _scheme: self._apply_theme())
+            # A bound method is disconnected with the window; a lambda outlived it.
+            hints.colorSchemeChanged.connect(self._color_scheme_changed)
         self.refresh_views()
         log.info("main_window_ready")
 
@@ -582,6 +584,7 @@ class MainWindow(QMainWindow):
         self.clock.timeout.connect(self._refresh_relative_times)
         self.clock.start(30_000)
         self.show_request = data_dir() / SHOW_REQUEST_FILE
+        self.show_response = data_dir() / SHOW_RESPONSE_FILE
         self.show_request_timer = QTimer(self)
         self.show_request_timer.timeout.connect(self._check_show_request)
         self.show_request_timer.start(1_000)
@@ -951,6 +954,9 @@ class MainWindow(QMainWindow):
         if scheme is None:
             return False
         return scheme() == Qt.ColorScheme.Dark
+
+    def _color_scheme_changed(self, _scheme):
+        self._apply_theme()
 
     def _apply_theme(self):
         name = "dark" if self._theme_is_dark() else "light"
@@ -3289,15 +3295,31 @@ class MainWindow(QMainWindow):
         self.raise_()
 
     def _check_show_request(self):
-        """A second launch asks for the window of this, the running copy."""
+        """A second launch asks for this, the running copy: its window, or its place."""
+        from .app import version_tuple
+
         try:
             if not self.show_request.exists():
                 return
+            requested = self.show_request.read_text(encoding="ascii").strip()
+            newer = version_tuple(requested) > version_tuple(__version__)
+            self.show_response.write_text("handover" if newer else "shown", encoding="ascii")
             self.show_request.unlink()
-        except OSError:
+        except (OSError, UnicodeDecodeError):
+            return
+        if newer:
+            log.info("handing_over_to_newer_version version=%s", requested)
+            self._hand_over()
             return
         log.info("window_shown_for_second_launch")
         self._restore()
+
+    def _hand_over(self):
+        """A newer version was started: quit and leave it the browser and the lecture."""
+        self._persist_session()
+        self.force_exit = True
+        self.tray.hide()
+        QApplication.quit()
 
     def _quit(self):
         log.info("quit_requested")

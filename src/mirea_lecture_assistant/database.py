@@ -23,24 +23,25 @@ class Database:
     def __init__(self, path: Path):
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        # One connection per thread: opening a new one per query cost a file open,
-        # a PRAGMA and a commit on every scan frame and table refresh.
-        self._local = threading.local()
-        self._connections: list[sqlite3.Connection] = []
+        # One connection per OS thread: opening a new one per query cost a file open,
+        # a PRAGMA and a commit on every scan frame and table refresh. Keyed by the
+        # thread id, not threading.local: Qt pool threads start every task with a
+        # fresh Python thread state, and each task leaked a connection.
+        self._connections: dict[int, sqlite3.Connection] = {}
         self._connections_lock = threading.Lock()
         self.migrate()
 
     def _thread_connection(self) -> sqlite3.Connection:
-        conn = getattr(self._local, "conn", None)
+        ident = threading.get_ident()
+        conn = self._connections.get(ident)
         if conn is None:
             conn = sqlite3.connect(self.path, timeout=10, check_same_thread=False)
             conn.row_factory = sqlite3.Row
             conn.execute("PRAGMA foreign_keys = ON")
             conn.execute("PRAGMA journal_mode = WAL")
             conn.execute("PRAGMA synchronous = NORMAL")
-            self._local.conn = conn
             with self._connections_lock:
-                self._connections.append(conn)
+                self._connections[ident] = conn
         return conn
 
     @contextmanager
@@ -55,13 +56,12 @@ class Database:
 
     def close(self) -> None:
         with self._connections_lock:
-            connections, self._connections = self._connections, []
-        for conn in connections:
+            connections, self._connections = self._connections, {}
+        for conn in connections.values():
             try:
                 conn.close()
             except sqlite3.Error:
                 pass
-        self._local = threading.local()
 
     def migrate(self) -> None:
         with self.connection() as conn:

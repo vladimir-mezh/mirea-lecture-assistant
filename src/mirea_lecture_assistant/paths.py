@@ -7,6 +7,8 @@ from pathlib import Path
 APP_DIR_NAME = "MireaLectureAssistant"
 # A second launch leaves this in the data directory; the running copy shows its window.
 SHOW_REQUEST_FILE = "show-window.request"
+# The running copy's answer: "shown", or "handover" when the new launch is a newer version.
+SHOW_RESPONSE_FILE = "show-window.response"
 
 
 def resource_path(relative_path: str) -> Path:
