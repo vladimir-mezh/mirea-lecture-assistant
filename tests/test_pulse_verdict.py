@@ -296,3 +296,18 @@ def test_a_completed_otp_does_not_make_a_refused_session_successful(pulse):
     assert not result.success
     assert not result.session_pending
     assert service.session == {}
+
+
+def test_logout_ends_the_sso_session_on_the_server(pulse):
+    seen = []
+
+    def sso(request: httpx.Request) -> httpx.Response:
+        seen.append((request.method, request.url.path, request.content.decode()))
+        return httpx.Response(204)
+
+    pulse.handle = sso
+    asyncio.run(MireaService({"refresh_token": "r1", "access_token": "a"}).logout())
+
+    assert seen and seen[0][0] == "POST"
+    assert seen[0][1].endswith("/protocol/openid-connect/logout")
+    assert "refresh_token=r1" in seen[0][2]

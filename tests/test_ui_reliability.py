@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import time
 from datetime import datetime, timedelta
+from pathlib import Path
 from types import SimpleNamespace
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -1510,3 +1511,93 @@ def test_asking_for_updates_on_the_latest_version_says_so(window, monkeypatch):
 
     assert window.update_button.isHidden()
     assert shown and __version__ in shown[0]
+
+
+def _failing_schedule(window, monkeypatch, *, credentials=("user", "pw")):
+    from mirea_lecture_assistant import ui
+
+    clock = [1000.0]
+    monkeypatch.setattr(ui.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(window.session_store, "load_credentials", lambda: credentials)
+    monkeypatch.setattr(window.session_store, "clear", lambda: None)
+    calls = []
+    monkeypatch.setattr(window, "_recover_expired_session", lambda reason: calls.append("check"))
+    monkeypatch.setattr(window, "_auto_login", lambda: calls.append("login"))
+
+    async def logout():
+        calls.append("logout")
+
+    monkeypatch.setattr(window.mirea, "logout", logout)
+    monkeypatch.setattr(
+        window, "_run", lambda function, done, _busy, failed=None, **_kw: done(function())
+    )
+    monkeypatch.setattr(window, "_evaluate_current_lessons", lambda _lessons: None)
+    window.mirea.session = {"access_token": "a", "refresh_token": "r"}
+    return clock, calls
+
+
+LOOP = "МИРЭА не отвечает. Попробуйте позже. Причина: вход в Пульс зациклился на переадресациях."
+
+
+def test_after_twenty_failing_minutes_the_app_signs_out_and_in_again(window, monkeypatch):
+    clock, calls = _failing_schedule(window, monkeypatch)
+
+    window._schedule_refresh_failed(LOOP)
+    clock[0] += 19 * 60
+    window._schedule_refresh_failed(LOOP)
+    assert "logout" not in calls  # other remedies get their twenty minutes first
+
+    clock[0] += 2 * 60
+    window._schedule_refresh_failed(LOOP)
+    assert calls[-2:] == ["logout", "login"]
+    assert window.mirea.session == {}
+
+    calls.clear()
+    clock[0] += 60 * 60
+    window.mirea.session = {"access_token": "b"}
+    window._schedule_refresh_failed(LOOP)
+    clock[0] += 21 * 60
+    window._schedule_refresh_failed(LOOP)
+    assert "logout" not in calls  # not more often than every two hours
+
+
+def test_no_internet_never_leads_to_signing_out(window, monkeypatch):
+    clock, calls = _failing_schedule(window, monkeypatch)
+    offline = "МИРЭА не отвечает. Попробуйте позже. Причина: сервер МИРЭА не ответил вовремя."
+
+    for _ in range(40):
+        window._schedule_refresh_failed(offline)
+        clock[0] += 60
+
+    assert "logout" not in calls
+
+
+def test_a_session_that_cannot_be_replaced_is_never_signed_out(window, monkeypatch):
+    clock, calls = _failing_schedule(window, monkeypatch, credentials=None)
+
+    window._schedule_refresh_failed(LOOP)
+    clock[0] += 25 * 60
+    window._schedule_refresh_failed(LOOP)
+
+    assert "logout" not in calls
+    assert window.mirea.session
+
+
+def test_start_with_windows_is_on_by_default_and_follows_the_program(window, monkeypatch):
+    from mirea_lecture_assistant import autostart, updater
+
+    calls = []
+    monkeypatch.delenv("MIREA_ASSISTANT_SMOKE_TEST", raising=False)
+    monkeypatch.setattr(autostart, "available", lambda: True)
+    monkeypatch.setattr(autostart, "registered", lambda: None)
+    monkeypatch.setattr(
+        autostart, "set_enabled", lambda enabled, exe: calls.append((enabled, exe.name))
+    )
+    monkeypatch.setattr(updater, "current_executable", lambda: Path("C:/x/App.exe"))
+
+    window._sync_autostart()
+    assert calls == [(True, "App.exe")]
+
+    window._autostart_toggled(False)
+    assert calls[-1] == (False, "App.exe")
+    assert window.db.get_setting("autostart") is False

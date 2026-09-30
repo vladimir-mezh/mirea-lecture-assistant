@@ -8,11 +8,12 @@ import sys
 import time
 from pathlib import Path
 
-from . import __version__
+from . import __version__, autostart
 from .async_runtime import shutdown_async_runtime
 from .database import Database
 from .logging_setup import configure_logging
 from .paths import SHOW_REQUEST_FILE, SHOW_RESPONSE_FILE, data_dir, resource_path
+from .supervisor import STARTUP_FAILED
 from .updater import version_tuple  # noqa: F401 - the second-launch check imports it from here
 
 
@@ -233,6 +234,8 @@ def main() -> int:
         log.info("second_instance_blocked")
         if os.environ.get("MIREA_ASSISTANT_SMOKE_TEST") == "1":
             return 0
+        if autostart.launched_at_sign_in(sys.argv):
+            return 0  # started with Windows while already running: nothing to do
         answer = ask_running_copy_to_show(root)
         if answer == "shown":
             log.info("second_instance_showed_running_copy")
@@ -270,8 +273,12 @@ def main() -> int:
             "MIREA Lecture Assistant",
             f"Приложение не смогло запуститься: {exc}\n\nПодробности — в журнале:\n{log_path}",
         )
-        return 1
-    window.show()
+        return STARTUP_FAILED  # the watchdog does not start it again
+    if autostart.launched_at_sign_in(sys.argv):
+        # Started with Windows: straight to the tray, no window over the desktop.
+        log.info("started_at_sign_in")
+    else:
+        window.show()
     smoke_test = os.environ.get("MIREA_ASSISTANT_SMOKE_TEST") == "1"
     if smoke_test:
         window.force_exit = True
