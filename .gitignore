@@ -1,0 +1,22 @@
+# Окружение и кэши
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Артефакты сборки PyInstaller
+build/
+build-candidate/
+build-stage/
+smoke-stage/
+dist/
+dist-update/
+
+# Локальные данные и секреты: в репозиторий не попадают никогда
+*.sqlite3
+*.log
+session.bin
