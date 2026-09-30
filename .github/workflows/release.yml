@@ -62,6 +62,9 @@ jobs:
           $version = .venv\Scripts\python -c "import mirea_lecture_assistant as m; print(m.__version__)"
           "tag=v$version" >> $env:GITHUB_OUTPUT
           Compress-Archive -Path dist\MireaLectureAssistant.exe -DestinationPath "dist\MireaLectureAssistant-v$version-windows.zip"
+          # The in-app updater installs only a file matching this checksum.
+          $hash = (Get-FileHash dist\MireaLectureAssistant.exe -Algorithm SHA256).Hash.ToLower()
+          "$hash  MireaLectureAssistant.exe" | Out-File -Encoding ascii dist\MireaLectureAssistant.exe.sha256
       - uses: actions/upload-artifact@v4
         with:
           name: MireaLectureAssistant-windows
@@ -76,4 +79,5 @@ jobs:
           body_path: CHANGELOG.md
           files: |
             dist/MireaLectureAssistant.exe
+            dist/MireaLectureAssistant.exe.sha256
             dist/MireaLectureAssistant-*-windows.zip

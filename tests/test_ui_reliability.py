@@ -1487,3 +1487,26 @@ def test_the_student_is_told_when_the_database_was_repaired(tmp_path, monkeypatc
     finally:
         window.force_exit = True
         window.close()
+
+
+def test_a_newer_release_shows_the_update_button(window):
+    from mirea_lecture_assistant import updater
+
+    release = updater.Release("99.0.0", "- Новое", "https://example/x.exe", 1, None)
+    window._update_checked(release, manual=False)
+
+    assert not window.update_button.isHidden()
+    assert "99.0.0" in window.update_button.text()
+
+
+def test_asking_for_updates_on_the_latest_version_says_so(window, monkeypatch):
+    from mirea_lecture_assistant import __version__, ui, updater
+
+    shown = []
+    monkeypatch.setattr(ui.QMessageBox, "information", lambda *args: shown.append(args[2]))
+    release = updater.Release(__version__, "", "https://example/x.exe", 1, None)
+
+    window._update_checked(release, manual=True)
+
+    assert window.update_button.isHidden()
+    assert shown and __version__ in shown[0]
