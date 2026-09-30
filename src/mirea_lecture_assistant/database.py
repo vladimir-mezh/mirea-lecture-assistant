@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 import time
 from contextlib import contextmanager
 from datetime import datetime
@@ -10,25 +11,54 @@ from pathlib import Path
 from .domain import Lesson, QrEvent, RuleMode
 
 # How many refreshes in a row may omit a lesson before it is treated as cancelled.
-MISSING_TOLERANCE = 3
+# Refreshes run once a minute, so this is also roughly the tolerated outage in
+# minutes: three used to drop the running pair after a three-minute Pulse hiccup.
+MISSING_TOLERANCE = 15
 
 
 class Database:
     def __init__(self, path: Path):
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        # One connection per thread: opening a new one per query cost a file open,
+        # a PRAGMA and a commit on every scan frame and table refresh.
+        self._local = threading.local()
+        self._connections: list[sqlite3.Connection] = []
+        self._connections_lock = threading.Lock()
         self.migrate()
+
+    def _thread_connection(self) -> sqlite3.Connection:
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            conn = sqlite3.connect(self.path, timeout=10, check_same_thread=False)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA foreign_keys = ON")
+            conn.execute("PRAGMA journal_mode = WAL")
+            conn.execute("PRAGMA synchronous = NORMAL")
+            self._local.conn = conn
+            with self._connections_lock:
+                self._connections.append(conn)
+        return conn
 
     @contextmanager
     def connection(self):
-        conn = sqlite3.connect(self.path)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA foreign_keys = ON")
+        conn = self._thread_connection()
         try:
             yield conn
             conn.commit()
-        finally:
-            conn.close()
+        except BaseException:
+            conn.rollback()
+            raise
+
+    def close(self) -> None:
+        with self._connections_lock:
+            connections, self._connections = self._connections, []
+        for conn in connections:
+            try:
+                conn.close()
+            except sqlite3.Error:
+                pass
+        self._local = threading.local()
 
     def migrate(self) -> None:
         with self.connection() as conn:
@@ -158,6 +188,7 @@ class Database:
         keep_from: datetime,
         *,
         missing_tolerance: int = MISSING_TOLERANCE,
+        now: datetime | None = None,
     ) -> tuple[int, int]:
         """Merge a refresh into the cache instead of overwriting it.
 
@@ -165,8 +196,9 @@ class Database:
         an empty list, indistinguishable from a free day. Overwriting the cache
         with such a result makes real lessons disappear from the table. A lesson
         is therefore dropped only after it is absent from several refreshes in a
-        row. Returns (still missing, dropped).
+        row, and never while it is running. Returns (still missing, dropped).
         """
+        now = now or datetime.now().astimezone()
         rows = [
             (
                 x.external_id,
@@ -210,11 +242,29 @@ class Database:
             missing = conn.execute(
                 "SELECT COUNT(*) FROM lessons WHERE missing_count > 0"
             ).fetchone()[0]
-            dropped = conn.execute(
-                "DELETE FROM lessons WHERE missing_count >= ? OR end_at < ?",
-                (missing_tolerance, keep_from.isoformat()),
-            ).rowcount
-        return missing, dropped
+            stale = [
+                row["external_id"]
+                for row in conn.execute(
+                    "SELECT external_id, start_at, end_at, missing_count FROM lessons"
+                ).fetchall()
+                # Offsets may differ between rows, so compare datetimes, not strings.
+                if datetime.fromisoformat(row["end_at"]) < keep_from
+                or (
+                    row["missing_count"] >= missing_tolerance
+                    and not (
+                        datetime.fromisoformat(row["start_at"])
+                        <= now
+                        <= datetime.fromisoformat(row["end_at"])
+                    )
+                )
+            ]
+            conn.executemany(
+                "DELETE FROM lessons WHERE external_id = ?", [(item,) for item in stale]
+            )
+        return missing, len(stale)
+
+    def get_lesson(self, external_id: str) -> Lesson | None:
+        return next((x for x in self.list_lessons() if x.external_id == external_id), None)
 
     def list_lessons(self) -> list[Lesson]:
         with self.connection() as conn:
@@ -242,6 +292,21 @@ class Database:
                 "ON CONFLICT(subject_name) DO UPDATE SET mode = excluded.mode",
                 (subject_name, mode.value),
             )
+
+    def all_rules(self) -> dict[str, RuleMode]:
+        with self.connection() as conn:
+            rows = conn.execute("SELECT subject_name, mode FROM subject_rules").fetchall()
+        return {row["subject_name"]: RuleMode(row["mode"]) for row in rows}
+
+    def all_links(self) -> dict[str, str]:
+        with self.connection() as conn:
+            rows = conn.execute("SELECT subject_name, url FROM lecture_links").fetchall()
+        return {row["subject_name"]: row["url"] for row in rows}
+
+    def all_resolved_links(self) -> dict[str, str]:
+        with self.connection() as conn:
+            rows = conn.execute("SELECT lesson_id, url FROM resolved_links").fetchall()
+        return {row["lesson_id"]: row["url"] for row in rows}
 
     def get_rule(self, subject_name: str) -> RuleMode:
         with self.connection() as conn:

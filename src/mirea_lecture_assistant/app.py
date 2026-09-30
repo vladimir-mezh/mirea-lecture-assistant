@@ -71,6 +71,8 @@ def main() -> int:
         logging.getLogger("qt").log(levels.get(message_type, logging.INFO), "%s", message)
 
     qInstallMessageHandler(qt_message_handler)
+    # The "А" here is Cyrillic. QLockFile records the application name and checks a
+    # crashed owner's lock against it, so it stays as released to keep that working.
     app.setApplicationName("MIREА Lecture Assistant")
     app.setOrganizationName("MIREA Lecture Assistant")
     app.setStyle("Fusion")

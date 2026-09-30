@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import re
@@ -20,6 +21,27 @@ log = logging.getLogger(__name__)
 
 # Capturing a full-resolution frame of a live stream is slower than a static page.
 CAPTURE_TIMEOUT_MS = 10_000
+# Room-state phrases are read from the page; a status banner is a short line.
+# Anything longer is a sentence someone typed.
+STATUS_LINE_MAX = 80
+# Chat and comment panes: whatever students type there is not the room's state.
+# Status banners are often aria-live regions themselves, so those are kept.
+CHAT_SELECTOR = "[class*='chat' i], [class*='comment' i], [role='log']"
+VISIBLE_TEXT_WITHOUT_CHAT = """
+selector => {
+  const chat = new Set();
+  for (const element of document.querySelectorAll(selector)) {
+    for (const line of (element.innerText || '').split('\\n')) {
+      const text = line.trim();
+      if (text) chat.add(text);
+    }
+  }
+  return (document.body ? document.body.innerText || '' : '')
+    .split('\\n')
+    .filter(line => !chat.has(line.trim()))
+    .join('\\n');
+}
+"""
 
 
 class NotSignedInError(RuntimeError):
@@ -45,8 +67,15 @@ class BrowserService:
         r"начать\s+(?:просмотр|трансл)|\bjoin\b|\benter\b",
         re.IGNORECASE,
     )
+    # "Подключить микрофон" also says "подключ"; pressing it would switch on the mic.
+    DEVICE_RE = re.compile(
+        r"микрофон|камер|звук|динамик|гарнитур|наушник|экран|устройств|"
+        r"microphone|camera|audio|speaker|screen|device",
+        re.IGNORECASE,
+    )
+    JOIN_LABEL_MAX = 40
     ENDED_RE = re.compile(
-        r"(?:встреча|мероприятие|трансляция|вебинар)\s+(?:завершен[ао]?|окончено)|"
+        r"(?:встреча|мероприятие|трансляция|вебинар)\s+(?:заверш[её]н[ао]?|окончен[ао]?)|"
         r"спасибо\s+за\s+участие|(?:meeting|event|webinar)\s+(?:has\s+)?ended",
         re.IGNORECASE,
     )
@@ -64,6 +93,10 @@ class BrowserService:
         self.capture_size: tuple[int, int] | None = (1920, 1080)
         self._playwright = None
         self._browser = None
+        self._connect_lock: asyncio.Lock | None = None
+        self._connect_lock_loop = None
+        # (page, size, CDP session) of the viewport override currently in force.
+        self._capture_override = None
 
     @property
     def is_running(self) -> bool:
@@ -75,6 +108,11 @@ class BrowserService:
             self.port = discovered
             return True
         return False
+
+    @property
+    def probably_running(self) -> bool:
+        """A cheap guess for the GUI thread; ``is_running`` probes over HTTP."""
+        return self.port is not None or self._browser is not None
 
     def _discover_port(self) -> int | None:
         """Adopt a browser this profile already runs, started by an earlier session.
@@ -335,18 +373,45 @@ class BrowserService:
         if page.is_closed() or not self._matches_lecture_url(page.url):
             return "lost"
         try:
-            text = await page.locator("body").inner_text(timeout=1_000)
+            text = await page.evaluate(VISIBLE_TEXT_WITHOUT_CHAT, CHAT_SELECTOR)
         except PlaywrightError:  # a transient DOM update is not proof that the tab died
             return "live"
-        if self.ENDED_RE.search(text):
-            return "ended"
-        if self.DISCONNECTED_RE.search(text):
-            return "lost"
+        state = self.room_state_from_text(text)
+        if state is not None:
+            return state
         control, label = await self._entry_control(page)
         if control is not None:
             log.info("lecture_entry_pending label=%s", label)
             return "waiting"
         return "live"
+
+    @classmethod
+    def room_state_from_text(cls, text: str) -> str | None:
+        """``ended`` or ``lost`` when a status banner says so, otherwise None.
+
+        Only short standalone lines count, and never questions: a student typing
+        "вебинар завершён?" or "переподключитесь" in the chat must not close the
+        lecture or restart the browser.
+        """
+        for raw_line in text.splitlines():
+            line = " ".join(raw_line.split())
+            if not line or len(line) > STATUS_LINE_MAX or "?" in line:
+                continue
+            if cls.ENDED_RE.search(line):
+                return "ended"
+            if cls.DISCONNECTED_RE.search(line):
+                return "lost"
+        return None
+
+    @classmethod
+    def is_entry_label(cls, label: str) -> bool:
+        label = " ".join(label.split())
+        return (
+            bool(label)
+            and len(label) <= cls.JOIN_LABEL_MAX
+            and bool(cls.JOIN_RE.search(label))
+            and not cls.DEVICE_RE.search(label)
+        )
 
     async def _entry_control(self, page):
         """Find the visible control that takes this page from the lobby into the room."""
@@ -361,7 +426,7 @@ class BrowserService:
                 log.debug("entry_control_unreadable", exc_info=True)
                 continue
             label = label.strip()
-            if label and self.JOIN_RE.search(label):
+            if self.is_entry_label(label):
                 return handle, label[:60]
         return None, ""
 
@@ -410,25 +475,40 @@ class BrowserService:
         """
         if self._browser is not None and self._browser.is_connected():
             return self._browser
-        await self._release_connection()
-        if not self.is_running:
-            raise RuntimeError("Браузер приложения не запущен")
-        from playwright.async_api import async_playwright
-
-        self._playwright = await async_playwright().start()
-        try:
-            self._browser = await self._playwright.chromium.connect_over_cdp(
-                f"http://127.0.0.1:{self.port}", timeout=3_500
-            )
-        except Exception:
+        # Scan, health check and join may all find the connection broken at once;
+        # without the lock each started its own driver and all but one leaked.
+        async with self._lock():
+            if self._browser is not None and self._browser.is_connected():
+                return self._browser
             await self._release_connection()
-            raise
-        log.info("cdp_connected port=%s", self.port)
-        return self._browser
+            # The liveness probe is blocking HTTP; keep it off the shared loop.
+            if not await asyncio.to_thread(lambda: self.is_running):
+                raise RuntimeError("Браузер приложения не запущен")
+            from playwright.async_api import async_playwright
+
+            self._playwright = await async_playwright().start()
+            try:
+                self._browser = await self._playwright.chromium.connect_over_cdp(
+                    f"http://127.0.0.1:{self.port}", timeout=3_500
+                )
+            except Exception:
+                await self._release_connection()
+                raise
+            log.info("cdp_connected port=%s", self.port)
+            return self._browser
+
+    def _lock(self) -> asyncio.Lock:
+        """A lock bound to the running loop (tests run each call on a new loop)."""
+        loop = asyncio.get_running_loop()
+        if self._connect_lock is None or self._connect_lock_loop is not loop:
+            self._connect_lock = asyncio.Lock()
+            self._connect_lock_loop = loop
+        return self._connect_lock
 
     async def _release_connection(self) -> None:
         """Drop the cached connection without closing the browser it controls."""
         playwright, self._playwright, self._browser = self._playwright, None, None
+        self._capture_override = None
         if playwright is None:
             return
         try:
@@ -441,8 +521,6 @@ class BrowserService:
         run_async(self._release_connection())
 
     async def _active_page(self):
-        if not self.is_running:
-            raise RuntimeError("Окно лекции ещё не открыто")
         context = (await self._connected_browser()).contexts[0]
         return self._pick_lecture_page(context.pages) or await context.new_page()
 
@@ -468,8 +546,6 @@ class BrowserService:
         return run_async(self._run_on_new_page(action), timeout)
 
     async def _run_on_new_page(self, action):
-        if not self.is_running:
-            raise RuntimeError("Браузер приложения не запущен")
         browser = await self._connected_browser()
         page = await browser.contexts[0].new_page()
         try:
@@ -478,8 +554,6 @@ class BrowserService:
             await page.close()
 
     async def _read_html_async(self, url: str, timeout_ms: int) -> str:
-        if not self.is_running:
-            raise RuntimeError("Браузер приложения не запущен")
         from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
         log.info("page_read_requested host=%s", urlparse(url).hostname or "unknown")
@@ -513,7 +587,21 @@ class BrowserService:
 
         The emulated viewport also makes the platform request a higher quality
         stream, so the picture gains real detail instead of being upscaled.
+        The override is set once per tab and its CDP session is kept: sending it
+        with every frame re-laid out the page each time, and a detached session
+        may take its override with it.
         """
+        current = self._capture_override
+        if current is not None:
+            applied_page, applied_size, session = current
+            if applied_page is page and applied_size == self.capture_size and not page.is_closed():
+                return
+            self._capture_override = None
+            try:
+                await session.send("Emulation.clearDeviceMetricsOverride", {})
+                await session.detach()
+            except Exception:  # the old tab may be gone together with its session
+                log.debug("capture_override_release_failed", exc_info=True)
         if not self.capture_size:
             return
         width, height = self.capture_size
@@ -523,8 +611,10 @@ class BrowserService:
                 "Emulation.setDeviceMetricsOverride",
                 {"width": width, "height": height, "deviceScaleFactor": 1, "mobile": False},
             )
-        finally:
+        except Exception:
             await session.detach()
+            raise
+        self._capture_override = (page, self.capture_size, session)
 
     async def capture_page_state(self) -> tuple[bytes, str]:
         """Capture pixels plus currently visible page text for chat signal detection."""
@@ -549,9 +639,8 @@ class BrowserService:
         return run_async(self._close_lecture_tab_async())
 
     async def _close_lecture_tab_async(self) -> bool:
-        if not self.is_running:
+        if not await asyncio.to_thread(lambda: self.is_running):
             return False
-
         browser = await self._connected_browser()
         return await self._close_lecture_page(browser.contexts[0])
 
@@ -581,31 +670,25 @@ class BrowserService:
         if host != "mts-link.ru" and not host.endswith(".mts-link.ru"):
             raise RuntimeError("Автоматическая отправка чата поддерживается только для MTS Link")
 
-        chat_buttons = page.get_by_role("button", name=re.compile(r"чат", re.IGNORECASE))
-        for index in range(await chat_buttons.count()):
-            button = chat_buttons.nth(index)
-            if await button.is_visible():
-                await button.click()
-                break
-
-        editor = page.get_by_placeholder(re.compile(r"введите сообщение", re.IGNORECASE))
-        visible_editor = None
-        for index in range(await editor.count()):
-            candidate = editor.nth(index)
-            if await candidate.is_visible():
-                visible_editor = candidate
-                break
+        visible_editor = await self._visible_chat_editor(page)
         if visible_editor is None:
-            fallback = page.locator(
-                'textarea[placeholder*="Введите сообщение"], '
-                'input[placeholder*="Введите сообщение"], '
-                '[contenteditable="true"][data-placeholder*="Введите сообщение"]'
+            # The «Чат» button toggles the pane: pressing it while the chat is
+            # already open used to close it and the message could not be typed.
+            chat_buttons = page.get_by_role(
+                "button", name=re.compile(r"^\s*чат\s*$|открыть\s+чат", re.IGNORECASE)
             )
-            for index in range(await fallback.count()):
-                candidate = fallback.nth(index)
-                if await candidate.is_visible():
-                    visible_editor = candidate
+            if not await chat_buttons.count():
+                chat_buttons = page.get_by_role("button", name=re.compile(r"чат", re.IGNORECASE))
+            for index in range(await chat_buttons.count()):
+                button = chat_buttons.nth(index)
+                if await button.is_visible():
+                    await button.click()
                     break
+            for _ in range(6):
+                visible_editor = await self._visible_chat_editor(page)
+                if visible_editor is not None:
+                    break
+                await page.wait_for_timeout(250)
         if visible_editor is None:
             raise RuntimeError("MTS Link не показал поле «Введите сообщение»")
         delivered = page.get_by_text(message, exact=True)
@@ -621,11 +704,29 @@ class BrowserService:
             "Не удалось подтвердить доставку сообщения; повтор отключён во избежание дубля"
         )
 
+    @staticmethod
+    async def _visible_chat_editor(page):
+        editor = page.get_by_placeholder(re.compile(r"введите сообщение", re.IGNORECASE))
+        for index in range(await editor.count()):
+            candidate = editor.nth(index)
+            if await candidate.is_visible():
+                return candidate
+        fallback = page.locator(
+            'textarea[placeholder*="Введите сообщение"], '
+            'input[placeholder*="Введите сообщение"], '
+            '[contenteditable="true"][data-placeholder*="Введите сообщение"]'
+        )
+        for index in range(await fallback.count()):
+            candidate = fallback.nth(index)
+            if await candidate.is_visible():
+                return candidate
+        return None
+
     def close(self) -> None:
         """Close only the dedicated browser instance started by this service."""
         if not self.is_running:
             return
-        run_async(self._close_async())
+        run_async(self._close_async(), timeout=8)
         log.info("browser_closed")
         (self.profile_dir / self.PORT_FILE).unlink(missing_ok=True)
         self.port = None
