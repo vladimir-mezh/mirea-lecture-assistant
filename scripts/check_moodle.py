@@ -2,7 +2,7 @@ r"""Check how the app can read «Вебинары по дисциплине» an
 
 Run it with the URL of a webinars module or of a section listing several:
 
-    .venv\Scripts\python.exe scripts/check_moodle.py <url> [--http]
+    .venv\Scripts\python.exe scripts/check_moodle.py <url> [--http] [--save-page]
 
 By default the page is read through the app's own browser profile — the same way
 the app will read it — so a Chrome window opens and stays signed in to the СДО.
@@ -102,9 +102,12 @@ def main() -> int:
             print("Окно намеренно оставлено открытым; вход сохранится в профиле.")
         return 1
 
-    saved = data_dir() / "logs" / "moodle_page.html"
-    saved.write_text(html, encoding="utf-8")
-    print(f"страница сохранена: {saved}")
+    if "--save-page" in sys.argv:
+        # A course page contains the student's personal data, so it is written
+        # only when explicitly asked for, and next to the log, not into it.
+        saved = data_dir() / "logs" / "moodle_page.html"
+        saved.write_text(html, encoding="utf-8")
+        print(f"страница сохранена (удалите после разбора): {saved}")
 
     webinars = parse_webinars(html, final_url)
     modules = find_webinar_modules(html, final_url)
