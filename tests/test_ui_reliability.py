@@ -217,7 +217,9 @@ def test_new_rotating_qr_replaces_an_old_pending_code(window):
 def test_rejections_are_counted_across_rotating_codes(window, monkeypatch):
     window.active_lecture_id = "lesson"
     sent = []
-    monkeypatch.setattr(window, "_send_chat_fallback", lambda reason, lesson: sent.append((reason, lesson)))
+    monkeypatch.setattr(
+        window, "_send_chat_fallback", lambda reason, lesson: sent.append((reason, lesson))
+    )
 
     for number in range(5):
         event_id = window.db.add_qr_event(f"fingerprint-{number}", "detected", lesson_id="lesson")

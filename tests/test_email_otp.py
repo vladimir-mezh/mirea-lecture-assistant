@@ -246,8 +246,6 @@ def test_connection_check_uses_explicit_yandex_login(monkeypatch):
 
     monkeypatch.setattr(email_otp.imaplib, "IMAP4_SSL", Mailbox)
 
-    account = EmailAccount(
-        "alias@yandex.ru", "app-password", imap_username="main-login"
-    )
+    account = EmailAccount("alias@yandex.ru", "app-password", imap_username="main-login")
     assert ImapOtpReader().latest_uid(account) == 7
     assert usernames == ["main-login"]
