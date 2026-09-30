@@ -90,6 +90,11 @@ def main() -> int:
         window.force_exit = True
         QTimer.singleShot(500, app.quit)
     exit_code = app.exec()
+    try:
+        # Leaves Chrome and its СДО session alone; only frees the driver process.
+        window.browser.disconnect()
+    except Exception:
+        log.warning("browser_disconnect_failed", exc_info=True)
     shutdown_async_runtime()
     log.info("application_exit code=%s", exit_code)
     return exit_code

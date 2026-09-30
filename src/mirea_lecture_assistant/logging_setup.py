@@ -4,8 +4,11 @@ import logging
 import platform
 import re
 import sys
+from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
+
+from . import __version__
 
 EMAIL = re.compile(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}")
 UUID = re.compile(
@@ -35,6 +38,20 @@ class RedactingFormatter(logging.Formatter):
         return redact(super().format(record))
 
 
+def _build_stamp() -> str:
+    """When this exact binary was produced.
+
+    Without it the journal cannot tell which build produced an entry, and a stale
+    executable looks exactly like a bug in the current source.
+    """
+    target = Path(sys.executable if getattr(sys, "frozen", False) else __file__)
+    try:
+        stamp = datetime.fromtimestamp(target.stat().st_mtime).astimezone()
+        return stamp.strftime("%d.%m.%Y %H:%M")
+    except OSError:
+        return "unknown"
+
+
 def configure_logging(log_dir: Path) -> Path:
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / "app.log"
@@ -62,7 +79,9 @@ def configure_logging(log_dir: Path) -> Path:
 
     sys.excepthook = exception_hook
     logging.getLogger("app").info(
-        "application_start platform=%s python=%s frozen=%s",
+        "application_start version=%s built=%s platform=%s python=%s frozen=%s",
+        __version__,
+        _build_stamp(),
         platform.platform(),
         platform.python_version(),
         bool(getattr(sys, "frozen", False)),

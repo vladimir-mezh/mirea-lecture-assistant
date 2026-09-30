@@ -86,7 +86,7 @@ def test_reopening_the_same_mts_room_reuses_the_existing_tab(service, monkeypatc
     page = Page()
 
     async def active_page():
-        return page, Playwright()
+        return page
 
     monkeypatch.setattr(service, "_active_page", active_page)
 
@@ -351,3 +351,69 @@ def test_nothing_to_close_is_reported(service):
 
     service.lecture_url = LECTURE
     assert asyncio.run(service._close_lecture_page(FakeContext([]))) is False
+
+
+class FakeConnection:
+    def __init__(self, connected: bool = True):
+        self.connected = connected
+        self.stopped = False
+
+    def is_connected(self):
+        return self.connected
+
+
+class FakeDriver:
+    def __init__(self, connection):
+        self.connection = connection
+        self.stopped = False
+
+    async def stop(self):
+        self.stopped = True
+
+
+def test_the_connection_is_reused_between_calls(service):
+    """Restarting the driver per frame cost ~270 ms and timed captures out."""
+    import asyncio
+
+    connection = FakeConnection()
+    service._browser = connection
+    service._playwright = FakeDriver(connection)
+
+    assert asyncio.run(service._connected_browser()) is connection
+    assert not service._playwright.stopped
+
+
+def test_a_broken_connection_is_dropped_before_reconnecting(service, monkeypatch):
+    import asyncio
+
+    driver = FakeDriver(None)
+    service._browser = FakeConnection(connected=False)
+    service._playwright = driver
+    monkeypatch.setattr(type(service), "is_running", property(lambda _self: False))
+
+    with pytest.raises(RuntimeError, match="не запущен"):
+        asyncio.run(service._connected_browser())
+
+    assert driver.stopped
+    assert service._browser is None and service._playwright is None
+
+
+def test_releasing_the_connection_leaves_the_browser_running(service):
+    """Shutdown must free the driver without closing the lecture or the СДО session."""
+    import asyncio
+
+    driver = FakeDriver(None)
+    service._playwright = driver
+    service._browser = FakeConnection()
+
+    asyncio.run(service._release_connection())
+
+    assert driver.stopped
+    assert service._browser is None and service._playwright is None
+
+
+def test_releasing_twice_is_harmless(service):
+    import asyncio
+
+    asyncio.run(service._release_connection())
+    asyncio.run(service._release_connection())

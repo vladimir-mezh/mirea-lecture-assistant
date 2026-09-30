@@ -54,6 +54,8 @@ class BrowserService:
         # 520x360 window screenshots at ~504x265, where a QR in the stream is
         # far too small to decode.
         self.capture_size: tuple[int, int] | None = (1920, 1080)
+        self._playwright = None
+        self._browser = None
 
     @property
     def is_running(self) -> bool:
@@ -247,28 +249,25 @@ class BrowserService:
         return None
 
     async def _navigate_async(self, url: str, *, force_navigation: bool = False) -> None:
-        page, playwright = await self._active_page()
-        try:
-            room_key = self._room_key(url)
-            if room_key is not None:
-                matching = [
-                    candidate
-                    for candidate in page.context.pages
-                    if not candidate.is_closed() and self._room_key(candidate.url) == room_key
-                ]
-                if matching:
-                    existing = matching[-1]
-                    if force_navigation:
-                        # Reload the actual webinar instead of reopening its /j/
-                        # invitation, which makes MTS Link spawn another tab.
-                        await existing.reload(wait_until="domcontentloaded", timeout=15_000)
-                        log.info("lecture_tab_reloaded room=%s", room_key[1])
-                    else:
-                        log.info("lecture_tab_reused room=%s", room_key[1])
-                    return
-            await page.goto(url)
-        finally:
-            await playwright.stop()
+        page = await self._active_page()
+        room_key = self._room_key(url)
+        if room_key is not None:
+            matching = [
+                candidate
+                for candidate in page.context.pages
+                if not candidate.is_closed() and self._room_key(candidate.url) == room_key
+            ]
+            if matching:
+                existing = matching[-1]
+                if force_navigation:
+                    # Reload the actual webinar instead of reopening its /j/
+                    # invitation, which makes MTS Link spawn another tab.
+                    await existing.reload(wait_until="domcontentloaded", timeout=15_000)
+                    log.info("lecture_tab_reloaded room=%s", room_key[1])
+                else:
+                    log.info("lecture_tab_reused room=%s", room_key[1])
+                return
+        await page.goto(url)
 
     def _pick_lecture_page(self, pages: list):
         """Choose the lecture tab by host instead of trusting tab order.
@@ -319,36 +318,62 @@ class BrowserService:
     async def _lecture_state_async(self) -> str:
         from playwright.async_api import Error as PlaywrightError
 
-        page, playwright = await self._active_page()
+        page = await self._active_page()
+        if page.is_closed() or not self._matches_lecture_url(page.url):
+            return "lost"
         try:
-            if page.is_closed() or not self._matches_lecture_url(page.url):
-                return "lost"
-            try:
-                text = await page.locator("body").inner_text(timeout=1_000)
-            except PlaywrightError:  # a transient DOM update is not proof that the tab died
-                return "live"
-            if self.ENDED_RE.search(text):
-                return "ended"
-            return "lost" if self.DISCONNECTED_RE.search(text) else "live"
-        finally:
+            text = await page.locator("body").inner_text(timeout=1_000)
+        except PlaywrightError:  # a transient DOM update is not proof that the tab died
+            return "live"
+        if self.ENDED_RE.search(text):
+            return "ended"
+        return "lost" if self.DISCONNECTED_RE.search(text) else "live"
+
+    async def _connected_browser(self):
+        """One CDP connection for the whole session, reconnected only when it breaks.
+
+        Starting a Playwright driver costs about 270 ms, and the scanner asks for
+        a frame every couple of seconds: reconnecting each time spawned and killed
+        a driver process thousands of times per lecture, which is what made frame
+        captures time out.
+        """
+        if self._browser is not None and self._browser.is_connected():
+            return self._browser
+        await self._release_connection()
+        if not self.is_running:
+            raise RuntimeError("Браузер приложения не запущен")
+        from playwright.async_api import async_playwright
+
+        self._playwright = await async_playwright().start()
+        try:
+            self._browser = await self._playwright.chromium.connect_over_cdp(
+                f"http://127.0.0.1:{self.port}", timeout=3_500
+            )
+        except Exception:
+            await self._release_connection()
+            raise
+        log.info("cdp_connected port=%s", self.port)
+        return self._browser
+
+    async def _release_connection(self) -> None:
+        """Drop the cached connection without closing the browser it controls."""
+        playwright, self._playwright, self._browser = self._playwright, None, None
+        if playwright is None:
+            return
+        try:
             await playwright.stop()
+        except Exception:  # a driver that already died needs no goodbye
+            log.debug("cdp_release_failed", exc_info=True)
+
+    def disconnect(self) -> None:
+        """Release the connection, leaving the browser and its session running."""
+        run_async(self._release_connection())
 
     async def _active_page(self):
         if not self.is_running:
             raise RuntimeError("Окно лекции ещё не открыто")
-        from playwright.async_api import async_playwright
-
-        playwright = await async_playwright().start()
-        try:
-            browser = await playwright.chromium.connect_over_cdp(
-                f"http://127.0.0.1:{self.port}", timeout=3_500
-            )
-            context = browser.contexts[0]
-            page = self._pick_lecture_page(context.pages) or await context.new_page()
-            return page, playwright
-        except Exception:
-            await playwright.stop()
-            raise
+        context = (await self._connected_browser()).contexts[0]
+        return self._pick_lecture_page(context.pages) or await context.new_page()
 
     def read_html(self, url: str, *, timeout_ms: int = 20_000) -> str:
         """Read a page in a background tab of the same profile, then close it.
@@ -374,56 +399,38 @@ class BrowserService:
     async def _run_on_new_page(self, action):
         if not self.is_running:
             raise RuntimeError("Браузер приложения не запущен")
-        from playwright.async_api import async_playwright
-
-        playwright = await async_playwright().start()
+        browser = await self._connected_browser()
+        page = await browser.contexts[0].new_page()
         try:
-            browser = await playwright.chromium.connect_over_cdp(
-                f"http://127.0.0.1:{self.port}", timeout=3_500
-            )
-            page = await browser.contexts[0].new_page()
-            try:
-                return await action(page)
-            finally:
-                await page.close()
+            return await action(page)
         finally:
-            await playwright.stop()
+            await page.close()
 
     async def _read_html_async(self, url: str, timeout_ms: int) -> str:
         if not self.is_running:
             raise RuntimeError("Браузер приложения не запущен")
         from playwright.async_api import TimeoutError as PlaywrightTimeoutError
-        from playwright.async_api import async_playwright
 
         log.info("page_read_requested host=%s", urlparse(url).hostname or "unknown")
-        playwright = await async_playwright().start()
+        browser = await self._connected_browser()
+        page = await browser.contexts[0].new_page()
         try:
-            browser = await playwright.chromium.connect_over_cdp(
-                f"http://127.0.0.1:{self.port}", timeout=3_500
-            )
-            context = browser.contexts[0]
-            page = await context.new_page()
+            await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
             try:
-                await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+                # Moodle renders course lists and webinar tables after load,
+                # so the document alone is not yet the content we came for.
+                await page.wait_for_load_state("networkidle", timeout=8_000)
+            except PlaywrightTimeoutError:
+                log.debug("page_read_busy host=%s", urlparse(url).hostname)
+            if "/mod/webinars/" in url:
                 try:
-                    # Moodle renders course lists and webinar tables after load,
-                    # so the document alone is not yet the content we came for.
-                    await page.wait_for_load_state("networkidle", timeout=8_000)
-                except PlaywrightTimeoutError:
-                    log.debug("page_read_busy host=%s", urlparse(url).hostname)
-                if "/mod/webinars/" in url:
-                    try:
-                        # The table is filled in by a script after the document loads.
-                        await page.wait_for_selector(
-                            "#wb2-table table.data tbody tr", timeout=5_000
-                        )
-                    except PlaywrightTimeoutError:  # a page with no webinars grows no rows
-                        log.debug("page_read_no_table host=%s", urlparse(url).hostname)
-                return await self._settled_content(page)
-            finally:
-                await page.close()
+                    # The table is filled in by a script after the document loads.
+                    await page.wait_for_selector("#wb2-table table.data tbody tr", timeout=5_000)
+                except PlaywrightTimeoutError:  # a page with no webinars grows no rows
+                    log.debug("page_read_no_table host=%s", urlparse(url).hostname)
+            return await self._settled_content(page)
         finally:
-            await playwright.stop()
+            await page.close()
 
     async def capture_png(self) -> bytes:
         """Capture page pixels directly, even when the window is overlapped."""
@@ -450,21 +457,16 @@ class BrowserService:
 
     async def capture_page_state(self) -> tuple[bytes, str]:
         """Capture pixels plus currently visible page text for chat signal detection."""
-        page, playwright = await self._active_page()
+        page = await self._active_page()
+        await self._apply_capture_size(page)
+        # A 1920x1080 frame of a live lecture needs more than the 3.5s that
+        # used to be allowed here: on 24.09 that budget lost 370 frames of 526.
+        png = await page.screenshot(type="png", animations="disabled", timeout=CAPTURE_TIMEOUT_MS)
         try:
-            await self._apply_capture_size(page)
-            # A 1920x1080 frame of a live lecture needs more than the 3.5s that
-            # used to be allowed here: on 24.09 that budget lost 370 frames of 526.
-            png = await page.screenshot(
-                type="png", animations="disabled", timeout=CAPTURE_TIMEOUT_MS
-            )
-            try:
-                visible_text = await page.locator("body").inner_text(timeout=1_000)
-            except Exception:  # noqa: BLE001 - text observation must not break QR capture
-                visible_text = ""
-            return png, visible_text
-        finally:
-            await playwright.stop()
+            visible_text = await page.locator("body").inner_text(timeout=1_000)
+        except Exception:  # noqa: BLE001 - text observation must not break QR capture
+            visible_text = ""
+        return png, visible_text
 
     def close_lecture_tab(self) -> bool:
         """Close a finished lecture without killing the browser.
@@ -478,16 +480,9 @@ class BrowserService:
     async def _close_lecture_tab_async(self) -> bool:
         if not self.is_running:
             return False
-        from playwright.async_api import async_playwright
 
-        playwright = await async_playwright().start()
-        try:
-            browser = await playwright.chromium.connect_over_cdp(
-                f"http://127.0.0.1:{self.port}", timeout=3_500
-            )
-            return await self._close_lecture_page(browser.contexts[0])
-        finally:
-            await playwright.stop()
+        browser = await self._connected_browser()
+        return await self._close_lecture_page(browser.contexts[0])
 
     async def _close_lecture_page(self, context) -> bool:
         page = self._pick_lecture_page(context.pages)
@@ -510,55 +505,50 @@ class BrowserService:
         run_async(self._send_chat_message_async(message.strip()))
 
     async def _send_chat_message_async(self, message: str) -> None:
-        page, playwright = await self._active_page()
-        try:
-            host = (urlparse(page.url).hostname or "").lower()
-            if host != "mts-link.ru" and not host.endswith(".mts-link.ru"):
-                raise RuntimeError(
-                    "Автоматическая отправка чата поддерживается только для MTS Link"
-                )
+        page = await self._active_page()
+        host = (urlparse(page.url).hostname or "").lower()
+        if host != "mts-link.ru" and not host.endswith(".mts-link.ru"):
+            raise RuntimeError("Автоматическая отправка чата поддерживается только для MTS Link")
 
-            chat_buttons = page.get_by_role("button", name=re.compile(r"чат", re.IGNORECASE))
-            for index in range(await chat_buttons.count()):
-                button = chat_buttons.nth(index)
-                if await button.is_visible():
-                    await button.click()
-                    break
+        chat_buttons = page.get_by_role("button", name=re.compile(r"чат", re.IGNORECASE))
+        for index in range(await chat_buttons.count()):
+            button = chat_buttons.nth(index)
+            if await button.is_visible():
+                await button.click()
+                break
 
-            editor = page.get_by_placeholder(re.compile(r"введите сообщение", re.IGNORECASE))
-            visible_editor = None
-            for index in range(await editor.count()):
-                candidate = editor.nth(index)
+        editor = page.get_by_placeholder(re.compile(r"введите сообщение", re.IGNORECASE))
+        visible_editor = None
+        for index in range(await editor.count()):
+            candidate = editor.nth(index)
+            if await candidate.is_visible():
+                visible_editor = candidate
+                break
+        if visible_editor is None:
+            fallback = page.locator(
+                'textarea[placeholder*="Введите сообщение"], '
+                'input[placeholder*="Введите сообщение"], '
+                '[contenteditable="true"][data-placeholder*="Введите сообщение"]'
+            )
+            for index in range(await fallback.count()):
+                candidate = fallback.nth(index)
                 if await candidate.is_visible():
                     visible_editor = candidate
                     break
-            if visible_editor is None:
-                fallback = page.locator(
-                    'textarea[placeholder*="Введите сообщение"], '
-                    'input[placeholder*="Введите сообщение"], '
-                    '[contenteditable="true"][data-placeholder*="Введите сообщение"]'
-                )
-                for index in range(await fallback.count()):
-                    candidate = fallback.nth(index)
-                    if await candidate.is_visible():
-                        visible_editor = candidate
-                        break
-            if visible_editor is None:
-                raise RuntimeError("MTS Link не показал поле «Введите сообщение»")
-            delivered = page.get_by_text(message, exact=True)
-            before = await delivered.count()
-            await visible_editor.fill(message)
-            await visible_editor.press("Enter")
-            for _ in range(10):
-                await page.wait_for_timeout(500)
-                if await delivered.count() > before:
-                    log.info("chat_delivery_confirmed")
-                    return
-            raise RuntimeError(
-                "Не удалось подтвердить доставку сообщения; повтор отключён во избежание дубля"
-            )
-        finally:
-            await playwright.stop()
+        if visible_editor is None:
+            raise RuntimeError("MTS Link не показал поле «Введите сообщение»")
+        delivered = page.get_by_text(message, exact=True)
+        before = await delivered.count()
+        await visible_editor.fill(message)
+        await visible_editor.press("Enter")
+        for _ in range(10):
+            await page.wait_for_timeout(500)
+            if await delivered.count() > before:
+                log.info("chat_delivery_confirmed")
+                return
+        raise RuntimeError(
+            "Не удалось подтвердить доставку сообщения; повтор отключён во избежание дубля"
+        )
 
     def close(self) -> None:
         """Close only the dedicated browser instance started by this service."""
@@ -572,14 +562,10 @@ class BrowserService:
         self.muted = None
 
     async def _close_async(self) -> None:
-        from playwright.async_api import async_playwright
 
-        playwright = await async_playwright().start()
-        try:
-            browser = await playwright.chromium.connect_over_cdp(f"http://127.0.0.1:{self.port}")
-            await browser.close()
-        finally:
-            await playwright.stop()
+        browser = await self._connected_browser()
+        await browser.close()
+        await self._release_connection()
 
     def minimize(self) -> bool:
         """Minimize the controlled lecture window. Native implementation is Windows-first."""
@@ -594,14 +580,11 @@ class BrowserService:
         return False
 
     async def _mark_title(self) -> None:
-        page, playwright = await self._active_page()
-        try:
-            await page.evaluate(
-                "marker => { if (!document.title.startsWith(marker)) document.title = marker + ' ' + document.title; }",
-                self.WINDOW_MARKER,
-            )
-        finally:
-            await playwright.stop()
+        page = await self._active_page()
+        await page.evaluate(
+            "marker => { if (!document.title.startsWith(marker)) document.title = marker + ' ' + document.title; }",
+            self.WINDOW_MARKER,
+        )
 
     @staticmethod
     async def _settled_content(page, attempts: int = 3) -> str:
