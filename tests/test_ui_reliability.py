@@ -113,7 +113,11 @@ def test_automatic_2fa_rejection_does_not_request_another_code(window, monkeypat
     failures = []
     monkeypatch.setattr(window, "_run_initial_login", lambda *args: retries.append(args))
     monkeypatch.setattr(window, "_schedule_login_retry", lambda *_: retries.append("retry"))
-    monkeypatch.setattr(window, "_operation_failed", failures.append)
+    # Unattended: reported through the tray, not a modal dialog nobody sees.
+    monkeypatch.setattr(
+        window, "_background_problem", lambda _title, message: failures.append(message)
+    )
+    monkeypatch.setattr(window, "_operation_failed", lambda message: failures.append("modal"))
 
     window._login_finished(SimpleNamespace(challenge=object(), success=False, message="rejected"))
 
@@ -416,3 +420,77 @@ def test_schedule_failure_still_opens_an_already_found_room(window, monkeypatch)
     window._schedule_refresh_failed("Пульс недоступен")
 
     assert opened == ["https://mts-link.ru/event/running"]
+
+
+def test_auth_indicator_follows_the_session(window, monkeypatch):
+    window.mirea.session = {"cookie": "expired"}
+    monkeypatch.setattr(window, "_auto_login", lambda: None)
+    monkeypatch.setattr(window, "refresh_schedule", lambda: None)
+    monkeypatch.setattr(window.session_store, "save", lambda _session: None)
+
+    window._session_verified(SessionState.EXPIRED)
+
+    assert "истекла" in window.auth_status.text()
+    window._login_finished(SimpleNamespace(challenge=None, success=True, message="", tokens={}))
+    assert "вход выполнен" in window.auth_status.text()
+
+
+def test_now_card_names_the_next_pair_and_its_mode(window):
+    now = datetime.now().astimezone()
+    lesson = Lesson(
+        external_id="next",
+        subject_name="Матанализ",
+        lesson_type="ЛК",
+        start_at=now + timedelta(minutes=30),
+        end_at=now + timedelta(minutes=120),
+    )
+    window.db.sync_lessons([lesson], now.replace(hour=0, minute=0, second=0, microsecond=0))
+    window.db.set_rule("Матанализ", RuleMode.AUTO)
+
+    window._update_now_card()
+
+    assert "Матанализ" in window.now_card.text()
+    assert "Авто" in window.now_card.text()
+    assert "Матанализ" in window.tray.toolTip()
+
+
+def test_background_results_are_not_wiped_by_other_operations(window):
+    window.statusBar().showMessage("Посещение отмечено", 8000)
+    worker_done = []
+
+    class FakeWorker:
+        signals = SimpleNamespace(
+            done=SimpleNamespace(connect=worker_done.append),
+            failed=SimpleNamespace(connect=lambda _handler: None),
+        )
+
+        def setAutoDelete(self, _flag):
+            return None
+
+    window._start_worker(
+        FakeWorker(),
+        lambda _value: None,
+        lambda _message: None,
+        busy_text="Проверяем вкладку лекции…",
+        pool=SimpleNamespace(start=lambda _worker: None),
+    )
+    assert "Проверяем вкладку" in window.activity_label.text()
+
+    worker_done[0](None)
+
+    assert window.activity_label.text() == ""
+    assert window.statusBar().currentMessage() == "Посещение отмечено"
+
+
+def test_schedule_modes_are_shown_in_russian(window):
+    now = datetime.now().astimezone()
+    lesson = Lesson("l1", "Физика", "ЛК", now + timedelta(hours=1), now + timedelta(hours=2))
+    window.db.sync_lessons([lesson], now.replace(hour=0, minute=0, second=0, microsecond=0))
+    window.db.set_rule("Физика", RuleMode.IGNORE)
+
+    window._fill_schedule()
+
+    assert window.schedule_table.item(0, 5).text() == "Не открывать"
+    window.subject_rule_subject.setCurrentText("Физика")
+    window.subject_rule_mode.setCurrentIndex(window.subject_rule_mode.findData("AUTO"))
+    assert window.db.get_rule("Физика") is RuleMode.AUTO
