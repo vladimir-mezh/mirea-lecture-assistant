@@ -558,6 +558,7 @@ class MainWindow(QMainWindow):
         self.login_retry_attempt = 0
         self.login_retry_scheduled = False
         self.session_recheck_scheduled = False
+        self.pending_pulse_login = None
         self.remember_login_requested = False
         self.login_started_at = datetime.now(UTC)
         self.session_obtained_at: float | None = None
@@ -1336,6 +1337,8 @@ class MainWindow(QMainWindow):
         if self.login_in_progress:
             return
         self.login_in_progress = True
+        self.pending_pulse_login = None
+        self.session_recheck_scheduled = False
         if self.sdo_sign_in_lock.locked():
             # An СДО sign-in is waiting for its emailed code right now; starting
             # here would put two codes in one mailbox. Try again in a moment.
@@ -1408,7 +1411,7 @@ class MainWindow(QMainWindow):
         result, self.email_uid_before_login = payload
         self._login_finished(result)
 
-    def _login_finished(self, result):
+    def _login_finished(self, result, *, refresh_schedule: bool = True):
         self.login_in_progress = False
         if result.challenge:
             if self.otp_submission_attempted:
@@ -1463,6 +1466,11 @@ class MainWindow(QMainWindow):
                 )
             return
         if not result.success:
+            if getattr(result, "session_pending", False):
+                self.pending_pulse_login = result
+                self._persist_session()
+                self._session_verified(SessionState.UNKNOWN)
+                return
             # Never start another SSO flow after a rejected/failed code.
             # The account may be locked by repeated automatic challenges.
             self.pending_login_credentials = None
@@ -1509,6 +1517,7 @@ class MainWindow(QMainWindow):
                 )
         self.pending_login_credentials = None
         self.pending_email_credentials = None
+        self.pending_pulse_login = None
         self.email_uid_before_login = None
         self.otp_submission_attempted = False
         self.login_cycle_retries = 0
@@ -1520,7 +1529,8 @@ class MainWindow(QMainWindow):
         self._set_auth_state("signed_in")
         log.info("login_success")
         self.statusBar().showMessage("Вход выполнен", 3000)
-        self.refresh_schedule()
+        if refresh_schedule:
+            self.refresh_schedule()
         for event_id in tuple(self.pending_qr):
             if event_id not in self.retry_scheduled:
                 self._retry_attendance(event_id)
@@ -1665,19 +1675,25 @@ class MainWindow(QMainWindow):
         if state is SessionState.EXPIRED:
             # A kept stale session makes the background schedule refresh fail and
             # start a recovery login on top of this one.
-            self.mirea.session = {}
+            self._discard_expired_session()
             self._set_auth_state("expired")
             self._auto_login()
             return
         if state is SessionState.UNKNOWN:
             # The saved session is kept and used; only the check itself failed.
-            self._set_auth_state("signed_in")
+            self._set_auth_state("checking")
             self.statusBar().showMessage("MIREA пока недоступна; повторим проверку", 8000)
             if not self.session_recheck_scheduled:
                 self.session_recheck_scheduled = True
                 QTimer.singleShot(60_000, self._retry_session_verification)
             # The check may fail where the schedule itself still loads.
             self._refresh_schedule_background()
+            return
+        if self.pending_pulse_login is not None:
+            result = self.pending_pulse_login
+            result.success = True
+            result.cookies = dict(self.mirea.session)
+            self._login_finished(result)
             return
         self._set_auth_state("signed_in")
         self.statusBar().showMessage("Сохранённый вход восстановлен", 3000)
@@ -1792,7 +1808,7 @@ class MainWindow(QMainWindow):
                 log.info("session_recovery_deferred reason=network")
                 return
             log.warning("session_expired reason=%s", reason)
-            self.mirea.session = {}
+            self._discard_expired_session()
             self._set_auth_state("expired")
             self._auto_login()
 
@@ -1809,6 +1825,12 @@ class MainWindow(QMainWindow):
 
     def _schedule_loaded(self, lessons):
         self.schedule_refresh_running = False
+        if self.pending_pulse_login is not None:
+            result = self.pending_pulse_login
+            result.success = True
+            result.cookies = dict(self.mirea.session)
+            self._login_finished(result, refresh_schedule=False)
+        self._set_auth_state("signed_in")
         # pymirea renewed the cookie or the tokens on the way; without saving them
         # the next start used the spent ones and asked for a new login and code.
         self._persist_session()
@@ -3195,6 +3217,16 @@ class MainWindow(QMainWindow):
             return
         self.persisted_session = fingerprint
         log.info("session_persisted")
+
+    def _discard_expired_session(self):
+        self.mirea.session = {}
+        self.pending_pulse_login = None
+        self.session_obtained_at = None
+        self.persisted_session = self._session_fingerprint({})
+        try:
+            self.session_store.clear()
+        except Exception:
+            log.warning("expired_session_discard_failed", exc_info=True)
 
     def _attendance_already_marked(self, lesson_id: str | None) -> bool:
         """Attendance is recorded once per lesson; scanning after that is pointless."""
