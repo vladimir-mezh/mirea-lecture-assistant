@@ -17,6 +17,11 @@ from datetime import datetime
 from pathlib import Path
 
 CHILD_ENV = "MIREA_ASSISTANT_CHILD"
+# Makes a PyInstaller program started by another copy unpack into its own
+# temporary folder. Without it, a copy started with the same exe path reuses the
+# starter's folder and loses it (certificates, Qt files) when the starter quits:
+# after an update the new version failed every HTTPS request with "[Errno 2]".
+RESET_ENV = "PYINSTALLER_RESET_ENVIRONMENT"
 # The app itself returns these; the watchdog stops on anything but a crash.
 STARTUP_FAILED = 3
 CRASHED = 70  # an uncaught Python exception (the launcher's code for it)
@@ -53,7 +58,9 @@ def _log(message: str) -> None:
 
 def run(argv: list[str], *, call=subprocess.call, sleep=time.sleep, clock=time.monotonic) -> int:
     """Run the app as a child until it ends on purpose; returns its last exit code."""
-    environment = {**os.environ, CHILD_ENV: "1"}
+    # The app gets a folder of its own too: this watchdog may itself be running
+    # on a folder borrowed from the copy that started it (an update by 0.2.8/0.2.9).
+    environment = {**os.environ, CHILD_ENV: "1", RESET_ENV: "1"}
     restarts: list[float] = []
     while True:
         code = call([sys.executable, *argv[1:]], env=environment)
@@ -74,6 +81,7 @@ def child_environment() -> dict[str, str]:
     """For starting a separate app (an update): it must get a watchdog of its own."""
     environment = dict(os.environ)
     environment.pop(CHILD_ENV, None)
+    environment[RESET_ENV] = "1"
     return environment
 
 

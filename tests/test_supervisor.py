@@ -11,6 +11,8 @@ def _run(codes):
 
     def call(command, env):
         calls.append(env.get(supervisor.CHILD_ENV))
+        # Always unpacked into a folder of its own, never one borrowed.
+        assert env[supervisor.RESET_ENV] == "1"
         return codes.pop(0)
 
     def sleep(seconds):
@@ -55,4 +57,8 @@ def test_only_the_built_program_outside_tests_is_watched(monkeypatch):
 def test_an_update_starts_a_separate_copy_with_its_own_watchdog(monkeypatch):
     monkeypatch.setenv(supervisor.CHILD_ENV, "1")
 
-    assert supervisor.CHILD_ENV not in supervisor.child_environment()
+    environment = supervisor.child_environment()
+    assert supervisor.CHILD_ENV not in environment
+    # Without this the updated copy ran on the old copy's temporary folder and
+    # lost its certificates when the old copy quit: "[Errno 2] No such file".
+    assert environment[supervisor.RESET_ENV] == "1"
