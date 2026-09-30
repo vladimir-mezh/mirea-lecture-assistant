@@ -49,6 +49,10 @@ def validate_qr(
             parsed = urlparse(candidate)
         except ValueError:
             return None, "Неверный формат QR-кода"
+        # "https://evil.com\@pulse.mirea.ru/…": Python and browsers disagree on
+        # which host that is, so an address with a login part is never trusted.
+        if "\\" in candidate or "@" in parsed.netloc:
+            return None, "Это не QR-код посещаемости МИРЭА"
         if (parsed.hostname or "").lower() not in ALLOWED_DOMAINS:
             return None, "Это не QR-код посещаемости МИРЭА"
         token = parse_qs(parsed.query).get("token", [None])[0]

@@ -11,24 +11,31 @@ from pathlib import Path
 from . import __version__
 
 EMAIL = re.compile(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}")
-UUID = re.compile(
-    r"(?i)\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b"
-)
+# Any UUID shape: attendance tokens are not guaranteed to be RFC 4122 v1-v5.
+UUID = re.compile(r"(?i)\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b")
 JWT = re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]*\b")
 JSON_SECRET = re.compile(
     r"""(?i)(["'](?:access_token|refresh_token|password|otp|emailCode)["']\s*:\s*["'])([^"']+)"""
 )
 SECRET_FIELD = re.compile(
-    r"(?i)(password|пароль|token|токен|otp|код подтверждения)(\s*[:=]\s*)(\S+)"
+    r"(?i)(password|пароль|token|токен|otp|emailcode|код подтверждения|код)(\s*[:=]\s*)(\S+)"
 )
-URL_PARAMETER = re.compile(r"([?&][^=\s&]+)=([^&\s]+)")
+UNQUOTED_JSON_SECRET = re.compile(
+    r"(?i)(\b(?:access_token|refresh_token|password|otp|emailCode)\s*:\s*)([^,}\s]+)"
+)
+AUTH_HEADER = re.compile(r"(?i)(authorization\s*[:=]\s*)(?:bearer\s+|basic\s+)?\S+")
+COOKIE_HEADER = re.compile(r"(?i)((?:set-)?cookie\s*[:=]\s*)[^\n]+")
+URL_PARAMETER = re.compile(r"([?&#][^=\s&#]+)=([^&\s#]+)")
 
 
 def redact(text: str) -> str:
     text = EMAIL.sub("<email>", text)
     text = UUID.sub("<uuid>", text)
     text = JWT.sub("<jwt>", text)
+    text = AUTH_HEADER.sub(r"\1<hidden>", text)
+    text = COOKIE_HEADER.sub(r"\1<hidden>", text)
     text = JSON_SECRET.sub(r"\1<hidden>", text)
+    text = UNQUOTED_JSON_SECRET.sub(r"\1<hidden>", text)
     text = SECRET_FIELD.sub(r"\1\2<hidden>", text)
     return URL_PARAMETER.sub(r"\1=<hidden>", text)
 
@@ -68,7 +75,8 @@ def configure_logging(log_dir: Path) -> Path:
     root.setLevel(logging.INFO)
     root.handlers.clear()
     root.addHandler(handler)
-    logging.getLogger("pymirea.session").setLevel(logging.WARNING)
+    # pymirea logs final SSO URLs and page excerpts at INFO on every login.
+    logging.getLogger("pymirea").setLevel(logging.WARNING)
     logging.captureWarnings(True)
 
     def exception_hook(exc_type, exc_value, traceback):

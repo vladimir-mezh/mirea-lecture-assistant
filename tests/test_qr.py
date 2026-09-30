@@ -56,3 +56,15 @@ def test_retry_in_progress_is_deduplicated(tmp_path):
     qr, _ = validate_qr(TOKEN, allow_bare_token=True)
     db.add_qr_event(qr.token_hash, "retrying", message="Повтор через 5 секунд")
     assert QrDeduplicator(db).is_duplicate(qr.token_hash, datetime.now().astimezone())
+
+
+def test_an_address_with_a_login_part_is_never_trusted():
+    from mirea_lecture_assistant.qr import validate_qr
+
+    token = "123e4567-e89b-12d3-a456-426614174000"
+    for raw in (
+        f"https://evil.example\\@pulse.mirea.ru/selfapprove?token={token}",
+        f"https://pulse.mirea.ru@evil.example/selfapprove?token={token}",
+    ):
+        qr, _error = validate_qr(raw)
+        assert qr is None

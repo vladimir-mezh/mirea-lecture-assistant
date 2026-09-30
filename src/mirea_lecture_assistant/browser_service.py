@@ -598,14 +598,22 @@ class BrowserService:
         self._capture_override = (page, self.capture_size)
 
     async def capture_page_state(self) -> tuple[bytes, str]:
-        """Capture pixels plus currently visible page text for chat signal detection."""
+        """Capture pixels plus the chat's visible text for roll-call detection.
+
+        Only the chat panes are read: the participant list shows classmates'
+        display names ("Иванов Иван ИКБО-01-24"), which looked like a roll call.
+        """
         page = await self._active_page()
         await self._apply_capture_size(page)
         # A 1920x1080 frame of a live lecture needs more than the 3.5s that
         # used to be allowed here: on 24.09 that budget lost 370 frames of 526.
         png = await page.screenshot(timeout=CAPTURE_TIMEOUT_MS)
         try:
-            visible_text = await page.inner_text("body", timeout=1_000)
+            visible_text = await page.evaluate(
+                "s => [...document.querySelectorAll(s)].map(e => e.innerText || '').join('\\n')",
+                CHAT_SELECTOR,
+                timeout=1,
+            )
         except Exception:  # noqa: BLE001 - text observation must not break QR capture
             visible_text = ""
         return png, visible_text

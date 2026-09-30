@@ -17,6 +17,9 @@ def classify_session_response(status_code: int, final_url: str) -> SessionState:
     host = (urlparse(lowered).hostname or "").lower()
     if status_code in {401, 403} or "/login" in lowered or host == "login.mirea.ru":
         return SessionState.EXPIRED
+    # Pulse sends an expired session to the SSO sign-in page, as pymirea knows.
+    if host == "sso.mirea.ru" or "openid-connect/auth" in lowered:
+        return SessionState.EXPIRED
     return SessionState.VALID
 
 
@@ -68,7 +71,8 @@ class MireaService:
 
         filtered_cookies = {
             name: value
-            for name, value in self.session.items()
+            # A copy: pymirea may refresh the tokens from another thread meanwhile.
+            for name, value in dict(self.session).items()
             if name not in {"access_token", "token_type", "refresh_token", "expires_in"}
             and not str(name).startswith("__")
         }

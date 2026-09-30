@@ -446,7 +446,9 @@ def test_another_senders_code_is_used_only_after_a_grace_period(imap, monkeypatc
     monkeypatch.setattr(email_otp.time, "monotonic", lambda: clock[0])
 
     assert (
-        ImapOtpReader().wait_for_code(EmailAccount("student@gmail.com", "pw"), now, timeout=120)
+        ImapOtpReader().wait_for_code(
+            EmailAccount("student@gmail.com", "pw"), now, timeout=120, accept_foreign=True
+        )
         == "7788"
     )
     assert clock[0] - 1000.0 >= email_otp.FOREIGN_CODE_GRACE_SECONDS
@@ -460,10 +462,10 @@ def test_one_unreadable_letter_does_not_stop_the_wait(imap, monkeypatch):
     imap({"INBOX": [(1, mirea), (2, b"broken")]})
     real = email_otp._otp_candidate
 
-    def flaky(raw, not_before):
+    def flaky(raw, not_before, **kwargs):
         if raw == b"broken":
             raise ValueError("malformed")
-        return real(raw, not_before)
+        return real(raw, not_before, **kwargs)
 
     monkeypatch.setattr(email_otp, "_otp_candidate", flaky)
 
@@ -487,3 +489,48 @@ def test_undetected_provider_explains_how_to_set_the_server():
 @pytest.mark.parametrize("address", ["a@yandex.ru", "a@mail.ru"])
 def test_grouped_app_password_is_joined_for_yandex_and_mailru(address):
     assert EmailAccount(address, "abcd efgh ijkl mnop").normalized().password == "abcdefghijklmnop"
+
+
+def test_an_unattended_wait_never_submits_another_services_code(imap, monkeypatch):
+    from mirea_lecture_assistant import email_otp
+
+    now = datetime.now(UTC)
+    foreign = message("Код подтверждения", "Ваш код: 7788", now, "noreply@other.example")
+    imap({"INBOX": [(1, foreign)]})
+    clock = [1000.0]
+    monkeypatch.setattr(
+        email_otp.time, "sleep", lambda seconds: clock.__setitem__(0, clock[0] + seconds)
+    )
+    monkeypatch.setattr(email_otp.time, "monotonic", lambda: clock[0])
+
+    with pytest.raises(TimeoutError):
+        ImapOtpReader().wait_for_code(EmailAccount("student@gmail.com", "pw"), now, timeout=60)
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["Ваш промокод AUTUMN2026 на скидку", "Раскодируйте сообщение: 15000 символов"],
+)
+def test_words_merely_containing_kod_are_not_codes(text):
+    now = datetime.now(UTC)
+    raw = message("Акция", text, now, "shop@example.org")
+    assert extract_fresh_otp(raw, now) is None
+
+
+def test_a_new_letter_is_read_even_if_its_date_lags_behind(imap):
+    """The MIREA mail server's clock ran a few seconds behind ours."""
+    now = datetime.now(UTC)
+    lagging = message(
+        "Подтверждение входа",
+        "Код подтверждения: 482913",
+        now - timedelta(seconds=30),
+        "sso@mirea.ru",
+    )
+    imap({"INBOX": [(5, b"old"), (6, lagging)]})
+
+    assert (
+        ImapOtpReader().wait_for_code(
+            EmailAccount("student@mail.ru", "pw"), now, timeout=60, after_uid=5
+        )
+        == "482913"
+    )
