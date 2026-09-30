@@ -63,9 +63,17 @@ LOOKUP_RETRY_FAILED_SECONDS = 300
 SDO_SIGN_IN_BACKOFF_SECONDS = 600
 # Rotating QR tokens are short-lived; retrying a stale one only produces noise.
 ATTENDANCE_RETRY_WINDOW = timedelta(minutes=10)
-# A room that says it is over this long before the pair ends was the wrong room,
-# or the teacher closed it and opened another one.
-ROOM_ENDED_EARLY = timedelta(minutes=10)
+# The pair is left only this long after its scheduled end. A room that says it
+# is over before then was the wrong room, or the teacher closed it and is about
+# to open another one.
+LEAVE_AFTER_END = timedelta(minutes=5)
+# While a pair runs, the СДО is checked again for a newer room of this group:
+# often at the start, when teachers recreate rooms, rarely later.
+RECHECK_EARLY_WINDOW = timedelta(minutes=20)
+RECHECK_EARLY_SECONDS = 120
+RECHECK_LATE_SECONDS = 300
+# After a room closed early, the replacement is looked for every minute.
+ROOM_LOST_RECHECK_SECONDS = 60
 # How long such a room is left out of the search. A teacher may restart a
 # session behind the same link, so it becomes eligible again afterwards.
 REJECTED_ROOM_SECONDS = 300
@@ -401,6 +409,8 @@ class MainWindow(QMainWindow):
         self.retry_scheduled: set[int] = set()
         self.submit_attempts: dict[int, int] = {}
         self.lookup_not_before: dict[str, float] = {}
+        # Lessons whose room closed before the pair was over: waiting for a new one.
+        self.room_lost_lessons: set[str] = set()
         self.sdo_sign_in_lock = threading.Lock()
         self.sdo_sign_in_failed_at: float | None = None
         self.schedule_redraw_pending = False
@@ -1500,6 +1510,11 @@ class MainWindow(QMainWindow):
                 <= lesson.end_at + timedelta(minutes=90)
             ):
                 continue
+            if lesson.external_id == self.active_lecture_id:
+                # Teachers recreate rooms mid-pair; keep an eye on the СДО.
+                if now < lesson.end_at:
+                    self._resolve_from_sources(lesson)
+                continue
             if lesson.external_id in self.joined_lessons:
                 continue
             mode = self.db.get_rule(lesson.subject_name)
@@ -1511,7 +1526,7 @@ class MainWindow(QMainWindow):
             if not url:
                 # The webinar is often created after the pair has begun, so this
                 # runs again (with a pause between attempts) until the room shows up.
-                if now <= lesson.end_at + timedelta(minutes=15):
+                if now <= lesson.end_at + LEAVE_AFTER_END + timedelta(minutes=10):
                     self._resolve_from_sources(lesson)
                 continue
             if mode is RuleMode.AUTO:
@@ -1663,12 +1678,22 @@ class MainWindow(QMainWindow):
             failed=lambda message: self._source_lookup_failed(lesson, message),
         )
 
+    def _lookup_pause(self, lesson) -> float:
+        """Seconds until the next СДО lookup for this lesson."""
+        if lesson.external_id in self.room_lost_lessons:
+            return ROOM_LOST_RECHECK_SECONDS
+        if lesson.external_id == self.active_lecture_id:
+            now = datetime.now().astimezone()
+            early = now < lesson.start_at + RECHECK_EARLY_WINDOW
+            return RECHECK_EARLY_SECONDS if early else RECHECK_LATE_SECONDS
+        return LOOKUP_RETRY_EMPTY_SECONDS
+
     def _source_resolved(self, lesson, webinar, discovered: list[str]):
         self.resolving_lessons.discard(lesson.external_id)
+        self.lookup_not_before[lesson.external_id] = time.monotonic() + self._lookup_pause(lesson)
         if webinar is None or not webinar.is_joinable:
-            self.lookup_not_before[lesson.external_id] = (
-                time.monotonic() + LOOKUP_RETRY_EMPTY_SECONDS
-            )
+            if lesson.external_id == self.active_lecture_id:
+                return  # still in the room we have; nothing newer yet
             legacy = self.db.get_link(lesson.subject_name)
             if legacy and legacy not in self._rejected_rooms(lesson.external_id):
                 # A permanent room set for the whole subject by an older version:
@@ -1696,6 +1721,22 @@ class MainWindow(QMainWindow):
                 8000,
             )
             return
+        if lesson.external_id == self.active_lecture_id:
+            if webinar.join_url == self.active_lecture_url:
+                return
+            # A newer room for this pair: the teacher closed the first one.
+            log.warning(
+                "lecture_room_replaced lesson_id=%s webinar_id=%s",
+                lesson.external_id,
+                webinar.webinar_id,
+            )
+            self.db.set_resolved_link(lesson.external_id, webinar.join_url)
+            self.statusBar().showMessage(
+                f"«{lesson.subject_name}»: в СДО новая комната — переходим в неё", 8000
+            )
+            self._open_lecture(webinar.join_url, lesson.external_id, force=True)
+            return
+        self.room_lost_lessons.discard(lesson.external_id)
         self.db.set_resolved_link(lesson.external_id, webinar.join_url)
         log.info(
             "webinar_resolved lesson_id=%s title=%s start=%s end=%s groups=%s",
@@ -1722,7 +1763,12 @@ class MainWindow(QMainWindow):
 
     def _source_lookup_failed(self, lesson, message: str):
         self.resolving_lessons.discard(lesson.external_id)
-        self.lookup_not_before[lesson.external_id] = time.monotonic() + LOOKUP_RETRY_FAILED_SECONDS
+        # A pair in progress keeps its own cadence; otherwise back off further.
+        in_progress = lesson.external_id in self.room_lost_lessons or (
+            lesson.external_id == self.active_lecture_id
+        )
+        pause = self._lookup_pause(lesson) if in_progress else LOOKUP_RETRY_FAILED_SECONDS
+        self.lookup_not_before[lesson.external_id] = time.monotonic() + pause
         log.warning("webinar_lookup_failed lesson_id=%s message=%s", lesson.external_id, message)
         self.statusBar().showMessage("Вебинар в СДО пока не найден: " + message, 6000)
 
@@ -2040,11 +2086,13 @@ class MainWindow(QMainWindow):
         """
         lesson_id = self.active_lecture_id
         now = datetime.now().astimezone()
-        early = lesson is not None and now < lesson.end_at - ROOM_ENDED_EARLY
-        if not early or not lesson_id or self._attendance_already_marked(lesson_id):
+        # The pair is left only after its scheduled end: a room closed minutes in
+        # is followed by a new one, and being out of it means being absent.
+        early = lesson is not None and now < lesson.end_at + LEAVE_AFTER_END
+        if not early or not lesson_id:
             self._finish_active_lecture("room_ended")
             return
-        minutes_left = int((lesson.end_at - now).total_seconds() // 60)
+        minutes_left = max(0, int((lesson.end_at - now).total_seconds() // 60))
         log.warning(
             "lecture_room_ended_early lesson_id=%s minutes_left=%s", lesson_id, minutes_left
         )
@@ -2057,10 +2105,12 @@ class MainWindow(QMainWindow):
         self.joined_lessons.discard(lesson_id)
         self.prompted_lessons.discard(lesson_id)
         self.lookup_not_before.pop(lesson_id, None)
+        self.room_lost_lessons.add(lesson_id)
         self._fill_schedule()
         self._background_problem(
             "Комната закрылась раньше конца пары",
-            f"«{lesson.subject_name}»: до конца пары {minutes_left} мин — ищем другую комнату в СДО",
+            f"«{lesson.subject_name}»: до конца пары {minutes_left} мин — "
+            "ищем новую комнату в СДО каждую минуту",
         )
         self._resolve_from_sources(lesson)
 
@@ -2203,7 +2253,13 @@ class MainWindow(QMainWindow):
             upcoming = [x for x in lessons if x.end_at >= now]
             current = next((x for x in upcoming if x.start_at <= now), None)
             nearest = current or (upcoming[0] if upcoming else None)
-            if nearest is None:
+            if nearest is not None and nearest.external_id in self.room_lost_lessons:
+                text = (
+                    f"<b>Сейчас:</b> {nearest.subject_name} · "
+                    '<span style="color:#b45309">комната закрылась — ищем новую ссылку в СДО</span>'
+                )
+                plain = f"{nearest.subject_name} · ищем новую комнату"
+            elif nearest is None:
                 text = plain = "Ближайших пар в расписании нет"
             else:
                 mode = MODE_LABELS[self.db.get_rule(nearest.subject_name)]

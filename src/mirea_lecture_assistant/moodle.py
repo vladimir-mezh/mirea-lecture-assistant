@@ -53,6 +53,8 @@ class Webinar:
     action: str
     is_recording: bool = False
     actions_html: str = ""
+    # The СДО numbers webinars as they are created: a larger id is a newer room.
+    webinar_id: int | None = None
 
     @property
     def is_joinable(self) -> bool:
@@ -101,6 +103,7 @@ def parse_webinars(html: str, base_url: str = "") -> list[Webinar]:
         join_url = urljoin(base_url, raw_href) if raw_href else None
         classes = " ".join((control.get("class") or []) if control is not None else [])
         text = actions.get_text(" ", strip=True) if actions else ""
+        raw_id = str(control.get("data-id") or "") if control is not None else ""
         recording = bool(
             RECORDING_RE.search(classes)
             or RECORDING_RE.search(raw_href or "")
@@ -116,6 +119,7 @@ def parse_webinars(html: str, base_url: str = "") -> list[Webinar]:
                 action=text,
                 is_recording=recording,
                 actions_html="" if (raw_href or actions is None) else str(actions),
+                webinar_id=int(raw_id) if raw_id.isdigit() else None,
             )
         )
     return webinars
@@ -221,7 +225,12 @@ def webinar_candidates(
 
 
 def _best(candidates: list[Webinar], start_at: datetime, group: str) -> Webinar | None:
-    """A room you can actually enter beats an exact time slot with no link."""
+    """A room you can actually enter beats an exact time slot with no link.
+
+    Among enterable rooms of this group the newest one wins: when a teacher
+    closes a room minutes into the pair and opens another, the old row stays
+    in the table, sits closer to the bell and used to be chosen again.
+    """
     if not candidates:
         return None
     wanted_group = normalize_group(group)
@@ -230,6 +239,7 @@ def _best(candidates: list[Webinar], start_at: datetime, group: str) -> Webinar 
         key=lambda w: (
             not w.is_joinable,
             not (wanted_group and wanted_group in w.groups),
+            -(w.webinar_id or 0),
             abs(w.start_at - start_at),
         ),
     )

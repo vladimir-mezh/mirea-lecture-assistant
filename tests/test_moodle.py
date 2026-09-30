@@ -604,12 +604,29 @@ def test_a_webinar_still_running_is_chosen_even_near_its_end():
     assert _resolve(page(row()), now=near_its_end) is not None
 
 
+OLDER_JOIN = (
+    '<button class="btn wb2-join-btn" data-id="188700" '
+    'data-href="https://my.mts-link.ru/j/10000001/20000000005">Подключиться</button>'
+)
+
+
 def test_a_room_that_turned_out_to_be_over_is_skipped_for_another_one():
     dead = "https://my.mts-link.ru/j/10000001/20000000002"
-    html = page(row(), row(epoch=1788415200 + 600, action=OTHER_JOIN))
+    html = page(row(), row(epoch=1788415200 + 600, action=OLDER_JOIN))
 
     first = _resolve(html)
     second = _resolve(html, excluded=frozenset({dead}))
 
     assert first.join_url == dead
-    assert second.join_url == "https://my.mts-link.ru/j/10000001/20000000009"
+    assert second.join_url == "https://my.mts-link.ru/j/10000001/20000000005"
+
+
+def test_a_room_recreated_during_the_pair_wins_over_the_first_one():
+    """The first room was closed five minutes in; a new row appeared for the same pair."""
+    first = row()  # data-id 188788, starts exactly at the bell
+    recreated = row(epoch=int(LESSON_START.timestamp()) + 7 * 60, action=OTHER_JOIN)
+
+    picked = _match(page(first, recreated))
+
+    assert picked.join_url == "https://my.mts-link.ru/j/10000001/20000000009"
+    assert picked.webinar_id == 188790
