@@ -1,5 +1,6 @@
 from datetime import UTC, datetime, timedelta
 from email.message import EmailMessage
+from typing import ClassVar
 
 import pytest
 
@@ -74,6 +75,9 @@ def test_otp_polling_recovers_after_a_temporary_imap_failure(monkeypatch):
 
         def login(self, *_args):
             return None
+
+        def list(self):
+            return "OK", []
 
         def select(self, *_args, **_kwargs):
             return "OK", []
@@ -249,3 +253,237 @@ def test_connection_check_uses_explicit_yandex_login(monkeypatch):
     account = EmailAccount("alias@yandex.ru", "app-password", imap_username="main-login")
     assert ImapOtpReader().latest_uid(account) == 7
     assert usernames == ["main-login"]
+
+
+class FakeMailbox:
+    """An IMAP server with folders of (uid, raw letter); records every login."""
+
+    logins: ClassVar[list[str]] = []
+
+    def __init__(self, folders, list_rows=()):
+        self.folders = folders
+        self.list_rows = list(list_rows)
+        self.selected = None
+        self.searches = []
+
+    def __call__(self, *_args, **_kwargs):
+        return self
+
+    def login(self, username, _password):
+        FakeMailbox.logins.append(username)
+
+    def logout(self):
+        return None
+
+    def list(self):
+        return "OK", self.list_rows
+
+    def select(self, name, readonly=False):
+        name = name.strip('"')
+        if name not in self.folders:
+            return "NO", [b"no such folder"]
+        self.selected = name
+        return "OK", [str(len(self.folders[name])).encode()]
+
+    def uid(self, command, *args):
+        letters = self.folders[self.selected]
+        if command == "search":
+            self.searches.append((self.selected, args[1:]))
+            return "OK", [b" ".join(str(uid).encode() for uid, _raw in letters)]
+        wanted = int(args[0])
+        for uid, raw in letters:
+            if uid == wanted:
+                return "OK", [(b"1 (UID %d BODY[] {1}" % uid, raw), b")"]
+        return "OK", [None]
+
+
+@pytest.fixture
+def imap(monkeypatch):
+    from mirea_lecture_assistant import email_otp
+
+    FakeMailbox.logins = []
+    monkeypatch.setattr(email_otp.time, "sleep", lambda _seconds: None)
+
+    def install(folders, list_rows=()):
+        server = FakeMailbox(folders, list_rows)
+        monkeypatch.setattr(email_otp.imaplib, "IMAP4_SSL", server)
+        return server
+
+    return install
+
+
+def raw_letter(headers: str, body: bytes = b"") -> bytes:
+    return headers.replace("\n", "\r\n").encode("utf-8") + b"\r\n\r\n" + body
+
+
+def rfc_date(moment: datetime) -> str:
+    return moment.strftime("%a, %d %b %Y %H:%M:%S +0000")
+
+
+def test_letter_with_raw_8bit_header_or_unknown_charset_does_not_break_parsing():
+    now = datetime.now(UTC)
+    raw_subject = raw_letter(
+        f"From: shop@example.ru\nSubject: Скидки недели\nDate: {rfc_date(now)}"
+    )
+    bad_charset = raw_letter(
+        f"From: shop@example.ru\nSubject: Hi\nDate: {rfc_date(now)}\n"
+        "Content-Type: text/plain; charset=utf-8x",
+        b"Hello",
+    )
+
+    assert extract_fresh_otp(raw_subject, now) is None
+    assert extract_fresh_otp(bad_charset, now) is None
+
+
+def test_code_is_read_from_a_letter_with_raw_8bit_utf8_subject():
+    now = datetime.now(UTC)
+    raw = raw_letter(
+        f"From: sso@mirea.ru\nSubject: 012345 – ваш код для входа в РТУ МИРЭА\n"
+        f"Date: {rfc_date(now)}"
+    )
+    assert extract_fresh_otp(raw, now) == "012345"
+
+
+def test_style_digits_of_an_html_letter_are_not_taken_for_the_code():
+    now = datetime.now(UTC)
+    raw = raw_letter(
+        f"From: sso@mirea.ru\nSubject: Подтверждение входа\nDate: {rfc_date(now)}\n"
+        "Content-Type: text/html; charset=utf-8",
+        "<html><head><style>.otp{width:1200px}</style></head>"
+        "<body>Ваш код&nbsp;подтверждения: <b>482913</b></body></html>".encode(),
+    )
+    assert extract_fresh_otp(raw, now) == "482913"
+
+
+def test_wait_uses_one_connection_for_many_polls(imap):
+    now = datetime.now(UTC)
+    code_letter = message("Подтверждение входа", "Код подтверждения: 482913", now, "sso@mirea.ru")
+    server = imap({"INBOX": [(10, b"old")]})
+    polls = []
+    original_poll = ImapOtpReader._poll
+
+    def poll(self, *args):
+        polls.append(1)
+        if len(polls) == 4:
+            server.folders["INBOX"].append((11, code_letter))
+        return original_poll(self, *args)
+
+    reader = ImapOtpReader()
+    reader._poll = poll.__get__(reader)
+
+    assert (
+        reader.wait_for_code(
+            EmailAccount("student@mail.ru", "app-password"), now, timeout=60, after_uid=10
+        )
+        == "482913"
+    )
+    assert len(polls) == 4
+    assert FakeMailbox.logins == ["student@mail.ru"]
+    # Only letters after the snapshot are requested, not the whole inbox.
+    assert server.searches[0] == ("INBOX", ("UID 11:*",))
+
+
+def test_code_filed_as_spam_is_found(imap):
+    now = datetime.now(UTC)
+    code_letter = message("Подтверждение входа", "Код подтверждения: 482913", now, "sso@mirea.ru")
+    server = imap(
+        {"INBOX": [(5, b"old")], "&BCEEPwQwBDw-": [(3, code_letter)]},
+        [
+            b'(\\HasNoChildren) "/" "INBOX"',
+            b'(\\HasNoChildren \\Junk) "/" "&BCEEPwQwBDw-"',
+        ],
+    )
+
+    code = ImapOtpReader().wait_for_code(
+        EmailAccount("student@mail.ru", "app-password"), now, timeout=60, after_uid=5
+    )
+
+    assert code == "482913"
+    assert server.searches[-1][0] == "&BCEEPwQwBDw-"
+    assert server.searches[-1][1][0] == "SINCE"
+
+
+def test_spam_folder_without_special_use_flag_is_found_by_name(imap):
+    now = datetime.now(UTC)
+    code_letter = message("Подтверждение входа", "Код подтверждения: 482913", now, "sso@mirea.ru")
+    imap(
+        {"INBOX": [], "Spam": [(1, code_letter)]},
+        [b'(\\HasNoChildren) "|" INBOX', b'(\\HasNoChildren) "|" Spam'],
+    )
+
+    assert (
+        ImapOtpReader().wait_for_code(
+            EmailAccount("student@yandex.ru", "app-password"), now, timeout=60
+        )
+        == "482913"
+    )
+
+
+def test_mirea_letter_wins_over_another_services_code(imap):
+    now = datetime.now(UTC)
+    foreign = message("Код подтверждения", "Ваш код: 7788", now, "noreply@shop.example")
+    mirea = message("Подтверждение входа", "Код подтверждения: 482913", now, "sso@mirea.ru")
+    imap({"INBOX": [(1, mirea), (2, foreign)]})
+
+    assert (
+        ImapOtpReader().wait_for_code(EmailAccount("student@gmail.com", "pw"), now, timeout=60)
+        == "482913"
+    )
+
+
+def test_another_senders_code_is_used_only_after_a_grace_period(imap, monkeypatch):
+    from mirea_lecture_assistant import email_otp
+
+    now = datetime.now(UTC)
+    foreign = message("Код подтверждения", "Ваш код: 7788", now, "noreply@other.example")
+    imap({"INBOX": [(1, foreign)]})
+    clock = [1000.0]
+
+    def fake_sleep(seconds):
+        clock[0] += seconds
+
+    monkeypatch.setattr(email_otp.time, "sleep", fake_sleep)
+    monkeypatch.setattr(email_otp.time, "monotonic", lambda: clock[0])
+
+    assert (
+        ImapOtpReader().wait_for_code(EmailAccount("student@gmail.com", "pw"), now, timeout=120)
+        == "7788"
+    )
+    assert clock[0] - 1000.0 >= email_otp.FOREIGN_CODE_GRACE_SECONDS
+
+
+def test_one_unreadable_letter_does_not_stop_the_wait(imap, monkeypatch):
+    from mirea_lecture_assistant import email_otp
+
+    now = datetime.now(UTC)
+    mirea = message("Подтверждение входа", "Код подтверждения: 482913", now, "sso@mirea.ru")
+    imap({"INBOX": [(1, mirea), (2, b"broken")]})
+    real = email_otp._otp_candidate
+
+    def flaky(raw, not_before):
+        if raw == b"broken":
+            raise ValueError("malformed")
+        return real(raw, not_before)
+
+    monkeypatch.setattr(email_otp, "_otp_candidate", flaky)
+
+    assert (
+        ImapOtpReader().wait_for_code(EmailAccount("student@gmail.com", "pw"), now, timeout=60)
+        == "482913"
+    )
+
+
+def test_rambler_is_detected():
+    account = EmailAccount("student@rambler.ru", "password").normalized()
+    assert account.provider == "rambler"
+    assert account.imap_host == "imap.rambler.ru"
+
+
+def test_undetected_provider_explains_how_to_set_the_server():
+    with pytest.raises(ValueError, match="Другой сервер IMAP"):
+        EmailAccount("student@edu.example.ru", "password").normalized()
+
+
+@pytest.mark.parametrize("address", ["a@yandex.ru", "a@mail.ru"])
+def test_grouped_app_password_is_joined_for_yandex_and_mailru(address):
+    assert EmailAccount(address, "abcd efgh ijkl mnop").normalized().password == "abcdefghijklmnop"

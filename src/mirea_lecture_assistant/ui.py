@@ -76,10 +76,11 @@ def _update_imap_fields(combo: QComboBox, host: QLineEdit, port: QSpinBox, hint:
         port.setValue(993)
         host.setPlaceholderText("Определится по адресу")
     messages = {
-        "auto": "Gmail, Яндекс, Mail.ru и Outlook определяются по адресу. Для другой почты выберите ручной IMAP.",
+        "auto": "Gmail, Яндекс, Mail.ru, Рамблер и Outlook определяются по адресу. Для другой почты выберите ручной IMAP.",
         "gmail": 'Нужен <a href="https://myaccount.google.com/apppasswords">пароль приложения Google</a>.',
         "yandex": 'Включите IMAP и создайте <a href="https://id.yandex.ru/security/app-passwords">пароль приложения для Почты</a>. Вводить нужно сам пароль, не его название. Если адрес — алиас, укажите основной логин Яндекс ID в поле «Логин IMAP».',
         "mailru": 'Создайте <a href="https://help.mail.ru/mail/login/mailer/">пароль для внешнего приложения Mail.ru</a>.',
+        "rambler": "В настройках Рамблер Почты включите доступ для почтовых программ (IMAP) и укажите пароль от почты.",
         "microsoft": "Microsoft требует OAuth2; пароль сработает только для аккаунтов, где разрешён пароль приложения. Иначе код нужно ввести вручную.",
         "custom": "Укажите SSL/TLS IMAP-сервер и порт своего почтового провайдера.",
     }
@@ -956,6 +957,11 @@ class MainWindow(QMainWindow):
                     email_credentials = self.session_store.load_email_credentials()
                 except Exception:  # noqa: BLE001
                     email_credentials = None
+            # The flow stays "in progress" until the code is submitted: a second
+            # login started meanwhile (schedule recovery, the watchdog) would
+            # replace the SSO client and the code from this email would be sent
+            # to the wrong flow. Slow providers (Яндекс, Mail.ru) hit that window.
+            self.login_in_progress = True
             if email_credentials:
                 self._run(
                     lambda: self.otp_reader.wait_for_code(
@@ -1037,6 +1043,8 @@ class MainWindow(QMainWindow):
         prompt = "Не удалось получить код автоматически. Введите код из письма:"
         if reason:
             prompt = f"{prompt}\n\n{reason}"
+        # Timers keep firing while the dialog is open; no second login meanwhile.
+        self.login_in_progress = True
         code, ok = QInputDialog.getText(self, "Двухфакторная авторизация", prompt)
         if ok and code.strip():
             self._complete_2fa(challenge, code.strip())
@@ -1120,6 +1128,9 @@ class MainWindow(QMainWindow):
     def _session_verified(self, state: SessionState):
         log.info("stored_session_verified state=%s", state.value)
         if state is SessionState.EXPIRED:
+            # A kept stale session makes the background schedule refresh fail and
+            # start a recovery login on top of this one.
+            self.mirea.session = {}
             self._auto_login()
             return
         if state is SessionState.UNKNOWN:

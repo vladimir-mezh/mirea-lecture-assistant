@@ -250,3 +250,37 @@ def test_finishing_a_room_discards_its_in_memory_qr(window):
 
     assert not window.pending_qr
     assert not window.latest_qr_event_by_lesson
+
+
+def test_session_recovery_does_not_start_a_second_login_while_the_code_is_awaited(
+    window, monkeypatch
+):
+    """Slow mail (Яндекс, Mail.ru) used to let the minute timer start another SSO flow."""
+    from mirea_lecture_assistant.email_otp import EmailAccount
+
+    window.pending_email_credentials = EmailAccount("student@mail.ru", "app-password")
+    window.mirea.session = {"cookie": "stale"}
+    started = []
+    monkeypatch.setattr(
+        window, "_run", lambda function, *_args, **_kwargs: started.append(function)
+    )
+    monkeypatch.setattr(window, "_auto_login", lambda: started.append("second-login"))
+
+    window._login_finished(SimpleNamespace(challenge="challenge", success=False, message=""))
+    window._recover_expired_session("schedule_refresh")
+
+    assert window.login_in_progress
+    assert "second-login" not in started
+    assert len(started) == 1  # only the email wait itself
+
+
+def test_expired_saved_session_is_dropped_before_automatic_login(window, monkeypatch):
+    window.mirea.session = {"cookie": "expired"}
+    sessions_at_login = []
+    monkeypatch.setattr(
+        window, "_auto_login", lambda: sessions_at_login.append(dict(window.mirea.session))
+    )
+
+    window._session_verified(SessionState.EXPIRED)
+
+    assert sessions_at_login == [{}]
