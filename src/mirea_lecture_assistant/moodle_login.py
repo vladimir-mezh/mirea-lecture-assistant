@@ -85,6 +85,10 @@ async def sign_in(
             log.info("sdo_sign_in_not_needed")
             return "already"
         raise SignInFailed("Страница входа МИРЭА не открылась")
+    host = (urlparse(page.url).hostname or "").lower()
+    if host != "mirea.ru" and not host.endswith(".mirea.ru"):
+        # The password is typed only into MIREA's own sign-in form.
+        raise SignInFailed("Форма входа открылась не на сайте МИРЭА")
     # The shared SSO budget is spent only when credentials are actually sent;
     # a live session that needs no form costs nothing.
     if reserve_attempt is not None and not reserve_attempt():

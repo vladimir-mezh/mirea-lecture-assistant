@@ -16,12 +16,15 @@ import logging
 import urllib.request
 from collections import deque
 from collections.abc import Callable
+from urllib.parse import urlparse
 
 log = logging.getLogger(__name__)
 
 # The debugging endpoint is local; a system proxy must never be asked for it.
 _LOCAL = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 _POLL_SECONDS = 0.1
+# Setting up a tab's session is quick when the tab is healthy.
+_ATTACH_SECONDS = 10.0
 
 # Element helpers run inside the page. "Visible" follows what a person sees:
 # rendered with a size, not hidden by style.
@@ -33,9 +36,20 @@ const visible = element => {
   const rect = element.getBoundingClientRect();
   return rect.width > 0 && rect.height > 0;
 };
+const inChat = element => Boolean(element.closest(
+  "[class*='chat' i], [class*='comment' i], [role='log']"));
+const leavesSite = element => {
+  if (element.tagName !== 'A' || !element.href) return false;
+  if (element.target === '_blank') return true;
+  try { return new URL(element.href, location.href).origin !== location.origin; }
+  catch (error) { return true; }
+};
+const label = element => ((element.innerText || element.value || '').trim()).slice(0, 60);
 const describe = (element, index) => ({
   index,
   visible: visible(element),
+  chat: inChat(element),
+  external: leavesSite(element),
   text: (element.innerText || '').trim(),
   value: 'value' in element ? String(element.value || '') : '',
   placeholder: element.getAttribute('placeholder')
@@ -59,17 +73,44 @@ class CdpTimeout(CdpError, TimeoutError):
     """What was waited for did not happen in time."""
 
 
-def debugger_url(port: int, timeout: float = 3.0) -> str:
+def _version(port: int, timeout: float) -> dict:
     with _LOCAL.open(f"http://127.0.0.1:{port}/json/version", timeout=timeout) as response:
-        return json.loads(response.read())["webSocketDebuggerUrl"]
+        info = json.loads(response.read())
+    if not isinstance(info, dict):
+        raise CdpError("Порт отладки отвечает не как браузер")
+    return info
 
 
-def endpoint_alive(port: int, timeout: float = 0.3) -> bool:
+def debugger_url(port: int, timeout: float = 3.0) -> str:
+    """The browser's WebSocket address, checked to stay on this very port.
+
+    Any local program answering on a stale port could otherwise hand us an
+    address of its own, and we would type the MIREA password into it.
+    """
+    url = str(_version(port, timeout).get("webSocketDebuggerUrl", ""))
+    parsed = urlparse(url)
+    if (
+        parsed.scheme != "ws"
+        or parsed.hostname not in ("127.0.0.1", "localhost")
+        or parsed.port != port
+        or not parsed.path.startswith("/devtools/browser/")
+    ):
+        raise CdpError("Порт отладки отвечает не как браузер приложения")
+    return url
+
+
+def browser_id(url: str) -> str:
+    """The id Chrome gives this browser run, the last part of its WebSocket path."""
+    return urlparse(url).path.rsplit("/", 1)[-1]
+
+
+def endpoint_alive(port: int, timeout: float = 0.3, *, expected_id: str | None = None) -> bool:
+    """Whether our browser answers on ``port``; with ``expected_id``, that very run."""
     try:
-        with _LOCAL.open(f"http://127.0.0.1:{port}/json/version", timeout=timeout):
-            return True
-    except OSError:
+        url = debugger_url(port, timeout)
+    except (OSError, ValueError, KeyError, CdpError):
         return False
+    return expected_id is None or browser_id(url) == expected_id
 
 
 class Browser:
@@ -116,8 +157,9 @@ class Browser:
             if not page.is_closed() and not page.url.startswith("devtools://")
         ]
 
-    async def new_page(self, url: str = "about:blank") -> Page:
-        target_id = (await self.send("Target.createTarget", {"url": url}))["targetId"]
+    async def new_page(self, url: str = "about:blank", *, background: bool = False) -> Page:
+        params = {"url": url, "background": background}
+        target_id = (await self.send("Target.createTarget", params))["targetId"]
         page = self._pages.get(target_id)
         if page is None:
             page = self._pages[target_id] = Page(self, target_id, url)
@@ -239,8 +281,12 @@ class Page:
         self._attach_lock: asyncio.Lock | None = None
         self._frame_id: str | None = None
         self._loader_id: str | None = None
-        self._lifecycle: deque[tuple[str, str]] = deque(maxlen=200)
-        self._waiters: list[tuple[Callable[[str, str], bool], asyncio.Future]] = []
+        # (sequence, loader, name): the sequence tells events after a command
+        # from the history before it.
+        self._lifecycle: deque[tuple[int, str, str]] = deque(maxlen=200)
+        self._sequence = itertools.count(1)
+        self._last_sequence = 0
+        self._waiters: list[tuple[Callable[[int, str, str], bool], asyncio.Future]] = []
 
     @property
     def url(self) -> str:
@@ -260,18 +306,44 @@ class Page:
             if self._session_id:
                 return self._session_id
             result = await self._browser.send(
-                "Target.attachToTarget", {"targetId": self.target_id, "flatten": True}
+                "Target.attachToTarget",
+                {"targetId": self.target_id, "flatten": True},
+                timeout=_ATTACH_SECONDS,
             )
             session_id = result["sessionId"]
             self._browser._sessions[session_id] = self
-            self._session_id = session_id
-            await self.send("Page.enable")
-            await self.send("Page.setLifecycleEventsEnabled", {"enabled": True})
-            # A minimised or covered window must still behave, and render, as focused.
-            await self.send("Emulation.setFocusEmulationEnabled", {"enabled": True})
-            frame = (await self.send("Page.getFrameTree"))["frameTree"]["frame"]
+
+            async def call(method, params=None):
+                return await self._browser.send(
+                    method, params, session_id=session_id, timeout=_ATTACH_SECONDS
+                )
+
+            try:
+                # A dialog already open would block even Page.enable; answering
+                # when there is none just returns an error.
+                try:
+                    await call("Page.handleJavaScriptDialog", {"accept": True})
+                except CdpError:
+                    pass
+                await call("Page.enable")
+                await call("Page.setLifecycleEventsEnabled", {"enabled": True})
+                # A minimised or covered window must still behave, and render, as focused.
+                await call("Emulation.setFocusEmulationEnabled", {"enabled": True})
+                frame = (await call("Page.getFrameTree"))["frameTree"]["frame"]
+            except BaseException:
+                # A half-set-up session (no lifecycle events, no frame) used to be
+                # kept for good and every later navigation of the tab timed out.
+                self._browser._sessions.pop(session_id, None)
+                try:
+                    await self._browser.send(
+                        "Target.detachFromTarget", {"sessionId": session_id}, timeout=3
+                    )
+                except CdpError:
+                    log.debug("cdp_detach_after_failed_attach_failed", exc_info=True)
+                raise
             self._frame_id = frame["id"]
             self._loader_id = frame.get("loaderId")
+            self._session_id = session_id
             return session_id
 
     async def send(self, method: str, params: dict | None = None, *, timeout: float = 30.0):
@@ -281,13 +353,21 @@ class Page:
         return await self._browser.send(method, params, session_id=session_id, timeout=timeout)
 
     def _on_event(self, method: str, params: dict) -> None:
-        if method == "Page.lifecycleEvent" and params.get("frameId") == self._frame_id:
+        if method == "Page.javascriptDialogOpening":
+            # alert/confirm/beforeunload block the page until answered: an
+            # unanswered "leave the webinar?" froze the tab — every screenshot
+            # and script timed out. Answer at once.
+            log.info("cdp_dialog_dismissed type=%s", params.get("type", ""))
+            asyncio.get_running_loop().create_task(self._answer_dialog())
+        elif method == "Page.lifecycleEvent" and params.get("frameId") == self._frame_id:
             loader, name = params.get("loaderId", ""), params.get("name", "")
             if name == "init":
                 self._loader_id = loader
-            self._lifecycle.append((loader, name))
+            sequence = next(self._sequence)
+            self._last_sequence = sequence
+            self._lifecycle.append((sequence, loader, name))
             for predicate, future in list(self._waiters):
-                if not future.done() and predicate(loader, name):
+                if not future.done() and predicate(sequence, loader, name):
                     future.set_result(loader)
         elif method == "Page.frameNavigated" and not params["frame"].get("parentId"):
             frame = params["frame"]
@@ -297,13 +377,19 @@ class Page:
         elif method == "Page.navigatedWithinDocument" and params.get("frameId") == self._frame_id:
             self._url = params.get("url", self._url)
 
+    async def _answer_dialog(self) -> None:
+        try:
+            await self.send("Page.handleJavaScriptDialog", {"accept": True}, timeout=5)
+        except CdpError:
+            log.debug("cdp_dialog_answer_failed", exc_info=True)
+
     def _fail_waiters(self, error: Exception) -> None:
         for _predicate, future in self._waiters:
             if not future.done():
                 future.set_exception(error)
 
     async def _wait_lifecycle(self, predicate, timeout_ms: float, what: str) -> None:
-        if any(predicate(loader, name) for loader, name in self._lifecycle):
+        if any(predicate(sequence, loader, name) for sequence, loader, name in self._lifecycle):
             return
         future = asyncio.get_running_loop().create_future()
         entry = (predicate, future)
@@ -322,31 +408,51 @@ class Page:
     async def goto(self, url: str, *, wait_until: str = "load", timeout: float = 30_000) -> None:
         event = {"load": "load", "domcontentloaded": "DOMContentLoaded"}[wait_until]
         await self._session()
+        start = self._last_sequence
         result = await self.send("Page.navigate", {"url": url}, timeout=timeout / 1000)
         if result.get("errorText"):
             raise CdpError(f"Страница не открылась: {result['errorText']}")
         loader = result.get("loaderId")
         if not loader:
             return  # a jump within the same document
-        await self._wait_lifecycle(
-            lambda seen, name: seen == loader and name == event, timeout, event
-        )
+        await self._wait_lifecycle(self._loaded_since(start, event, loader), timeout, event)
+
+    def _loaded_since(self, start: int, event: str, loader: str | None = None):
+        """Match ``event`` of the navigated document or of any document after it.
+
+        A script redirect while the page parses replaces the navigated document
+        before it fires DOMContentLoaded; its successor loads instead.
+        """
+
+        def predicate(sequence: int, seen: str, name: str) -> bool:
+            if sequence <= start or name != event:
+                return False
+            if seen == loader:
+                return True
+            return any(
+                later > start and started == seen and kind == "init"
+                for later, started, kind in self._lifecycle
+            )
+
+        return predicate
 
     async def reload(self, *, timeout: float = 30_000) -> None:
         await self._session()
-        previous = self._loader_id
+        start = self._last_sequence
         await self.send("Page.reload", timeout=timeout / 1000)
+        # Only a document started by this reload counts; the history used to
+        # satisfy the wait at once, before anything was reloaded.
         await self._wait_lifecycle(
-            lambda seen, name: seen != previous and name == "DOMContentLoaded",
-            timeout,
-            "DOMContentLoaded",
+            self._loaded_since(start, "DOMContentLoaded"), timeout, "DOMContentLoaded"
         )
 
     async def wait_for_network_idle(self, timeout: float = 8_000) -> None:
         await self._session()
         loader = self._loader_id
         await self._wait_lifecycle(
-            lambda seen, name: seen == loader and name == "networkIdle", timeout, "networkIdle"
+            lambda _sequence, seen, name: seen == loader and name == "networkIdle",
+            timeout,
+            "networkIdle",
         )
 
     async def wait_for_url(self, predicate: Callable[[str], bool], *, timeout: float) -> None:
@@ -369,8 +475,14 @@ class Page:
 
     # --- page content -------------------------------------------------------
 
-    async def evaluate(self, function: str, arg=None, *, timeout: float = 30.0):
-        """Call a JavaScript function in the page and return its JSON-able result."""
+    async def evaluate(
+        self, function: str, arg=None, *, timeout: float = 30.0, user_gesture: bool = False
+    ):
+        """Call a JavaScript function in the page and return its JSON-able result.
+
+        ``user_gesture`` is for clicks and typing only: a script run "by the
+        user" arms the page's leave-confirmation, so reading the page must not.
+        """
         call = f"({function})({json.dumps(arg, ensure_ascii=False)})"
         result = await self.send(
             "Runtime.evaluate",
@@ -378,7 +490,7 @@ class Page:
                 "expression": call,
                 "returnByValue": True,
                 "awaitPromise": True,
-                "userGesture": True,
+                "userGesture": user_gesture,
             },
             timeout=timeout,
         )
@@ -444,23 +556,40 @@ class Page:
 
     # --- input --------------------------------------------------------------
 
-    async def click(self, selector: str, *, index: int | None = None) -> None:
-        """Click the element like a person would: a real mouse press at its centre."""
+    async def click(
+        self, selector: str, *, index: int | None = None, expect_label: str | None = None
+    ) -> None:
+        """Click the element like a person would: a real mouse press at its centre.
+
+        With ``expect_label`` the element must still carry that label: the page
+        may re-render between reading it and clicking, and then the same index
+        is some other control.
+        """
         box = await self.evaluate(
-            """([s, i]) => {"""
+            """([s, i, expected]) => {"""
             + _JS_HELPERS
             + """ const e = pick(s, i);
                 if (!e) return null;
+                if (expected !== null && label(e) !== expected) return {changed: true};
                 e.scrollIntoView({block: 'center', inline: 'center'});
                 const r = e.getBoundingClientRect();
-                if (r.width > 0 && r.height > 0) return {x: r.x + r.width / 2, y: r.y + r.height / 2};
+                const x = r.x + r.width / 2, y = r.y + r.height / 2;
+                const top = document.elementFromPoint(x, y);
+                // Covered by an overlay, or not laid out: the mouse would hit
+                // something else, so the element is clicked directly.
+                if (r.width > 0 && r.height > 0 && top && (top === e || e.contains(top))) {
+                  return {x, y};
+                }
                 e.click();
                 return {clicked: true};
             }""",
-            [selector, index],
+            [selector, index, expect_label],
+            user_gesture=True,
         )
         if box is None:
             raise CdpError(f"На странице нет элемента {selector}")
+        if box.get("changed"):
+            raise CdpError("Элемент на странице сменился, нажатие отменено")
         if box.get("clicked"):
             return
         point = {"x": box["x"], "y": box["y"], "button": "left", "clickCount": 1}
@@ -482,6 +611,7 @@ class Page:
                 return true;
             }""",
             [selector, index],
+            user_gesture=True,
         )
         if not found:
             raise CdpError(f"На странице нет поля {selector}")

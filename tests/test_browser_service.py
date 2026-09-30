@@ -64,6 +64,7 @@ def test_reopening_the_same_mts_room_reuses_the_existing_tab(service, monkeypatc
 
     class Page:
         url = meeting
+        target_id = "lecture-tab"
 
         def __init__(self):
             self.navigations = 0
@@ -109,10 +110,11 @@ def test_the_newest_tab_of_the_platform_wins(service):
     assert service._pick_lecture_page([older, newer]) is newer
 
 
-def test_without_a_known_lecture_the_last_tab_is_used(service):
+def test_without_a_known_lecture_no_tab_is_taken(service):
+    """The newest tab used to be taken: a helper tab or one the student opened."""
     pages = [FakePage("https://example.test/a"), FakePage("https://example.test/b")]
 
-    assert service._pick_lecture_page(pages) is pages[1]
+    assert service._pick_lecture_page(pages) is None
 
 
 def test_no_tabs_means_no_choice(service):

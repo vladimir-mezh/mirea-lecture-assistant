@@ -45,7 +45,10 @@ ROOM = """<!doctype html><html><head><meta charset="utf-8"><title>Лекция</
   <img id="qr" src="/qr.png">
   <button aria-label="Чат" onclick="toggleChat()">💬</button>
   <div class="chat-panel">
-    <div id="messages"><div>Петров: переподключитесь, у кого звук пропал</div></div>
+    <div id="messages">
+      <div>Петров: переподключитесь, у кого звук пропал</div>
+      <div>Сидорова: опрос тут <a href="https://forms.example/join" target="_blank">join</a></div>
+    </div>
     <textarea id="chatEditor" placeholder="Введите сообщение"
       onkeydown="send(event, this)"></textarea>
   </div>
@@ -53,6 +56,8 @@ ROOM = """<!doctype html><html><head><meta charset="utf-8"><title>Лекция</
 <div id="ended" style="display:none">Вебинар завершён</div>
 <script>
   function enter() {
+    // Like the real platform: leaving a joined room asks for confirmation.
+    window.onbeforeunload = event => { event.preventDefault(); event.returnValue = ''; };
     document.getElementById('who').textContent = document.getElementById('name').value;
     document.getElementById('lobby').style.display = 'none';
     document.getElementById('room').style.display = 'block';
@@ -111,6 +116,10 @@ class Site(http.server.BaseHTTPRequestHandler):
             body, kind = ROOM.encode(), "text/html; charset=utf-8"
         elif self.path == "/qr.png":
             body, kind = self.qr_png, "image/png"
+        elif self.path.startswith("/redirect/"):
+            # The page replaces itself while it is still being parsed.
+            body = b"<!doctype html><script>location.replace('/event/777')</script>"
+            kind = "text/html; charset=utf-8"
         elif self.path.startswith("/mod/webinars/"):
             body, kind = WEBINARS.encode(), "text/html; charset=utf-8"
         else:
@@ -208,3 +217,48 @@ def test_the_finished_lecture_tab_closes_but_the_browser_stays(room):
     service.lecture_url = f"http://mts-link.ru:{http_port}/event/12345"
     assert service.close_lecture_tab() is True
     assert service.is_running
+
+
+def test_a_leave_confirmation_or_an_alert_never_freezes_the_lecture_tab(room):
+    """An unanswered "leave the webinar?" used to time out every capture after a reload."""
+    service, http_port = room
+    lecture = f"http://mts-link.ru:{http_port}/event/555"
+    service.open(lecture)
+    assert service.join_lecture("Иванов Иван") == "joined"  # arms onbeforeunload
+    page = run_async(service._active_page())
+
+    started = time.monotonic()
+    service.open(lecture, force_navigation=True)  # the reload recovery
+    run_async(page.evaluate("() => setTimeout(() => alert('Внимание'), 0)"))
+    time.sleep(0.3)
+    png, _text = run_async(service.capture_page_state())
+
+    assert png.startswith(b"\x89PNG")
+    assert time.monotonic() - started < 10
+    assert service.lecture_state() in ("waiting", "live")
+
+
+def test_a_script_redirect_while_loading_still_finishes_the_navigation(room):
+    service, http_port = room
+
+    async def visit(page):
+        await page.goto(f"http://mts-link.ru:{http_port}/redirect/1", timeout=8_000)
+        return page.url
+
+    assert service.run_on_new_page(visit, timeout=15).endswith("/event/777")
+
+
+def test_opening_a_lecture_never_takes_a_helper_tab(room):
+    service, http_port = room
+    browser = run_async(service._connected_browser())
+    helper = run_async(service._helper_page(browser))
+    run_async(helper.goto(f"http://online-edu.mirea.ru:{http_port}/mod/webinars/view.php?id=2"))
+    helper_url = helper.url
+    service.lecture_url = None
+    service._lecture_target = None
+
+    service.open(f"http://mts-link.ru:{http_port}/event/999")
+
+    assert helper.url == helper_url
+    service._helper_targets.discard(helper.target_id)
+    run_async(helper.close())

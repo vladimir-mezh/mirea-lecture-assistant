@@ -470,6 +470,7 @@ class MainWindow(QMainWindow):
         self.lecture_health_check_running = False
         self.entering_lecture_room = False
         self.lecture_recovery_failures = 0
+        self.lecture_unstable_checks = 0
         QTimer.singleShot(0, self._startup_auth)
 
     def _build_ui(self):
@@ -2188,6 +2189,15 @@ class MainWindow(QMainWindow):
 
         def checked(state: str):
             self.lecture_health_check_running = False
+            if state == "unstable":
+                # A reconnect banner is usually gone within seconds: act only if
+                # it is still there at the next check.
+                self.lecture_unstable_checks += 1
+                if self.lecture_unstable_checks < 2:
+                    return
+                state = "lost"
+            else:
+                self.lecture_unstable_checks = 0
             if state == "live":
                 self.lecture_recovery_failures = 0
                 return
