@@ -569,3 +569,47 @@ def test_something_that_is_not_a_group_is_rejected():
     assert not is_group_code("ИКБО")
     assert not is_group_code("32-23")
     assert not is_group_code("моя группа ИКБО-11-99")
+
+
+OTHER_JOIN = (
+    '<button class="btn wb2-join-btn" data-id="188790" '
+    'data-href="https://my.mts-link.ru/j/10000001/20000000009">Подключиться</button>'
+)
+
+
+def _resolve(html: str, **kwargs):
+    return resolve_lecture_url(
+        lambda _url: html,
+        [MODULE_URL],
+        subject=SUBJECT,
+        start_at=LESSON_START,
+        end_at=LESSON_END,
+        group="ИКБО-11-99",
+        **kwargs,
+    )
+
+
+def test_a_webinar_whose_scheduled_end_has_passed_is_not_chosen():
+    """A room that is already over opened on the first real lecture and ended at once."""
+    after_its_end = datetime.fromtimestamp(1788426702).astimezone() + timedelta(minutes=30)
+
+    assert _resolve(page(row()), now=after_its_end) is None
+    # Without a clock (history, tests of old pages) nothing changes.
+    assert _resolve(page(row())) is not None
+
+
+def test_a_webinar_still_running_is_chosen_even_near_its_end():
+    near_its_end = datetime.fromtimestamp(1788426702).astimezone() - timedelta(minutes=1)
+
+    assert _resolve(page(row()), now=near_its_end) is not None
+
+
+def test_a_room_that_turned_out_to_be_over_is_skipped_for_another_one():
+    dead = "https://my.mts-link.ru/j/10000001/20000000002"
+    html = page(row(), row(epoch=1788415200 + 600, action=OTHER_JOIN))
+
+    first = _resolve(html)
+    second = _resolve(html, excluded=frozenset({dead}))
+
+    assert first.join_url == dead
+    assert second.join_url == "https://my.mts-link.ru/j/10000001/20000000009"

@@ -494,3 +494,87 @@ def test_schedule_modes_are_shown_in_russian(window):
     window.subject_rule_subject.setCurrentText("Физика")
     window.subject_rule_mode.setCurrentIndex(window.subject_rule_mode.findData("AUTO"))
     assert window.db.get_rule("Физика") is RuleMode.AUTO
+
+
+def _watch_room_that_says_ended(window, monkeypatch, lesson):
+    today = datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
+    window.db.sync_lessons([lesson], today)
+    room = "https://my.mts-link.ru/j/1/2"
+    window.db.set_resolved_link(lesson.external_id, room)
+    window.joined_lessons.add(lesson.external_id)
+    window.active_lecture_id = lesson.external_id
+    window.active_lecture_url = room
+    calls = {"lookups": [], "closed": []}
+    monkeypatch.setattr(window, "_resolve_from_sources", calls["lookups"].append)
+
+    def run(function, done, *_args, **_kwargs):
+        if function == window.browser.lecture_state:
+            done("ended")
+        elif function == window.browser.close_lecture_tab:
+            calls["closed"].append(True)
+
+    monkeypatch.setattr(window, "_run", run)
+    monkeypatch.setattr(type(window.browser), "probably_running", property(lambda _self: True))
+    window._lecture_watch_tick()
+    return room, calls
+
+
+def test_a_room_that_ends_long_before_the_pair_is_replaced(window, monkeypatch):
+    """The first real lecture: a dead room left the app on about:blank for the whole pair."""
+    lesson = _running_lesson("early")
+    room, calls = _watch_room_that_says_ended(window, monkeypatch, lesson)
+
+    assert window.active_lecture_id is None
+    assert window.db.get_resolved_link("early") == ""
+    assert room in window._rejected_rooms("early")
+    assert "early" not in window.joined_lessons
+    assert [item.external_id for item in calls["lookups"]] == ["early"]
+    assert calls["closed"] == []  # the next room opens in the same tab
+
+
+def test_a_room_that_ends_with_the_pair_just_finishes(window, monkeypatch):
+    now = datetime.now().astimezone()
+    lesson = Lesson(
+        "over", "Надёжность", "ЛК", now - timedelta(minutes=85), now + timedelta(minutes=5)
+    )
+    room, calls = _watch_room_that_says_ended(window, monkeypatch, lesson)
+
+    assert window.active_lecture_id is None
+    assert window.db.get_resolved_link("over") == room
+    assert calls["lookups"] == []
+    assert calls["closed"] == [True]
+
+
+def test_a_rejected_room_is_not_reopened_from_the_cache(window, monkeypatch):
+    lesson = _running_lesson("cached")
+    today = datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
+    window.db.sync_lessons([lesson], today)
+    window.db.set_rule(lesson.subject_name, RuleMode.AUTO)
+    window.db.set_resolved_link("cached", "https://my.mts-link.ru/j/1/2")
+    window._reject_room("cached", "https://my.mts-link.ru/j/1/2")
+    opened, lookups = [], []
+    monkeypatch.setattr(window, "_open_lecture", lambda url, lesson_id: opened.append(url))
+    monkeypatch.setattr(window, "_resolve_from_sources", lookups.append)
+
+    window._evaluate_current_lessons(window.db.list_lessons())
+
+    assert opened == []
+    assert [item.external_id for item in lookups] == ["cached"]
+
+
+def test_a_rejected_room_becomes_eligible_again_later(window, monkeypatch):
+    from mirea_lecture_assistant import ui
+
+    window._reject_room("lesson", "https://my.mts-link.ru/j/1/2")
+    later = ui.time.time() + ui.REJECTED_ROOM_SECONDS + 1
+    monkeypatch.setattr(ui.time, "time", lambda: later)
+
+    assert window._rejected_rooms("lesson") == frozenset()
+
+
+def test_a_link_typed_by_the_student_overrides_a_rejection(window):
+    window._reject_room("lesson", "https://my.mts-link.ru/j/1/2")
+
+    window._save_lesson_link("lesson", "https://my.mts-link.ru/j/1/2")
+
+    assert window._rejected_rooms("lesson") == frozenset()
