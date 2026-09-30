@@ -18,6 +18,8 @@ SESSION_EXPIRED_MESSAGE = re.compile(
 )
 NO_LESSONS_MESSAGE = "Нет пар в ближайшие дни"
 PULSE_COOKIE = ".AspNetCore.Cookies"
+TOKEN_KEYS = frozenset({"access_token", "refresh_token", "token_type", "expires_in"})
+REDIRECTS = (301, 302, 303, 307, 308)
 # pymirea's wording where it misleads: this one advises a new login that cannot help.
 PLAIN_MESSAGES = {
     "Не удалось получить cookie (.AspNetCore.Cookies). Перелогиньтесь.": (
@@ -151,6 +153,8 @@ class MireaService:
         day's own answer, so a free day is not taken for a refusal.
         """
         state = await self._pulse_verdict_once()
+        if state is SessionState.UNKNOWN and await self._break_redirect_loop():
+            state = await self._pulse_verdict_once()
         saved = self.session.pop(PULSE_COOKIE, None) if state is SessionState.EXPIRED else None
         if saved is not None:
             # pymirea sends a saved cookie as is and never replaces it, and with one
@@ -193,6 +197,76 @@ class MireaService:
             await api.close()
         return self._verdict(message)
 
+    async def _break_redirect_loop(self) -> bool:
+        """Drop the SSO browser cookies when the Pulse sign-in went round in circles.
+
+        Keycloak loops when an old copy of its cookies (kept in the session,
+        sent for every *.mirea.ru host) meets the fresh ones it sets: pymirea's
+        bootstrap then failed with TooManyRedirects at every start. The tokens
+        stay, so pymirea continues with them or refreshes them. True if the last
+        request looped and cookies were dropped.
+        """
+        import httpx
+
+        if not isinstance(_upstream_failure.get(), httpx.TooManyRedirects):
+            return False
+        await self._trace_bootstrap()
+        stale = sorted(
+            key for key in self.session if key not in TOKEN_KEYS and not str(key).startswith("__")
+        )
+        for key in stale:
+            self.session.pop(key, None)
+        log.warning("pulse_redirect_loop_cookies_dropped names=%s", ",".join(stale) or "-")
+        _upstream_failure.set(None)
+        return bool(stale)
+
+    async def _trace_bootstrap(self) -> None:
+        """Where the bootstrap goes round, for the journal: hosts, paths, cookie names."""
+        import httpx
+        from pymirea.grades import MireaGrades
+        from pymirea.tokens import get_authorization_header
+
+        jar = httpx.Cookies()
+        for name, value in self.session.items():
+            if value and name not in TOKEN_KEYS and not str(name).startswith("__"):
+                jar.set(str(name), str(value), domain=".mirea.ru")
+        headers = {"Origin": MireaGrades.APP_URL, "Referer": f"{MireaGrades.APP_URL}/"}
+        authorization = get_authorization_header(self.session)
+        if authorization:
+            headers["Authorization"] = authorization
+        url = f"{MireaGrades.AUTH_LOGIN_URL}?redirectUri=%2Fapi%2Fbaseinfo"
+        hops: list[str] = []
+        try:
+            async with httpx.AsyncClient(
+                cookies=jar,
+                follow_redirects=False,
+                timeout=httpx.Timeout(15.0, connect=8.0),
+                transport=httpx.AsyncHTTPTransport(retries=0),
+            ) as client:
+                for _ in range(12):
+                    response = await client.get(url, headers=headers)
+                    names = sorted(
+                        {
+                            item.split("=", 1)[0].strip()
+                            for item in response.headers.get_list("set-cookie")
+                        }
+                    )
+                    hops.append(
+                        f"{response.status_code} {response.url.host}{response.url.path}"
+                        f" set={','.join(names) or '-'}"
+                    )
+                    location = response.headers.get("location")
+                    if response.status_code not in REDIRECTS or not location:
+                        break
+                    url = str(response.url.join(location))
+        except Exception as exc:  # noqa: BLE001 - a diagnostic must never fail the caller
+            hops.append(f"error {type(exc).__name__}")
+        log.warning(
+            "pulse_redirect_trace sent=%s hops=%s",
+            ",".join(sorted(jar.keys())) or "-",
+            " | ".join(hops),
+        )
+
     async def _verdict_from_schedule(self, api) -> SessionState:
         """For a pymirea without the internals ``pulse_verdict`` relies on."""
         result = await api.get_schedule(days=1)
@@ -217,6 +291,8 @@ class MireaService:
         finally:
             await api.close()
         if not result.success:
+            if not _retried and await self._break_redirect_loop():
+                return await self.get_schedule(days, _retried=True)
             message = result.message or "Не удалось получить расписание"
             if message == NO_LESSONS_MESSAGE:
                 # pymirea says this both for free days and when every request

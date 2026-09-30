@@ -167,3 +167,49 @@ def test_a_maintenance_page_does_not_cost_the_saved_cookie(pulse):
 
     assert asyncio.run(MireaService(session).verify_state()) is SessionState.UNKNOWN
     assert session[".AspNetCore.Cookies"] == "still-good"
+
+
+def _looping_keycloak(request: httpx.Request) -> httpx.Response:
+    """Keycloak going round in circles while an old copy of its cookie is sent along."""
+    if request.url.path == "/api/auth/login":
+        return httpx.Response(302, headers={"Location": LOGIN_PAGE})
+    if request.url.host == "sso.mirea.ru" and request.url.path.endswith("/token"):
+        return httpx.Response(200, json={"access_token": "new", "refresh_token": "r2"})
+    if request.url.host == "sso.mirea.ru":
+        if "AUTH_SESSION_ID=stale" in request.headers.get("cookie", ""):
+            return httpx.Response(
+                302, headers={"Location": "https://pulse.mirea.ru/api/auth/login?redirectUri=%2F"}
+            )
+        return httpx.Response(200, html="<html><form id=kc-form-login></form></html>")
+    if request.url.path.startswith("/rtu_tc."):
+        return httpx.Response(
+            200, content=EMPTY_DAY, headers={"Content-Type": "application/grpc-web+proto"}
+        )
+    return httpx.Response(404)
+
+
+def test_a_sign_in_redirect_loop_is_broken_by_dropping_old_sso_cookies(pulse, caplog):
+    """ "Вход в Пульс зациклился на переадресациях" at every start: the session's old
+    SSO cookies are dropped, the tokens carry on, and the journal shows the loop."""
+    pulse.handle = _looping_keycloak
+    session = {
+        "AUTH_SESSION_ID": "stale",
+        "KEYCLOAK_IDENTITY": "old",
+        "access_token": "a",
+        "refresh_token": "r",
+    }
+
+    with caplog.at_level("WARNING", logger="mirea_lecture_assistant.mirea_service"):
+        assert asyncio.run(MireaService(session).verify_state()) is SessionState.VALID
+
+    assert "AUTH_SESSION_ID" not in session and "KEYCLOAK_IDENTITY" not in session
+    assert session["refresh_token"]
+    assert "pulse_redirect_trace" in caplog.text and "sso.mirea.ru" in caplog.text
+    assert "stale" not in caplog.text  # names only, never cookie values
+
+
+def test_a_schedule_refresh_recovers_from_a_sign_in_redirect_loop(pulse):
+    pulse.handle = _looping_keycloak
+    session = {"AUTH_SESSION_ID": "stale", "access_token": "a", "refresh_token": "r"}
+
+    assert asyncio.run(MireaService(session).get_schedule(2)) == []
