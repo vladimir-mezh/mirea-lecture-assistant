@@ -1770,3 +1770,72 @@ def test_failing_captures_reload_the_room_at_most_every_ten_minutes(window, monk
 
     assert len(reopened) == 1
     assert "restart" not in reopened
+
+
+def _wheel_over(widget):
+    from PySide6.QtCore import QPoint, QPointF, Qt
+    from PySide6.QtGui import QWheelEvent
+
+    center = QPointF(widget.rect().center())
+    event = QWheelEvent(
+        center,
+        QPointF(widget.mapToGlobal(widget.rect().center())),
+        QPoint(),
+        QPoint(0, -120),
+        Qt.MouseButton.NoButton,
+        Qt.KeyboardModifier.NoModifier,
+        Qt.ScrollPhase.NoScrollPhase,
+        False,
+    )
+    QApplication.sendEvent(widget, event)
+
+
+def test_the_mouse_wheel_does_not_change_settings_under_the_pointer(window):
+    """Scrolling the settings page used to flip whatever list passed under the pointer."""
+    window._show_page(3)
+    window.resize(900, 400)
+    window.show()
+    provider = window.email_provider.currentIndex()
+    minutes = window.join_before.value()
+
+    _wheel_over(window.email_provider)
+    _wheel_over(window.join_before)
+    _wheel_over(window.join_before.lineEdit())
+
+    assert window.email_provider.currentIndex() == provider
+    assert window.join_before.value() == minutes
+    assert not window._settings_dirty()
+    window.hide()
+
+
+def test_unsaved_settings_are_dropped_when_leaving_the_page(window):
+    window.db.set_setting("join_before", 5)
+    window.db.set_setting("group", "ИКБО-01-24")
+    window._load_settings()
+    window._show_page(3)
+    window.join_before.setValue(20)
+    window.group_edit.setText("ИКБО-99-99")
+    window.group_edit.textEdited.emit("ИКБО-99-99")
+    window.email_address.setText("typed@example.ru")
+    window.email_app_password.setText("never-saved")
+    assert window._settings_dirty()
+
+    window._show_page(0)
+
+    assert window.join_before.value() == 5  # the pair is not prepared 20 min early
+    assert window.group_edit.text() == "ИКБО-01-24"
+    assert window.email_address.text() == ""
+    assert window.email_app_password.text() == ""
+    assert not window._settings_dirty()
+    assert window.db.get_setting("join_before") == 5
+
+
+def test_saved_settings_stay_when_leaving_the_page(window):
+    window._show_page(3)
+    window.join_before.setValue(12)
+    window._save_settings()
+
+    window._show_page(1)
+
+    assert window.join_before.value() == 12
+    assert window.db.get_setting("join_before") == 12
