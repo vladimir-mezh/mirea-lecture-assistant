@@ -9,11 +9,11 @@ import time
 from pathlib import Path
 
 from . import __version__, autostart
-from .async_runtime import shutdown_async_runtime
+from .async_runtime import async_runtime_healthy, shutdown_async_runtime
 from .database import Database
 from .logging_setup import configure_logging
 from .paths import SHOW_REQUEST_FILE, SHOW_RESPONSE_FILE, data_dir, resource_path
-from .supervisor import STARTUP_FAILED
+from .supervisor import STARTUP_FAILED, touch_heartbeat
 from .updater import version_tuple  # noqa: F401 - the second-launch check imports it from here
 
 
@@ -279,6 +279,15 @@ def main() -> int:
         log.info("started_at_sign_in")
     else:
         window.show()
+    heartbeat_timer = QTimer(app)
+
+    def heartbeat():
+        scan_stuck = window.scan_running and time.perf_counter() - window.scan_started_at > 60
+        if not scan_stuck and async_runtime_healthy():
+            touch_heartbeat()
+
+    heartbeat_timer.timeout.connect(heartbeat)
+    heartbeat_timer.start(1_000)
     smoke_test = os.environ.get("MIREA_ASSISTANT_SMOKE_TEST") == "1"
     if smoke_test:
         window.force_exit = True

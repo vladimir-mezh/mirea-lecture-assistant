@@ -30,6 +30,27 @@ def test_state_survives_between_calls():
         runtime.shutdown()
 
 
+def test_an_unresponsive_shared_loop_is_not_healthy(monkeypatch):
+    runtime = AsyncRuntime()
+
+    class Loop:
+        def is_closed(self):
+            return False
+
+        def call_soon_threadsafe(self, callback):
+            pass  # blocked native operation: callback never executes
+
+    class Thread:
+        def is_alive(self):
+            return True
+
+    runtime._loop = Loop()
+    runtime._thread = Thread()
+    runtime._health_at = 0
+    monkeypatch.setattr("mirea_lecture_assistant.async_runtime.time.monotonic", lambda: 61)
+    assert not runtime.healthy()
+
+
 def test_runs_off_the_calling_thread():
     runtime = AsyncRuntime()
     try:

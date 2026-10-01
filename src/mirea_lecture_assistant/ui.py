@@ -50,7 +50,7 @@ from PySide6.QtWidgets import (
 
 from . import __version__, autostart, updater
 from .async_runtime import run_async
-from .browser_service import CAPTURE_TIMEOUT_MS, BrowserService, NotSignedInError
+from .browser_service import BrowserService, NotSignedInError
 from .chat_detection import chat_baseline, classmates_report_attendance_issue
 from .database import Database
 from .domain import Lesson, PendingAttendance, RuleMode, SessionState
@@ -63,6 +63,7 @@ from .relative_time import format_relative_time
 from .reliability import (
     attendance_failure_counts_for_chat,
     should_retry_login,
+    transient_login_failure,
 )
 from .security import SessionStore
 
@@ -81,6 +82,10 @@ ATTENDANCE_FAILURE_SPAN_SECONDS = 120
 # is over before then was the wrong room, or the teacher closed it and is about
 # to open another one.
 LEAVE_AFTER_END = timedelta(minutes=5)
+# A frozen stream or failing captures may come from the stream or the computer,
+# not from the tab: a reload is tried, but not again and again (each one leaves
+# and re-enters the room, and a QR shown meanwhile is missed).
+SOFT_RECOVERY_EVERY_SECONDS = 10 * 60
 # While a pair runs, the СДО is checked again for a newer room of this group:
 # often at the start, when teachers recreate rooms, rarely later.
 RECHECK_EARLY_WINDOW = timedelta(minutes=20)
@@ -572,6 +577,7 @@ class MainWindow(QMainWindow):
         self.scan_running = False
         self.scan_started_at = 0.0
         self.last_capture_heartbeat = 0.0
+        self.last_capture_at = 0.0
         self.force_exit = False
         self.pending_login_credentials: tuple[str, str] | None = None
         self.pending_email_credentials: EmailAccount | None = None
@@ -583,6 +589,7 @@ class MainWindow(QMainWindow):
         self.automatic_login_cycle = False
         self.login_retry_attempt = 0
         self.login_retry_scheduled = False
+        self.login_retry_generation = 0
         self.session_recheck_scheduled = False
         self.pending_pulse_login = None
         self.remember_login_requested = False
@@ -641,6 +648,9 @@ class MainWindow(QMainWindow):
         self.entering_lecture_room = False
         self.lecture_recovery_failures = 0
         self.lecture_unstable_checks = 0
+        self.soft_recovery_at: float | None = None
+        if os.environ.get("MIREA_ASSISTANT_SMOKE_TEST") != "1":
+            QTimer.singleShot(0, self._restore_active_lecture)
         QTimer.singleShot(0, self._startup_auth)
         self._sync_autostart()
         self.available_update: updater.Release | None = None
@@ -1605,22 +1615,29 @@ class MainWindow(QMainWindow):
         day. Codes stay safe, as this runs only when no code was requested.
         """
         attempt = self.login_retry_attempt
-        if not should_retry_login(reason) or attempt >= len(AUTO_LOGIN_RETRY_MINUTES):
+        if not should_retry_login(reason):
             self._schedule_login_retry(reason)
             self._background_problem(
                 "Автовход не удался", f"{reason}\n\nВойдите вручную: «Войти в MIREA»."
             )
             return
-        minutes = AUTO_LOGIN_RETRY_MINUTES[attempt]
+        minutes = AUTO_LOGIN_RETRY_MINUTES[min(attempt, len(AUTO_LOGIN_RETRY_MINUTES) - 1)]
         self.login_retry_attempt += 1
         self.login_retry_scheduled = True
+        self.login_retry_generation += 1
+        generation = self.login_retry_generation
         log.info("automatic_login_retry_scheduled attempt=%s minutes=%s", attempt + 1, minutes)
         self.statusBar().showMessage(
             f"Автовход не удался: {reason.splitlines()[0] if reason else 'ошибка'} "
             f"Повторим через {minutes} мин.",
             15000,
         )
-        QTimer.singleShot(minutes * 60_000, self._run_scheduled_login)
+        QTimer.singleShot(
+            minutes * 60_000,
+            lambda: (
+                self._run_scheduled_login() if generation == self.login_retry_generation else None
+            ),
+        )
 
     def _initial_login_finished(self, payload):
         self.login_in_progress = False
@@ -1639,6 +1656,8 @@ class MainWindow(QMainWindow):
                         "Автовход не удался",
                         result.message or "Код не принят; войдите вручную",
                     )
+                    if transient_login_failure(result.message):
+                        self._retry_automatic_login_later(result.message)
                     return
                 self._manual_2fa(
                     result.challenge,
@@ -1703,6 +1722,8 @@ class MainWindow(QMainWindow):
                         "Автовход не удался",
                         f"{result.message}\n\nКод диагностики: {diagnostic_id}",
                     )
+                    if transient_login_failure(result.message):
+                        self._retry_automatic_login_later(result.message)
                 else:
                     self._retry_automatic_login_later(result.message or "")
                 return
@@ -1786,6 +1807,7 @@ class MainWindow(QMainWindow):
             self.automatic_login_cycle = False
             self._set_auth_state("signed_out")
             self._background_problem("Код не удалось проверить", message)
+            self._retry_automatic_login_later(message)
             return
         self._manual_2fa(challenge, message)
 
@@ -1809,12 +1831,14 @@ class MainWindow(QMainWindow):
             self.automatic_login_cycle = False
             self._set_auth_state("signed_out")
             self._background_problem("Код из почты не получен", message)
+            self._retry_automatic_login_later(message)
             return
         self._manual_2fa(challenge, message)
 
     def _schedule_login_retry(self, reason: str | None = None):
         # Deliberately fail closed: automatic retries can request unlimited OTPs.
         self.login_retry_scheduled = False
+        self.login_retry_generation += 1
         self.automatic_login_cycle = False
         log.warning("automatic_login_stopped reason=%s", reason or "unknown")
         self.statusBar().showMessage("Автовход остановлен. Повторите вход вручную.", 15000)
@@ -1948,6 +1972,7 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(
                 "Автовход ограничен: не более 5 попыток за 30 минут. Войдите вручную.", 15000
             )
+            self._retry_automatic_login_later("Лимит попыток входа; ждём снятия ограничения")
             return
         self.pending_login_credentials = credentials
         self.pending_email_credentials = email_credentials
@@ -2155,6 +2180,42 @@ class MainWindow(QMainWindow):
 
     def _evaluate_cached_lessons(self):
         self._evaluate_current_lessons(self.db.list_lessons())
+
+    def _restore_active_lecture(self):
+        """Resume only a room actually monitored before a crash/update, not old links."""
+        saved = self.db.get_setting("active_lecture", {})
+        if not saved or self.active_lecture_id or self.opening_lecture_id:
+            return
+        lesson = self.db.get_lesson(saved.get("lesson_id"))
+        if lesson is None and isinstance(saved.get("lesson"), dict):
+            try:
+                snapshot = dict(saved["lesson"])
+                snapshot["start_at"] = datetime.fromisoformat(snapshot["start_at"])
+                snapshot["end_at"] = datetime.fromisoformat(snapshot["end_at"])
+                lesson = Lesson(**snapshot)
+                if (
+                    lesson.external_id != saved.get("lesson_id")
+                    or lesson.start_at.tzinfo is None
+                    or lesson.end_at.tzinfo is None
+                ):
+                    lesson = None
+            except (KeyError, ValueError, TypeError):
+                lesson = None
+        now = datetime.now().astimezone()
+        if (
+            lesson is None
+            or not saved.get("url")
+            or not (lesson.start_at <= now <= lesson.end_at + timedelta(hours=2))
+            or self.db.get_rule(lesson.subject_name) is RuleMode.IGNORE
+            or self._superseded(lesson, now)
+        ):
+            self.db.set_setting("active_lecture", {})
+            return
+        self.active_lecture_url = saved["url"]
+        self.active_lesson = lesson
+        self._make_active(lesson.external_id)
+        log.info("lecture_resume_requested lesson_id=%s", lesson.external_id)
+        self._open_lecture(saved["url"], lesson.external_id, force=True)
 
     def _is_current(self, lesson, now: datetime, lead: timedelta | None = None) -> bool:
         lead = timedelta(minutes=self.join_before.value()) if lead is None else lead
@@ -2810,6 +2871,19 @@ class MainWindow(QMainWindow):
             self.chat_config_warned = False
             self.chat_baseline = None
             self.lecture_started_at = time.monotonic()
+            self.last_capture_at = 0.0
+        if lesson_id and self.active_lecture_url:
+            checkpoint = {"lesson_id": lesson_id, "url": self.active_lecture_url}
+            if self.active_lesson is not None:
+                lesson = self.active_lesson
+                checkpoint["lesson"] = {
+                    "external_id": lesson.external_id,
+                    "subject_name": lesson.subject_name,
+                    "lesson_type": lesson.lesson_type,
+                    "start_at": lesson.start_at.isoformat(),
+                    "end_at": lesson.end_at.isoformat(),
+                }
+            self.db.set_setting("active_lecture", checkpoint)
 
     def _lecture_opened(self, browser_name: str, lesson_id: str | None, *, manual: bool = False):
         self.opening_lecture_id = None
@@ -2829,7 +2903,9 @@ class MainWindow(QMainWindow):
         self.active_lecture_url = self.browser.lecture_url
         log.info("lecture_opened lesson_id=%s browser=%s", lesson_id, browser_name)
         self._make_active(lesson_id)
-        self.statusBar().showMessage(f"Лекция открыта в {browser_name}", 4000)
+        self.statusBar().showMessage(
+            f"Страница лекции загружена в {browser_name}; подключаемся…", 4000
+        )
         if self.minimize_on_open.isChecked():
             self._minimize_lecture("Сворачиваем окно лекции…")
         self._enter_lecture_room()
@@ -2876,6 +2952,16 @@ class MainWindow(QMainWindow):
                 state = "lost"
             else:
                 self.lecture_unstable_checks = 0
+            if state == "live" and (
+                self.scan_timer.isActive()
+                and time.monotonic() - (self.last_capture_at or self.lecture_started_at) > 30
+            ):
+                log.warning("lecture_capture_stale")
+                state = "stalled"
+            if state == "stalled":
+                if not self._soft_recovery_due():
+                    return
+                state = "lost"
             if state == "live":
                 self.lecture_recovery_failures = 0
                 return
@@ -2908,6 +2994,18 @@ class MainWindow(QMainWindow):
             "Проверяем вкладку лекции…",
             failed=failed,
         )
+
+    def _soft_recovery_due(self) -> bool:
+        now = time.monotonic()
+        if self.soft_recovery_at is not None and now - self.soft_recovery_at < (
+            SOFT_RECOVERY_EVERY_SECONDS
+        ):
+            return False
+        self.soft_recovery_at = now
+        # The reloaded room gets the same 30 seconds as a new one before its
+        # captures count as stale again.
+        self.last_capture_at = now
+        return True
 
     def _enter_lecture_room(self):
         """Press the platform's entry control, with the student's name if asked for."""
@@ -3004,6 +3102,7 @@ class MainWindow(QMainWindow):
         self._clear_pending_for_lesson(lesson_id)
         self.active_lecture_id = None
         self.active_lecture_url = None
+        self.db.set_setting("active_lecture", {})
         self.lecture_recovery_failures = 0
         if self.scan_timer.isActive():
             self.toggle_scanner()
@@ -3162,6 +3261,7 @@ class MainWindow(QMainWindow):
             log.info("scanner_stopped")
             self._update_now_card()
         else:
+            self.last_capture_at = time.monotonic()
             self.scan_timer.start(self.scan_interval.value() * 1000)
             self.scan_button.setText("Остановить сканирование")
             self.scan_state.setText("● Сканирует")
@@ -3185,12 +3285,9 @@ class MainWindow(QMainWindow):
         self._start_worker(worker, self._scan_results, self._scan_failed, pool=self.scan_pool)
 
     def _scan_source(self, direct_capture: bool):
-        if direct_capture and self.browser.is_running:
-            # Longer than the screenshot's own budget, so a slow 1080p frame is
-            # not cancelled from outside while it is still allowed to finish.
-            png, page_text = run_async(
-                self.browser.capture_page_state(), timeout=CAPTURE_TIMEOUT_MS / 1000 + 4
-            )
+        if direct_capture:
+            # Bound the whole browser operation, not only the screenshot request.
+            png, page_text = run_async(self.browser.capture_page_state(), timeout=4.5)
             return self.scanner.decode_png(png), page_text
         return self.scanner.scan_once(), ""
 
@@ -3198,6 +3295,7 @@ class MainWindow(QMainWindow):
         self.scan_running = False
         batch, page_text = observation
         now = time.monotonic()
+        self.last_capture_at = now
         if now - self.last_capture_heartbeat >= 30:
             self.last_capture_heartbeat = now
             log.info(

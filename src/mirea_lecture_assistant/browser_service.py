@@ -27,7 +27,27 @@ from .moodle import looks_like_login_page
 log = logging.getLogger(__name__)
 
 # Capturing a full-resolution frame of a live stream is slower than a static page.
-CAPTURE_TIMEOUT_MS = 10_000
+CAPTURE_TIMEOUT_MS = 3_000
+MEDIA_STALL_SECONDS = 45
+DOCUMENT_READY = """() => document.readyState !== 'loading' && !!document.body &&
+  (!!document.body.innerText.trim() || !!document.body.querySelector('video, canvas, iframe'))"""
+MEDIA_PROGRESS = (
+    "() => {"
+    + DEEP_ALL_JS
+    + """
+  const candidates = deepAll('video').filter(v =>
+    v.srcObject && v.srcObject.getVideoTracks &&
+    v.srcObject.getVideoTracks().some(t => t.readyState === 'live') &&
+    v.getBoundingClientRect().width > 20 && v.getBoundingClientRect().height > 20);
+  candidates.sort((a, b) => b.getBoundingClientRect().width * b.getBoundingClientRect().height -
+    a.getBoundingClientRect().width * a.getBoundingClientRect().height);
+  const v = candidates[0];
+  if (!v) return null;
+  const q = v.getVideoPlaybackQuality ? v.getVideoPlaybackQuality() : null;
+  const muted = v.srcObject.getVideoTracks().every(t => t.muted);
+  return [v.srcObject.id, v.currentTime, q ? q.totalVideoFrames : 0, muted];
+}"""
+)
 # Room-state phrases are read from the page; a status banner is a short line.
 # Anything longer is a sentence someone typed.
 STATUS_LINE_MAX = 80
@@ -137,6 +157,9 @@ class BrowserService:
         self._connect_lock_loop = None
         # (page, size, CDP session) of the viewport override currently in force.
         self._capture_override = None
+        self._capture_slow_until = 0.0
+        self._media_progress = None
+        self._media_progress_at = 0.0
 
     @property
     def is_running(self) -> bool:
@@ -316,7 +339,30 @@ class BrowserService:
             self._navigate(url, force_navigation=force_navigation)
         if not blank:
             self.lecture_url = url
+            run_async(self._wait_lecture_loaded_async(), timeout=20)
         return browser_name
+
+    async def _wait_lecture_loaded_async(self, timeout: float = 15) -> None:
+        """A Chrome endpoint is not a loaded page; follow popup/redirect tab events."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            browser = await self._connected_browser()
+            page = self._pick_lecture_page(browser.pages)
+            if page is not None:
+                try:
+                    if await page.evaluate(DOCUMENT_READY, timeout=1):
+                        log.info("lecture_page_loaded target=%s", page.target_id)
+                        return
+                except CdpError:
+                    pass  # transient redirect: retry with the current tab list
+            await asyncio.sleep(0.2)
+        raise RuntimeError("Страница лекции не загрузилась: пустая или недоступная вкладка")
+
+    @staticmethod
+    def _usable_lecture_page(page) -> bool:
+        return not getattr(page, "is_closed", lambda: False)() and page.url.lower().startswith(
+            ("https://", "http://")
+        )
 
     def restart(self, url: str, *, muted: bool = True, width: int = 520, height: int = 360) -> str:
         """Escalate recovery by replacing the dedicated browser process."""
@@ -406,10 +452,20 @@ class BrowserService:
             return None
         if self._lecture_target:
             for page in pages:
-                if getattr(page, "target_id", None) == self._lecture_target:
+                if (
+                    getattr(page, "target_id", None) == self._lecture_target
+                    and self._usable_lecture_page(page)
+                    and getattr(page, "target_id", None) not in self._helper_targets
+                ):
                     return page
         if self.lecture_url:
-            matching = [page for page in pages if self._matches_lecture_url(page.url)]
+            matching = [
+                page
+                for page in pages
+                if self._usable_lecture_page(page)
+                and getattr(page, "target_id", None) not in self._helper_targets
+                and self._matches_lecture_url(page.url)
+            ]
             if matching:
                 self._lecture_target = getattr(matching[-1], "target_id", None)
                 return matching[-1]
@@ -452,6 +508,8 @@ class BrowserService:
         if page is None or page.is_closed() or not self._matches_lecture_url(page.url):
             return "lost"
         try:
+            if not await page.evaluate(DOCUMENT_READY, timeout=0.5):
+                return "unstable"
             text = await page.evaluate(VISIBLE_TEXT_WITHOUT_CHAT, CHAT_SELECTOR, timeout=4)
         except CdpTimeout:
             return "lost"  # the page does not answer at all
@@ -468,7 +526,31 @@ class BrowserService:
         if index is not None:
             log.info("lecture_entry_pending label=%s", label)
             return "waiting"
+        try:
+            sample = await page.evaluate(MEDIA_PROGRESS, timeout=0.5)
+            if self._media_stalled(sample, time.monotonic()):
+                log.warning("lecture_media_stalled")
+                # Not a banner: the UI decides how often a reload is worth trying.
+                return "stalled"
+        except CdpError:
+            pass  # unsupported player: retain banner/DOM/capture checks
         return "live"
+
+    def _media_stalled(self, sample, now: float) -> bool:
+        """A static slide is fine: media time still advances. Never compare pixels."""
+        if not sample:
+            self._media_progress = None
+            self._media_progress_at = now
+            return False
+        if len(sample) > 3 and sample[3] is True:
+            # A live track that stopped receiving data may retain an advancing
+            # playback clock. Its muted state must not be hidden by that clock.
+            sample = [sample[0], "muted"]
+        if sample != self._media_progress:
+            self._media_progress = sample
+            self._media_progress_at = now
+            return False
+        return now - self._media_progress_at >= MEDIA_STALL_SECONDS
 
     @classmethod
     def room_state_from_text(cls, text: str) -> str | None:
@@ -529,7 +611,8 @@ class BrowserService:
         await page.click(ENTRY_CONTROLS, index=index, expect_label=label)
         log.info("lecture_join_clicked label=%s", label)
         await page.wait_for_timeout(2_000)
-        return "joined"
+        state = await self._lecture_state_async()
+        return "joined" if state in ("live", "stalled") else "waiting"
 
     async def _fill_display_name(self, page, display_name: str) -> None:
         """Lobbies ask who is entering; an empty field keeps the button disabled."""
@@ -593,6 +676,8 @@ class BrowserService:
         page = self._pick_lecture_page(browser.pages)
         if page is None:
             raise RuntimeError("Вкладка лекции не открыта")
+        if not await page.evaluate(DOCUMENT_READY, timeout=0.5):
+            raise RuntimeError("Страница лекции ещё не загрузилась")
         return page
 
     async def _helper_page(self, browser):
@@ -666,10 +751,13 @@ class BrowserService:
         The override is set once per tab, on the tab's own DevTools session, which
         stays attached: sending it with every frame re-laid out the page each time.
         """
+        target_size = self.capture_size
+        if target_size == (1920, 1080) and time.monotonic() < self._capture_slow_until:
+            target_size = (1280, 720)
         current = self._capture_override
         if current is not None:
             applied_page, applied_size = current
-            if applied_page is page and applied_size == self.capture_size and not page.is_closed():
+            if applied_page is page and applied_size == target_size and not page.is_closed():
                 return
             self._capture_override = None
             if not applied_page.is_closed():
@@ -677,14 +765,14 @@ class BrowserService:
                     await applied_page.send("Emulation.clearDeviceMetricsOverride", {})
                 except Exception:  # the old tab may be going away right now
                     log.debug("capture_override_release_failed", exc_info=True)
-        if not self.capture_size:
+        if not target_size:
             return
-        width, height = self.capture_size
+        width, height = target_size
         await page.send(
             "Emulation.setDeviceMetricsOverride",
             {"width": width, "height": height, "deviceScaleFactor": 1, "mobile": False},
         )
-        self._capture_override = (page, self.capture_size)
+        self._capture_override = (page, target_size)
 
     async def capture_page_state(self) -> tuple[bytes, str]:
         """Capture pixels plus the chat's visible text for roll-call detection.
@@ -694,11 +782,16 @@ class BrowserService:
         """
         page = await self._active_page()
         await self._apply_capture_size(page)
-        # A 1920x1080 frame of a live lecture needs more than the 3.5s that
-        # used to be allowed here: on 24.09 that budget lost 370 frames of 526.
-        png = await page.screenshot(timeout=CAPTURE_TIMEOUT_MS)
+        # Keep rotating QR sampling responsive. Slow HD rendering switches to a
+        # smaller real viewport for one minute; never reuse an old frame/token.
         try:
-            visible_text = await page.evaluate(CHAT_TEXT, CHAT_SELECTOR, timeout=1)
+            png = await page.screenshot(timeout=CAPTURE_TIMEOUT_MS)
+        except CdpTimeout:
+            self._capture_slow_until = time.monotonic() + 60
+            log.warning("capture_resolution_degraded seconds=60")
+            raise
+        try:
+            visible_text = await page.evaluate(CHAT_TEXT, CHAT_SELECTOR, timeout=0.5)
         except Exception:  # noqa: BLE001 - text observation must not break QR capture
             visible_text = ""
         return png, visible_text

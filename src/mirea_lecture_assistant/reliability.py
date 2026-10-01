@@ -30,6 +30,18 @@ def should_retry_login(message: str | None) -> bool:
     return not bool(PERMANENT_LOGIN_ERROR.search(message or ""))
 
 
+def transient_login_failure(message: str | None) -> bool:
+    """A rejected OTP is not permission to loop; explicit outages are retryable."""
+    return bool(
+        re.search(
+            r"timeout|timed out|network|connect|temporar|unavailable|тайм.?аут|"
+            r"не отвечает|недоступ|соединени|ошибка сети|\b(?:429|5\d\d)\b",
+            message or "",
+            re.IGNORECASE,
+        )
+    )
+
+
 def attendance_failure_counts_for_chat(message: str | None) -> bool:
     """Only a real attendance rejection counts toward the public chat fallback."""
     return not bool(TRANSIENT_ATTENDANCE_ERROR.search(message or ""))

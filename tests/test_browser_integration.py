@@ -284,3 +284,25 @@ def test_a_room_rendered_inside_a_frame_is_joined_and_chatted_in(room):
     service.send_chat_message("Петров Пётр ИКБО-01-24")
     page = run_async(service._active_page())
     assert run_async(page.count_text("Петров Пётр ИКБО-01-24")) == 1
+
+
+def test_pinned_blank_tab_is_replaced_by_the_real_lecture_tab(room):
+    service, _http_port = room
+    real = run_async(service._active_page())
+    browser = run_async(service._connected_browser())
+    blank = run_async(browser.new_page(background=True))
+    try:
+        service._lecture_target = blank.target_id
+        assert run_async(service._active_page()).target_id == real.target_id
+        assert service._lecture_target == real.target_id
+    finally:
+        run_async(blank.close())
+
+
+def test_empty_http_document_is_not_a_live_or_capturable_lecture(room):
+    service, _http_port = room
+    page = run_async(service._active_page())
+    run_async(page.evaluate("() => document.body.replaceChildren()"))
+    assert service.lecture_state() == "unstable"
+    with pytest.raises(RuntimeError, match="ещё не загрузилась"):
+        run_async(service.capture_page_state())
