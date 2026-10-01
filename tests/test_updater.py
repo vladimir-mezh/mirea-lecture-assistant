@@ -101,3 +101,37 @@ def test_the_new_version_is_started_as_a_separate_copy(tmp_path, monkeypatch):
     assert kwargs["env"]["PYINSTALLER_RESET_ENVIRONMENT"] == "1"
     assert "MIREA_ASSISTANT_CHILD" not in kwargs["env"]
     assert kwargs["cwd"] == str(tmp_path)
+
+
+def test_old_version_cleanup_preserves_an_active_download(tmp_path):
+    current = tmp_path / updater.EXE_NAME
+    current.write_bytes(b"running")
+    old = current.with_name(current.name + ".old")
+    old.write_bytes(b"old")
+    for suffix in (".download", ".new"):
+        current.with_name(current.name + suffix).write_bytes(b"in progress")
+    assert updater.clean_leftovers(current)
+    assert not old.exists()
+    assert current.read_bytes() == b"running"
+    assert current.with_name(current.name + ".download").read_bytes() == b"in progress"
+    assert current.with_name(current.name + ".new").read_bytes() == b"in progress"
+
+
+def test_locked_old_version_is_retried_after_it_is_released(tmp_path, monkeypatch):
+    current = tmp_path / updater.EXE_NAME
+    old = current.with_name(current.name + ".old")
+    old.write_bytes(b"old")
+    unlink = type(old).unlink
+    locked = [True]
+
+    def guarded(path, **kwargs):
+        if path == old and locked[0]:
+            raise PermissionError("old bootloader still exiting")
+        return unlink(path, **kwargs)
+
+    monkeypatch.setattr(type(old), "unlink", guarded)
+    assert not updater.clean_leftovers(current)
+    assert old.exists()
+    locked[0] = False
+    assert updater.clean_leftovers(current)
+    assert not old.exists()

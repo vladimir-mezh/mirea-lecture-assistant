@@ -5,6 +5,22 @@ from mirea_lecture_assistant import supervisor
 ACCESS_VIOLATION = 0xC0000005
 
 
+def test_watchdog_exit_logging_never_lazily_imports_the_replaced_archive(tmp_path, monkeypatch):
+    import builtins
+
+    original = builtins.__import__
+
+    def guarded(name, *args, **kwargs):
+        if name == "paths" or name.endswith(".paths"):
+            raise RuntimeError("attempted import from replaced archive")
+        return original(name, *args, **kwargs)
+
+    monkeypatch.setattr(supervisor, "data_dir", lambda: tmp_path)
+    monkeypatch.setattr(builtins, "__import__", guarded)
+    supervisor._log("app_ended code=0")
+    assert "app_ended code=0" in (tmp_path / "logs" / "supervisor.log").read_text()
+
+
 def test_hung_child_is_terminated_as_its_own_tree(monkeypatch):
     clock = [0.0]
     killed = []

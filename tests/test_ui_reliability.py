@@ -56,6 +56,19 @@ def test_detected_qr_keeps_the_lesson_that_was_active(window):
     assert pending.lesson_id == "lesson-old"
 
 
+def test_old_version_cleanup_retries_without_an_update_check(window, monkeypatch):
+    from mirea_lecture_assistant import updater
+
+    outcomes = iter([False, True])
+    monkeypatch.setattr(updater, "clean_leftovers", lambda _path: next(outcomes))
+    window.db.set_setting("check_updates", False)
+    window._cleanup_old_version()
+    assert window.update_cleanup_timer.isActive()
+    assert window.update_cleanup_timer.interval() == 5000
+    window._cleanup_old_version()
+    assert not window.update_cleanup_timer.isActive()
+
+
 @pytest.mark.parametrize("method", ["_code_check_failed", "_otp_wait_failed"])
 def test_automatic_email_or_code_outage_schedules_a_fresh_login(window, monkeypatch, method):
     retried = []

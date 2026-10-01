@@ -170,11 +170,14 @@ def start(executable: Path) -> None:
     )
 
 
-def clean_leftovers(current: Path) -> None:
-    """Remove the replaced file once the old copy has quit."""
-    for suffix in (".old", ".download", ".new"):
-        leftover = current.with_name(current.name + suffix)
-        try:
-            leftover.unlink(missing_ok=True)
-        except OSError:
-            pass  # still running or locked; the next start retries
+def clean_leftovers(current: Path) -> bool:
+    """Delete only the old executable; retry locked files without touching downloads."""
+    previous = current.with_name(current.name + ".old")
+    try:
+        existed = previous.exists()
+        previous.unlink(missing_ok=True)
+        if existed:
+            log.info("update_old_version_removed path=%s", previous)
+        return True
+    except OSError:
+        return False  # bootloader/antivirus may still hold it; a timer retries

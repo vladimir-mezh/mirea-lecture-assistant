@@ -17,6 +17,8 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+from .paths import data_dir
+
 CHILD_ENV = "MIREA_ASSISTANT_CHILD"
 # Makes a PyInstaller program started by another copy unpack into its own
 # temporary folder. Without it, a copy started with the same exe path reuses the
@@ -113,8 +115,6 @@ def is_crash(code: int) -> bool:
 
 def _log(message: str) -> None:
     try:
-        from .paths import data_dir
-
         folder = data_dir() / "logs"
         folder.mkdir(parents=True, exist_ok=True)
         with (folder / "supervisor.log").open("a", encoding="utf-8") as file:
