@@ -85,3 +85,19 @@ def test_the_new_file_takes_the_place_of_the_running_one(tmp_path):
 
     updater.clean_leftovers(current)
     assert sorted(path.name for path in tmp_path.iterdir()) == [updater.EXE_NAME]
+
+
+def test_the_new_version_is_started_as_a_separate_copy(tmp_path, monkeypatch):
+    monkeypatch.setenv("MIREA_ASSISTANT_CHILD", "1")
+    monkeypatch.setenv("_PYI_APPLICATION_HOME_DIR", "old-bundle")
+    calls = []
+    monkeypatch.setattr(updater.subprocess, "Popen", lambda *args, **kw: calls.append((args, kw)))
+    executable = tmp_path / updater.EXE_NAME
+
+    updater.start(executable)
+
+    args, kwargs = calls[0]
+    assert args[0] == [str(executable)]
+    assert kwargs["env"]["PYINSTALLER_RESET_ENVIRONMENT"] == "1"
+    assert "MIREA_ASSISTANT_CHILD" not in kwargs["env"]
+    assert kwargs["cwd"] == str(tmp_path)
