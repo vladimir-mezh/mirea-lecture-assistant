@@ -170,11 +170,25 @@ def start(executable: Path) -> None:
     )
 
 
-def clean_leftovers(current: Path) -> None:
-    """Remove the replaced file once the old copy has quit."""
-    for suffix in (".old", ".download", ".new"):
-        leftover = current.with_name(current.name + suffix)
-        try:
-            leftover.unlink(missing_ok=True)
-        except OSError:
-            pass  # still running or locked; the next start retries
+def clean_leftovers(current: Path, *, partial: bool = False) -> bool:
+    """Delete the replaced executable; True once it is gone.
+
+    ``partial`` also removes an unfinished ``.download`` or ``.new`` (an update
+    interrupted by a crash or power loss, ~50 MB each). Only at startup, before an
+    update of this copy can have started: never while a download may be running.
+    """
+    if partial:
+        for suffix in (".download", ".new"):
+            try:
+                current.with_name(current.name + suffix).unlink(missing_ok=True)
+            except OSError:
+                pass
+    previous = current.with_name(current.name + ".old")
+    try:
+        existed = previous.exists()
+        previous.unlink(missing_ok=True)
+        if existed:
+            log.info("update_old_version_removed path=%s", previous)
+        return True
+    except OSError:
+        return False  # bootloader/antivirus may still hold it; a timer retries
