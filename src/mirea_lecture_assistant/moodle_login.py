@@ -17,6 +17,10 @@ USERNAME_FIELD = "input[name='username'], input#username"
 PASSWORD_FIELD = "input[name='password'], input#password"
 CODE_FIELD = "input[name='emailCode'], input#emailCode, input[name='otp']"
 SUBMIT = "button[type='submit'], input[type='submit'], #kc-login"
+CODE_SUBMIT = (
+    f"form:has({CODE_FIELD}) button[type='submit'], "
+    f"form:has({CODE_FIELD}) input[type='submit']"
+)
 MAX_SKIP = (
     "form[action*='required-action']:has(input[name='skip'][value='true']) "
     "input[type='submit'][value='Пропустить']"
@@ -104,7 +108,11 @@ async def sign_in(
         # QR capture and browser health checks continue while the email arrives.
         code = await asyncio.to_thread(request_code)
         await page.fill(CODE_FIELD, code)
-        await page.click(SUBMIT)
+        # The current Keycloak SPA submits a complete six-digit code itself.
+        # It has only resend/cancel controls: clicking SUBMIT fails before the
+        # asynchronous redirect completes. Older forms still need a click.
+        if await _visible(page, CODE_SUBMIT, min(timeout_ms, 1_000)):
+            await page.click(CODE_SUBMIT)
 
     try:
         await page.wait_for_url(

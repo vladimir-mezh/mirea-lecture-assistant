@@ -5,7 +5,7 @@ import threading
 
 import pytest
 
-from mirea_lecture_assistant.moodle_login import MAX_SKIP, SignInFailed, sign_in
+from mirea_lecture_assistant.moodle_login import CODE_SUBMIT, MAX_SKIP, SignInFailed, sign_in
 
 MAX_URL = (
     "https://sso.mirea.ru/realms/mirea/login-actions/required-action"
@@ -39,6 +39,8 @@ class FakePage:
     async def wait_for_selector(self, selector, timeout=0):
         from mirea_lecture_assistant.cdp import CdpTimeout
 
+        if "type='submit'" in selector and self.filled.get("code"):
+            return
         for screen in self.screens:
             if screen in selector:
                 self.screens.remove(screen)
@@ -84,6 +86,43 @@ def test_credentials_and_the_emailed_code_are_submitted():
     assert page.filled["input[name='username'], input#username"] == "user@mirea.ru"
     assert page.filled["code"] == "079234"
     assert page.clicks == 2
+
+
+def test_spa_code_auto_submits_without_a_submit_button():
+    class AutoSubmitPage(FakePage):
+        async def wait_for_selector(self, selector, timeout=0):
+            if "type='submit'" in selector and self.filled.get("code"):
+                raise TimeoutError("SPA has no submit button")
+            return await super().wait_for_selector(selector, timeout=timeout)
+
+        async def fill(self, selector, value):
+            await super().fill(selector, value)
+            if "emailCode" in selector:
+                self.url = self.final_url
+
+    page = AutoSubmitPage(screens=["username", "password", "emailCode"])
+
+    assert _run(page) == "signed-in"
+    assert page.clicks == 1
+    assert page.filled["code"] == "079234"
+
+
+def test_auto_submit_redirect_does_not_click_a_different_challenge():
+    class OtherActionPage(FakePage):
+        async def fill(self, selector, value):
+            await super().fill(selector, value)
+            if "emailCode" in selector:
+                self.url = MAX_URL.replace("max-account-config", "required-password-change")
+
+        async def wait_for_selector(self, selector, timeout=0):
+            if selector == CODE_SUBMIT:
+                raise TimeoutError("Not the code form")
+            return await super().wait_for_selector(selector, timeout=timeout)
+
+    page = OtherActionPage(screens=["username", "password", "emailCode"])
+    with pytest.raises(SignInFailed):
+        _run(page)
+    assert page.clicks == 1
 
 
 def test_waiting_for_email_does_not_block_the_async_browser_loop():
