@@ -9,7 +9,17 @@ from datetime import UTC, datetime, timedelta
 from functools import partial
 from string import Template
 
-from PySide6.QtCore import QObject, QRunnable, Qt, QThreadPool, QTimer, QUrl, Signal, Slot
+from PySide6.QtCore import (
+    QEvent,
+    QObject,
+    QRunnable,
+    Qt,
+    QThreadPool,
+    QTimer,
+    QUrl,
+    Signal,
+    Slot,
+)
 from PySide6.QtGui import (
     QAction,
     QBrush,
@@ -21,6 +31,8 @@ from PySide6.QtGui import (
     QShortcut,
 )
 from PySide6.QtWidgets import (
+    QAbstractScrollArea,
+    QAbstractSpinBox,
     QApplication,
     QCheckBox,
     QComboBox,
@@ -82,6 +94,7 @@ ATTENDANCE_FAILURE_SPAN_SECONDS = 120
 # is over before then was the wrong room, or the teacher closed it and is about
 # to open another one.
 LEAVE_AFTER_END = timedelta(minutes=5)
+SETTINGS_PAGE = 3
 # A frozen stream or failing captures may come from the stream or the computer,
 # not from the tab: a reload is tried, but not again and again (each one leaves
 # and re-enters the room, and a QR shown meanwhile is missed).
@@ -134,6 +147,31 @@ def is_network_trouble(message: str) -> bool:
 # The chat fallback: a few spaced attempts per pair, not one per scanned frame.
 CHAT_MAX_ATTEMPTS = 3
 CHAT_RETRY_SECONDS = 60
+
+
+class WheelGuard(QObject):
+    """The mouse wheel scrolls the page, never the list or number under the pointer.
+
+    Scrolling through the settings used to switch whatever list happened to pass
+    under the pointer. A list still changes by clicking it, a number by typing or
+    its arrows; an open list's popup scrolls as usual.
+    """
+
+    def eventFilter(self, watched, event):
+        if event.type() != QEvent.Type.Wheel or not isinstance(
+            watched, (QComboBox, QAbstractSpinBox)
+        ):
+            return False
+        area = watched.parentWidget()
+        while area is not None and not isinstance(area, QAbstractScrollArea):
+            area = area.parentWidget()
+        if area is not None:
+            QApplication.sendEvent(area.viewport(), event)
+        return True
+
+    def guard(self, root: QWidget) -> None:
+        for widget in (*root.findChildren(QComboBox), *root.findChildren(QAbstractSpinBox)):
+            widget.installEventFilter(self)
 
 
 def _fill_email_providers(combo: QComboBox, selected: str = "auto") -> None:
@@ -852,6 +890,8 @@ class MainWindow(QMainWindow):
         self.pages.addWidget(self._settings_page())
         root.addWidget(self.pages, 1)
         self.setCentralWidget(central)
+        self.wheel_guard = WheelGuard(self)
+        self.wheel_guard.guard(central)
         self._show_page(0)
         self.activity_label = QLabel("", objectName="activity")
         self.statusBar().addPermanentWidget(self.activity_label)
@@ -1226,6 +1266,9 @@ class MainWindow(QMainWindow):
     def _settings_changed(self, *_args):
         self.settings_dirty_label.setText("● Есть несохранённые изменения")
 
+    def _settings_dirty(self) -> bool:
+        return bool(self.settings_dirty_label.text())
+
     def _build_tray(self):
         icon = QApplication.windowIcon()
         self.tray = QSystemTrayIcon(icon, self)
@@ -1260,6 +1303,13 @@ class MainWindow(QMainWindow):
         self.tray.show()
 
     def _show_page(self, index: int):
+        leaving_settings = self.pages.currentIndex() == SETTINGS_PAGE and index != SETTINGS_PAGE
+        if leaving_settings and self._settings_dirty():
+            # Unsaved edits are dropped, not left half-applied: several of them
+            # (minutes before a pair, the scan interval) are read from the fields.
+            self._load_settings()
+            log.info("settings_unsaved_changes_discarded")
+            self.statusBar().showMessage("Несохранённые изменения настроек отменены", 4000)
         self.pages.setCurrentIndex(index)
         for i, button in enumerate(self.nav_buttons):
             button.setChecked(i == index)
@@ -1295,6 +1345,16 @@ class MainWindow(QMainWindow):
             self.imap_port.setValue(email_credentials.imap_port)
             self.imap_username.setText(email_credentials.imap_username)
             self.email_app_password.setPlaceholderText("Сохранён в защищённом хранилище")
+        else:
+            self.email_address.clear()
+            self.imap_username.clear()
+            self.email_provider.setCurrentIndex(max(self.email_provider.findData("auto"), 0))
+            _update_imap_fields(
+                self.email_provider, self.imap_host, self.imap_port, self.email_hint
+            )
+            self.email_app_password.setPlaceholderText("Пароль приложения почты")
+        # A password typed and never saved is not kept in the field.
+        self.email_app_password.clear()
         self._update_group_label()
         self.settings_dirty_label.setText("")
 
