@@ -37,6 +37,13 @@ jobs:
       - name: Build
         shell: pwsh
         run: .venv\Scripts\python -m PyInstaller --clean --noconfirm MireaLectureAssistant.spec
+      - name: Frozen update regression
+        shell: pwsh
+        run: |
+          .venv\Scripts\python -m PyInstaller --noconfirm --onefile --console --paths src --name FrozenUpdateProbe --distpath build/update-probe scripts/frozen_update_probe.py
+          if ($LASTEXITCODE -ne 0) { throw "Probe build failed" }
+          .venv\Scripts\python scripts/frozen_update_probe.py build/update-probe/FrozenUpdateProbe.exe
+          if ($LASTEXITCODE -ne 0) { throw "Updated process lost its runtime" }
       - name: Smoke test
         shell: pwsh
         # The executable must start on a student's data (lessons, one of them

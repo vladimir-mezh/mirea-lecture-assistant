@@ -71,9 +71,17 @@ def run(argv: list[str], *, call=subprocess.call, sleep=time.sleep, clock=time.m
 
 
 def child_environment() -> dict[str, str]:
-    """For starting a separate app (an update): it must get a watchdog of its own."""
+    """Start an independent update, not a worker sharing our onefile extraction."""
     environment = dict(os.environ)
     environment.pop(CHILD_ENV, None)
+    if getattr(sys, "frozen", False):
+        # Updating replaces the archive at the SAME executable path. PyInstaller
+        # otherwise treats the new process as our worker and reuses _MEIPASS.
+        # Once we exit, our bootloader removes certificates/assets from under it.
+        # Use the public bootloader switch; don't edit private _PYI_* variables.
+        # The watchdog's own worker intentionally continues to share its bundle
+        # (run() waits for it), so this reset belongs only to independent updates.
+        environment["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
     return environment
 
 

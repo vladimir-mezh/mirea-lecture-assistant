@@ -56,3 +56,33 @@ def test_an_update_starts_a_separate_copy_with_its_own_watchdog(monkeypatch):
     monkeypatch.setenv(supervisor.CHILD_ENV, "1")
 
     assert supervisor.CHILD_ENV not in supervisor.child_environment()
+
+
+def test_frozen_update_gets_its_own_extraction_without_mutating_parent(monkeypatch):
+    monkeypatch.setattr(supervisor.sys, "frozen", True, raising=False)
+    monkeypatch.setenv(supervisor.CHILD_ENV, "1")
+    monkeypatch.setenv("_PYI_APPLICATION_HOME_DIR", "old-extraction")
+    monkeypatch.setenv("PYINSTALLER_RESET_ENVIRONMENT", "0")
+    monkeypatch.setenv("MIREA_TEST_SETTING", "preserved")
+
+    environment = supervisor.child_environment()
+
+    assert environment["PYINSTALLER_RESET_ENVIRONMENT"] == "1"
+    assert supervisor.CHILD_ENV not in environment
+    assert environment["MIREA_TEST_SETTING"] == "preserved"
+    assert supervisor.os.environ["PYINSTALLER_RESET_ENVIRONMENT"] == "0"
+    assert supervisor.os.environ[supervisor.CHILD_ENV] == "1"
+
+
+def test_watchdog_worker_keeps_its_parent_extraction(monkeypatch):
+    monkeypatch.setenv("_PYI_APPLICATION_HOME_DIR", "watchdog-extraction")
+    monkeypatch.delenv("PYINSTALLER_RESET_ENVIRONMENT", raising=False)
+    environments = []
+
+    def call(command, env):
+        environments.append(env)
+        return 0
+
+    assert supervisor.run(["app.exe"], call=call) == 0
+    assert environments[0]["_PYI_APPLICATION_HOME_DIR"] == "watchdog-extraction"
+    assert "PYINSTALLER_RESET_ENVIRONMENT" not in environments[0]
