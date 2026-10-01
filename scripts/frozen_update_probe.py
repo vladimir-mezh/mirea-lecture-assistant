@@ -146,7 +146,9 @@ def _wait_for(path: Path, seconds: float) -> bool:
 
 
 def run(executable: Path, scenario: str) -> bool:
-    with tempfile.TemporaryDirectory(prefix="mirea-update-probe-") as folder:
+    with tempfile.TemporaryDirectory(
+        prefix="mirea-update-probe-", ignore_cleanup_errors=True
+    ) as folder:
         result = Path(folder) / "result.json"
         process = subprocess.Popen([str(executable.resolve())], env=_environment(scenario, result))
         process.wait(timeout=60)
@@ -167,7 +169,10 @@ def run(executable: Path, scenario: str) -> bool:
 
 
 def run_replace(build_a: Path, build_b: Path) -> bool:
-    with tempfile.TemporaryDirectory(prefix="mirea-update-replace-") as folder:
+    with tempfile.TemporaryDirectory(
+        prefix="mirea-update-replace-",
+        ignore_cleanup_errors=True,  # B may still be exiting
+    ) as folder:
         root = Path(folder)
         results = root / "results"
         results.mkdir()
