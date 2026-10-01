@@ -135,3 +135,15 @@ def test_locked_old_version_is_retried_after_it_is_released(tmp_path, monkeypatc
     locked[0] = False
     assert updater.clean_leftovers(current)
     assert not old.exists()
+
+
+def test_an_interrupted_download_is_removed_at_startup(tmp_path):
+    """A crash mid-download left ~50 MB next to the program for good."""
+    current = tmp_path / updater.EXE_NAME
+    current.write_bytes(b"running")
+    for suffix in (".download", ".new"):
+        current.with_name(current.name + suffix).write_bytes(b"left over")
+
+    assert updater.clean_leftovers(current, partial=True)
+
+    assert sorted(path.name for path in tmp_path.iterdir()) == [updater.EXE_NAME]

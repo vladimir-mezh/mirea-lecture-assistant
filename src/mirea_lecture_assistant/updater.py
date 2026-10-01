@@ -170,8 +170,19 @@ def start(executable: Path) -> None:
     )
 
 
-def clean_leftovers(current: Path) -> bool:
-    """Delete only the old executable; retry locked files without touching downloads."""
+def clean_leftovers(current: Path, *, partial: bool = False) -> bool:
+    """Delete the replaced executable; True once it is gone.
+
+    ``partial`` also removes an unfinished ``.download`` or ``.new`` (an update
+    interrupted by a crash or power loss, ~50 MB each). Only at startup, before an
+    update of this copy can have started: never while a download may be running.
+    """
+    if partial:
+        for suffix in (".download", ".new"):
+            try:
+                current.with_name(current.name + suffix).unlink(missing_ok=True)
+            except OSError:
+                pass
     previous = current.with_name(current.name + ".old")
     try:
         existed = previous.exists()

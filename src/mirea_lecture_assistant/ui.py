@@ -696,7 +696,9 @@ class MainWindow(QMainWindow):
         self.update_cleanup_timer.setInterval(5_000)
         self.update_cleanup_timer.timeout.connect(self._cleanup_old_version)
         if updater.can_self_update() and os.environ.get("MIREA_ASSISTANT_SMOKE_TEST") != "1":
-            QTimer.singleShot(1_000, self._cleanup_old_version)
+            # An update needs a check (20 s) and a click first, so no download of
+            # this copy can be running yet: leftovers of an interrupted one go too.
+            QTimer.singleShot(1_000, lambda: self._cleanup_old_version(partial=True))
         self.update_check_running = False
         self.update_timer = QTimer(self)
         self.update_timer.setInterval(UPDATE_CHECK_MS)
@@ -707,9 +709,9 @@ class MainWindow(QMainWindow):
         if self.db.recovery:
             QTimer.singleShot(0, self._report_database_recovery)
 
-    def _cleanup_old_version(self):
+    def _cleanup_old_version(self, partial: bool = False):
         # Independent of update-check settings and of network availability.
-        if updater.clean_leftovers(updater.current_executable()):
+        if updater.clean_leftovers(updater.current_executable(), partial=partial):
             self.update_cleanup_timer.stop()
         elif not self.update_cleanup_timer.isActive():
             self.update_cleanup_timer.start()

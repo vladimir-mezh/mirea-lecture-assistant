@@ -8,7 +8,14 @@ from mirea_lecture_assistant import supervisor
 
 if supervisor.should_supervise():
     # This copy only watches: the app runs as its child and comes back after a crash.
-    os._exit(supervisor.run(sys.argv))
+    # After an update its exe is another version's file, so nothing new can be
+    # imported here; whatever goes wrong, it ends quietly rather than in an error
+    # window the student has to close.
+    try:
+        watchdog_code = supervisor.run(sys.argv)
+    except BaseException:  # noqa: BLE001
+        watchdog_code = 1
+    os._exit(watchdog_code)
 
 # Imported only here: the watchdog copy above never loads the app.
 from mirea_lecture_assistant.app import main

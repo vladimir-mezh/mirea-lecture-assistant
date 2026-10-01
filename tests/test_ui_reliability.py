@@ -60,7 +60,7 @@ def test_old_version_cleanup_retries_without_an_update_check(window, monkeypatch
     from mirea_lecture_assistant import updater
 
     outcomes = iter([False, True])
-    monkeypatch.setattr(updater, "clean_leftovers", lambda _path: next(outcomes))
+    monkeypatch.setattr(updater, "clean_leftovers", lambda _path, **_kw: next(outcomes))
     window.db.set_setting("check_updates", False)
     window._cleanup_old_version()
     assert window.update_cleanup_timer.isActive()
@@ -1852,3 +1852,20 @@ def test_saved_settings_stay_when_leaving_the_page(window):
 
     assert window.join_before.value() == 12
     assert window.db.get_setting("join_before") == 12
+
+
+def test_only_the_startup_cleanup_touches_unfinished_downloads(window, monkeypatch):
+    from mirea_lecture_assistant import updater
+
+    calls = []
+    monkeypatch.setattr(
+        updater, "clean_leftovers", lambda _path, partial=False: calls.append(partial) or True
+    )
+    window._cleanup_old_version(partial=True)  # the one at startup
+    window._cleanup_old_version()  # every retry while .old is locked
+    window.db.set_setting("check_updates", True)
+    monkeypatch.setattr(window, "_run", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(updater, "can_self_update", lambda: True)
+    window._check_for_updates(manual=True)  # possibly while a download runs
+
+    assert calls == [True, False, False]

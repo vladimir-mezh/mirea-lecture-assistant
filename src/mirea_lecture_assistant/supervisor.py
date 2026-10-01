@@ -119,7 +119,7 @@ def _log(message: str) -> None:
         folder.mkdir(parents=True, exist_ok=True)
         with (folder / "supervisor.log").open("a", encoding="utf-8") as file:
             file.write(f"{datetime.now().astimezone():%Y-%m-%d %H:%M:%S} {message}\n")
-    except OSError:
+    except Exception:  # noqa: BLE001, S110 - a log line is never worth an error window
         pass
 
 
