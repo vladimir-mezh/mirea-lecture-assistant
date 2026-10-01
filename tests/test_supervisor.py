@@ -5,6 +5,39 @@ from mirea_lecture_assistant import supervisor
 ACCESS_VIOLATION = 0xC0000005
 
 
+def test_hung_child_is_terminated_as_its_own_tree(monkeypatch):
+    ticks = iter([0, supervisor.STARTUP_GRACE_SECONDS + 1])
+    killed = []
+
+    class Process:
+        pid = 12345
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout):
+            return 1
+
+    monkeypatch.setattr(supervisor.time, "monotonic", lambda: next(ticks))
+    monkeypatch.setattr(supervisor.subprocess, "Popen", lambda *_a, **_kw: Process())
+    monkeypatch.setattr(supervisor.subprocess, "run", lambda command, **_kw: killed.append(command))
+    monkeypatch.setattr(supervisor.sys, "platform", "win32")
+    monkeypatch.setattr(supervisor, "_log", lambda *_args: None)
+    assert supervisor.monitored_call(["app.exe"], {}) == supervisor.CRASHED
+    assert killed == [["taskkill", "/PID", "12345", "/T", "/F"]]
+
+
+def test_a_healthy_child_can_exit_without_a_forced_restart(monkeypatch):
+    class Process:
+        returncode = 0
+
+        def poll(self):
+            return 0
+
+    monkeypatch.setattr(supervisor.subprocess, "Popen", lambda *_a, **_kw: Process())
+    assert supervisor.monitored_call(["app.exe"], {}) == 0
+
+
 def _run(codes):
     calls = []
     clock = [0.0]
@@ -38,11 +71,11 @@ def test_a_deliberate_end_is_final():
         assert _run([code]) == (code, ["1"])
 
 
-def test_it_gives_up_after_a_few_crashes_in_a_row():
-    code, calls = _run([ACCESS_VIOLATION] * 10)
+def test_repeated_crashes_cool_down_but_do_not_abandon_the_app():
+    code, calls = _run([ACCESS_VIOLATION] * 10 + [0])
 
-    assert code == ACCESS_VIOLATION
-    assert len(calls) == supervisor.MAX_RESTARTS + 1
+    assert code == 0
+    assert len(calls) == 11
 
 
 def test_only_the_built_program_outside_tests_is_watched(monkeypatch):

@@ -3,8 +3,8 @@
 The built program runs twice: this watchdog (no window, no Qt) starts the real
 app as its child and waits. A crash brings it back; a deliberate end does not:
 «Выход» in the tray, a handover to a newer version, a failed start, or being
-closed from another copy or the Task Manager. Several crashes in a row mean
-something is wrong that restarting will not fix, so it gives up.
+closed from another copy or the Task Manager. Repeated crashes trigger a cooldown
+instead of a hot restart loop; monitoring resumes afterwards.
 """
 
 from __future__ import annotations
@@ -12,6 +12,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
@@ -28,6 +29,64 @@ CRASHED = 70  # an uncaught Python exception (the launcher's code for it)
 MAX_RESTARTS = 3
 RESTART_WINDOW_SECONDS = 10 * 60
 RESTART_DELAY_SECONDS = 3
+HEARTBEAT_ENV = "MIREA_ASSISTANT_HEARTBEAT"
+HEARTBEAT_TIMEOUT_SECONDS = 120
+STARTUP_GRACE_SECONDS = 180
+CRASH_COOLDOWN_SECONDS = 300
+
+
+def monitored_call(command, env) -> int:
+    """Watch only our own child; a living process is not proof of a living UI."""
+    with tempfile.TemporaryDirectory(prefix="mirea-watchdog-") as folder:
+        heartbeat = Path(folder) / "heartbeat"
+        process = subprocess.Popen(command, env={**env, HEARTBEAT_ENV: str(heartbeat)})
+        started = time.monotonic()
+        last_seen = started
+        last_stamp = None
+        while process.poll() is None:
+            try:
+                stamp = heartbeat.stat().st_mtime_ns
+            except FileNotFoundError:
+                stamp = None
+            now = time.monotonic()
+            if stamp is not None and stamp != last_stamp:
+                last_seen = now
+                last_stamp = stamp
+            stale = (
+                now - last_seen > HEARTBEAT_TIMEOUT_SECONDS
+                if last_stamp is not None
+                else now - started > STARTUP_GRACE_SECONDS
+            )
+            if stale:
+                _log(f"app_unresponsive pid={process.pid} restarting")
+                # PyInstaller's worker is a descendant of its bootloader: killing
+                # only the bootloader leaves the Qt process and instance lock alive.
+                if sys.platform == "win32":
+                    subprocess.run(
+                        ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                        capture_output=True,
+                        timeout=15,
+                        check=False,
+                        creationflags=subprocess.CREATE_NO_WINDOW,
+                    )
+                else:
+                    process.kill()
+                process.wait(timeout=15)
+                return CRASHED
+            try:
+                return process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+        return process.returncode
+
+
+def touch_heartbeat() -> None:
+    path = os.environ.get(HEARTBEAT_ENV)
+    if path:
+        try:
+            Path(path).touch()
+        except OSError:
+            pass
 
 
 def should_supervise(environ=os.environ) -> bool:
@@ -56,7 +115,7 @@ def _log(message: str) -> None:
         pass
 
 
-def run(argv: list[str], *, call=subprocess.call, sleep=time.sleep, clock=time.monotonic) -> int:
+def run(argv: list[str], *, call=monitored_call, sleep=time.sleep, clock=time.monotonic) -> int:
     """Run the app as a child until it ends on purpose; returns its last exit code."""
     # The app gets a folder of its own too: this watchdog may itself be running
     # on a folder borrowed from the copy that started it (an update by 0.2.8/0.2.9).
@@ -70,8 +129,9 @@ def run(argv: list[str], *, call=subprocess.call, sleep=time.sleep, clock=time.m
         now = clock()
         restarts = [moment for moment in restarts if now - moment < RESTART_WINDOW_SECONDS]
         if len(restarts) >= MAX_RESTARTS:
-            _log(f"app_crashed code={code:#x} giving_up restarts={len(restarts)}")
-            return code
+            _log(f"app_crashed code={code:#x} cooling_down seconds={CRASH_COOLDOWN_SECONDS}")
+            sleep(CRASH_COOLDOWN_SECONDS)
+            restarts.clear()
         restarts.append(now)
         _log(f"app_crashed code={code:#x} restarting")
         sleep(RESTART_DELAY_SECONDS)

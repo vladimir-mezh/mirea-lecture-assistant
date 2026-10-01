@@ -56,6 +56,125 @@ def test_detected_qr_keeps_the_lesson_that_was_active(window):
     assert pending.lesson_id == "lesson-old"
 
 
+@pytest.mark.parametrize("method", ["_code_check_failed", "_otp_wait_failed"])
+def test_automatic_email_or_code_outage_schedules_a_fresh_login(window, monkeypatch, method):
+    retried = []
+    window.automatic_login_cycle = True
+    window.login_in_progress = True
+    monkeypatch.setattr(window, "_background_problem", lambda *_args: None)
+    monkeypatch.setattr(window, "_retry_automatic_login_later", retried.append)
+    getattr(window, method)("challenge", "Network timeout")
+    assert retried == ["Network timeout"]
+    assert not window.login_in_progress
+
+
+def test_login_cooldown_is_retried_not_abandoned(window, monkeypatch):
+    retried = []
+    monkeypatch.setattr(window.session_store, "load_credentials", lambda: ("test", "test"))
+    monkeypatch.setattr(window.db, "reserve_auth_attempt", lambda *_args: False)
+    monkeypatch.setattr(window, "_retry_automatic_login_later", retried.append)
+    window._auto_login()
+    assert len(retried) == 1
+    assert not window.login_in_progress
+
+
+def test_only_latest_login_retry_timer_can_start_a_login(window, monkeypatch):
+    from mirea_lecture_assistant import ui
+
+    timers, calls = [], []
+    monkeypatch.setattr(ui.QTimer, "singleShot", lambda _delay, callback: timers.append(callback))
+    monkeypatch.setattr(window, "_auto_login", lambda: calls.append(True))
+    window._retry_automatic_login_later("Network timeout")
+    window._retry_automatic_login_later("Network timeout")
+    timers[0]()
+    assert calls == []
+    timers[1]()
+    assert calls == [True]
+
+
+def test_overrunning_lecture_is_restored_after_restart(window, monkeypatch):
+    now = datetime.now().astimezone()
+    lesson = Lesson(
+        "resume", "Subject", "ЛК", now - timedelta(hours=2), now - timedelta(minutes=20)
+    )
+    window.db.sync_lessons([lesson], now - timedelta(days=1))
+    window.db.set_rule(lesson.subject_name, RuleMode.AUTO)
+    url = "https://my.mts-link.ru/j/resume"
+    window.db.set_setting("active_lecture", {"lesson_id": "resume", "url": url})
+    opened = []
+    monkeypatch.setattr(window, "_open_lecture", lambda *args, **kwargs: opened.append(args))
+    window._restore_active_lecture()
+    assert window.active_lecture_id == "resume"
+    assert opened == [(url, "resume")]
+    assert window._may_open(url, "resume")
+
+
+@pytest.mark.parametrize("reason", ["expired", "ignored", "superseded"])
+def test_resume_does_not_open_an_ineligible_old_pair(window, monkeypatch, reason):
+    now = datetime.now().astimezone()
+    end = now - timedelta(hours=3 if reason == "expired" else 0, minutes=20)
+    lesson = Lesson("resume", "Subject", "ЛК", end - timedelta(hours=1), end)
+    window.db.sync_lessons([lesson], now - timedelta(days=1))
+    window.db.set_rule(
+        lesson.subject_name, RuleMode.IGNORE if reason == "ignored" else RuleMode.AUTO
+    )
+    window.db.set_setting(
+        "active_lecture", {"lesson_id": "resume", "url": "https://mts-link.ru/j/1"}
+    )
+    monkeypatch.setattr(window, "_superseded", lambda *_args: reason == "superseded")
+    monkeypatch.setattr(
+        window, "_open_lecture", lambda *_args, **_kwargs: pytest.fail("old pair opened")
+    )
+    window._restore_active_lecture()
+    assert window.active_lecture_id is None
+    assert window.db.get_setting("active_lecture") == {}
+
+
+def test_finished_lecture_clears_restart_checkpoint(window):
+    window.db.set_setting("active_lecture", {"lesson_id": "old", "url": "old"})
+    window._finish_active_lecture("ended", close_tab=False)
+    assert window.db.get_setting("active_lecture") == {}
+
+
+def test_resume_uses_saved_timetable_during_a_schedule_outage(window, monkeypatch):
+    lesson = _running_lesson("snapshot")
+    window.active_lesson = lesson
+    window.active_lecture_url = "https://mts-link.ru/j/1"
+    window._make_active("snapshot")
+    assert window.db.get_setting("active_lecture")["lesson"]["external_id"] == "snapshot"
+    window.active_lecture_id = None
+    window.active_lesson = None
+    opened = []
+    monkeypatch.setattr(window, "_open_lecture", lambda *args, **kwargs: opened.append(args))
+    window._restore_active_lecture()
+    assert window.active_lecture_id == "snapshot"
+    assert window.active_lesson.external_id == "snapshot"
+    assert opened == [("https://mts-link.ru/j/1", "snapshot")]
+
+
+def test_a_live_tab_without_fresh_capture_is_reloaded(window, monkeypatch):
+    window.active_lecture_id = "test"
+    window.active_lecture_url = "https://mts-link.ru/j/1"
+    window.lecture_started_at = time.monotonic() - 60
+    window.scan_timer.start(1000)
+    opened = []
+    monkeypatch.setattr(window, "_run", lambda _fn, done, *_a, **_kw: done("live"))
+    monkeypatch.setattr(window, "_open_lecture", lambda *args, **kwargs: opened.append(args))
+    window._lecture_watch_tick()
+    assert opened == [("https://mts-link.ru/j/1", "test")]
+    window.scan_timer.stop()
+
+
+def test_direct_capture_does_not_fall_back_to_an_unrelated_desktop(window, monkeypatch):
+    async def capture():
+        raise RuntimeError("Lecture tab disconnected")
+
+    monkeypatch.setattr(window.browser, "capture_page_state", capture)
+    monkeypatch.setattr(window.scanner, "scan_once", lambda: pytest.fail("desktop fallback"))
+    with pytest.raises(RuntimeError, match="Lecture tab disconnected"):
+        window._scan_source(True)
+
+
 def test_late_attendance_success_does_not_mark_the_next_lesson(window):
     event_id = window.db.add_qr_event("fingerprint", "retrying", lesson_id="lesson-old")
     window.pending_qr[event_id] = PendingAttendance(
@@ -1167,18 +1286,25 @@ def test_a_wrong_password_or_a_refused_code_is_never_retried_on_its_own(window, 
     assert timers == [] and problems == ["Автовход не удался"] and modals == []
 
     timers, problems, modals = _failed_automatic_login(
-        window, monkeypatch, "Сервер МИРЭА не отвечает", code_sent=True
+        window, monkeypatch, "Код не принят", code_sent=True
     )
     assert timers == [] and problems == ["Автовход не удался"] and modals == []
 
 
-def test_automatic_login_retries_are_limited(window, monkeypatch):
+def test_network_outage_after_code_submission_is_retried(window, monkeypatch):
+    timers, problems, modals = _failed_automatic_login(
+        window, monkeypatch, "Сервер МИРЭА не отвечает", code_sent=True
+    )
+    assert timers == [2 * 60_000] and problems == ["Автовход не удался"] and modals == []
+
+
+def test_temporary_login_failures_continue_with_a_bounded_delay(window, monkeypatch):
     window.login_retry_attempt = 3
     timers, problems, _modals = _failed_automatic_login(
         window, monkeypatch, "Сервер МИРЭА не отвечает"
     )
 
-    assert timers == [] and problems == ["Автовход не удался"]
+    assert timers == [15 * 60_000] and problems == []
 
 
 def test_codes_count_from_the_moment_a_deferred_login_really_starts(window, monkeypatch):

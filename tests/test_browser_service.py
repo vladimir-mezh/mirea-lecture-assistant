@@ -10,6 +10,75 @@ from mirea_lecture_assistant.browser_service import BrowserService
 LECTURE = "https://mts-link.ru/event/12345"
 
 
+async def _loaded():
+    return None
+
+
+def test_static_slides_are_not_stalled_when_media_clock_advances(service):
+    assert not service._media_stalled(["stream", 1, 10], 0)
+    assert not service._media_stalled(["stream", 61, 10], 60)
+
+
+def test_an_unchanging_media_clock_and_frame_count_is_stalled(service):
+    assert not service._media_stalled(["stream", 1, 10], 0)
+    assert not service._media_stalled(["stream", 1, 10], 44)
+    assert service._media_stalled(["stream", 1, 10], 45)
+    assert not service._media_stalled(["new-stream", 1, 10], 46)
+
+
+def test_pages_without_a_video_stream_do_not_trigger_media_restarts(service):
+    assert not service._media_stalled(None, 0)
+    assert not service._media_stalled(None, 300)
+
+
+def test_a_track_without_incoming_data_cannot_hide_behind_its_clock(service):
+    assert not service._media_stalled(["stream", 1, 10, True], 0)
+    assert service._media_stalled(["stream", 61, 10, True], 60)
+    assert not service._media_stalled(["stream", 62, 11, False], 61)
+
+
+def test_slow_hd_capture_uses_smaller_viewport_then_recovers(service, monkeypatch):
+    import asyncio
+
+    class Page:
+        def is_closed(self):
+            return False
+
+        async def send(self, method, params):
+            return None
+
+    page = Page()
+    monkeypatch.setattr(browser_service.time, "monotonic", lambda: 20)
+    service._capture_slow_until = 60
+    asyncio.run(service._apply_capture_size(page))
+    assert service._capture_override == (page, (1280, 720))
+    monkeypatch.setattr(browser_service.time, "monotonic", lambda: 61)
+    asyncio.run(service._apply_capture_size(page))
+    assert service._capture_override == (page, (1920, 1080))
+
+
+def test_capture_timeout_never_returns_a_stale_frame(service, monkeypatch):
+    import asyncio
+
+    class Page:
+        async def screenshot(self, timeout):
+            assert timeout <= 3000
+            raise browser_service.CdpTimeout("slow frame")
+
+    async def active_page():
+        return Page()
+
+    async def apply_size(_page):
+        return None
+
+    monkeypatch.setattr(service, "_active_page", active_page)
+    monkeypatch.setattr(service, "_apply_capture_size", apply_size)
+    monkeypatch.setattr(browser_service.time, "monotonic", lambda: 10)
+    with pytest.raises(browser_service.CdpTimeout):
+        asyncio.run(service.capture_page_state())
+    assert service._capture_slow_until == 70
+
+
 @dataclass
 class FakePage:
     url: str
@@ -115,6 +184,75 @@ def test_without_a_known_lecture_no_tab_is_taken(service):
     pages = [FakePage("https://example.test/a"), FakePage("https://example.test/b")]
 
     assert service._pick_lecture_page(pages) is None
+
+
+@pytest.mark.parametrize(
+    "url", ["about:blank", "about:blank#redirect", "", "chrome-error://chromewebdata/"]
+)
+def test_pinned_blank_or_error_tab_is_never_a_capture_target(service, url):
+    page = FakePage(url)
+    page.target_id = "pinned"
+    service._lecture_target = "pinned"
+    service.lecture_url = LECTURE
+    assert service._pick_lecture_page([page]) is None
+
+
+def test_popup_wins_when_the_pinned_tab_stays_blank(service):
+    blank, real = FakePage("about:blank"), FakePage(LECTURE)
+    blank.target_id, real.target_id = "old", "popup"
+    service._lecture_target = "old"
+    service.lecture_url = LECTURE
+    assert service._pick_lecture_page([blank, real]) is real
+    assert service._lecture_target == "popup"
+
+
+def test_first_launch_waits_for_a_loaded_page_not_only_a_browser_port(service, monkeypatch):
+    monkeypatch.setattr(type(service), "is_running", property(lambda _self: False))
+    monkeypatch.setattr(type(service), "_find_browser", lambda _self: ("Chrome", "chrome"))
+    monkeypatch.setattr(type(service), "_free_port", staticmethod(lambda: 12345))
+    monkeypatch.setattr(type(service), "_cdp_available", staticmethod(lambda _port: True))
+    monkeypatch.setattr(browser_service.subprocess, "Popen", lambda *_a, **_kw: None)
+
+    async def not_loaded():
+        assert service.lecture_url == LECTURE
+        raise RuntimeError("blank page")
+
+    monkeypatch.setattr(service, "_wait_lecture_loaded_async", not_loaded)
+    with pytest.raises(RuntimeError, match="blank page"):
+        service.open(LECTURE)
+
+
+def test_loaded_page_wait_rejects_blank_without_success(service, monkeypatch):
+    import asyncio
+
+    service.lecture_url = LECTURE
+    blank = FakePage("about:blank")
+
+    async def connected():
+        return type("Browser", (), {"pages": [blank]})()
+
+    monkeypatch.setattr(service, "_connected_browser", connected)
+    with pytest.raises(RuntimeError, match="не загрузилась"):
+        asyncio.run(service._wait_lecture_loaded_async(timeout=0.01))
+
+
+def test_loading_page_is_not_available_to_the_scanner(service, monkeypatch):
+    import asyncio
+
+    service.lecture_url = LECTURE
+
+    class Page:
+        url = LECTURE
+
+        async def evaluate(self, *_args, **_kwargs):
+            return False
+
+    async def connected():
+        return type("Browser", (), {"pages": [Page()]})()
+
+    monkeypatch.setattr(service, "_connected_browser", connected)
+    with pytest.raises(RuntimeError, match="ещё не загрузилась"):
+        asyncio.run(service._active_page())
 
 
 def test_no_tabs_means_no_choice(service):
@@ -573,6 +711,7 @@ def test_an_adopted_browser_is_not_killed_over_an_unknown_sound_mode(service, mo
     monkeypatch.setattr(type(service), "close", lambda _self: closed.append(True))
     monkeypatch.setattr(type(service), "_navigate", lambda _self, _url, **_kw: None)
     monkeypatch.setattr(type(service), "_find_browser", lambda _self: ("Google Chrome", "chrome"))
+    monkeypatch.setattr(service, "_wait_lecture_loaded_async", _loaded)
 
     service.muted = None  # adopted from a previous run
     service.open("https://my.mts-link.ru/j/1/2", muted=True)
@@ -586,6 +725,7 @@ def test_a_known_different_sound_mode_still_restarts_the_browser(service, monkey
     monkeypatch.setattr(type(service), "close", lambda _self: closed.append(True))
     monkeypatch.setattr(type(service), "_navigate", lambda _self, _url, **_kw: None)
     monkeypatch.setattr(type(service), "_find_browser", lambda _self: ("Google Chrome", "chrome"))
+    monkeypatch.setattr(service, "_wait_lecture_loaded_async", _loaded)
 
     service.muted = False
     service.open("https://my.mts-link.ru/j/1/2", muted=True)
@@ -615,6 +755,7 @@ def test_a_successful_launch_records_its_port(service, monkeypatch):
     monkeypatch.setattr(type(service), "_free_port", staticmethod(lambda: 49335))
     monkeypatch.setattr(type(service), "_cdp_available", staticmethod(lambda port: port == 49335))
     monkeypatch.setattr(browser_service.subprocess, "Popen", lambda *_a, **_kw: None)
+    monkeypatch.setattr(service, "_wait_lecture_loaded_async", _loaded)
 
     service.open("https://my.mts-link.ru/j/1/2")
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
+import time
 from collections.abc import Coroutine
 from typing import Any, TypeVar
 
@@ -24,6 +25,22 @@ class AsyncRuntime:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
+        self._health_at = time.monotonic()
+
+    def healthy(self) -> bool:
+        loop = self._loop
+        if loop is None:
+            return True
+        if loop.is_closed() or self._thread is None or not self._thread.is_alive():
+            return False
+        try:
+            loop.call_soon_threadsafe(self._ack_health)
+        except RuntimeError:
+            return False
+        return time.monotonic() - self._health_at < 60
+
+    def _ack_health(self) -> None:
+        self._health_at = time.monotonic()
 
     def loop(self) -> asyncio.AbstractEventLoop:
         with self._lock:
@@ -37,6 +54,7 @@ class AsyncRuntime:
                 )
                 thread.start()
                 self._loop = loop
+                self._health_at = time.monotonic()
                 self._thread = thread
                 log.info("async_runtime_started")
             return self._loop
@@ -97,3 +115,7 @@ def run_async(coroutine: Coroutine[Any, Any, T], timeout: float | None = None) -
 
 def shutdown_async_runtime() -> None:
     _runtime.shutdown()
+
+
+def async_runtime_healthy() -> bool:
+    return _runtime.healthy()
