@@ -173,7 +173,7 @@ def test_three_failed_health_checks_escalate_to_browser_restart(window, monkeypa
         start_at=now - timedelta(minutes=10),
         end_at=now + timedelta(minutes=60),
     )
-    window.db.sync_lessons([lesson], now.replace(hour=0, minute=0, second=0, microsecond=0))
+    window.db.sync_lessons([lesson], now - timedelta(days=1))
     window.active_lecture_id = lesson.external_id
     window.active_lecture_url = "https://mts-link.ru/event/lesson"
     reopened = []
@@ -203,7 +203,7 @@ def test_room_end_stops_monitoring_even_after_scheduled_end(window, monkeypatch)
         start_at=now - timedelta(hours=2),
         end_at=now - timedelta(minutes=20),
     )
-    window.db.sync_lessons([lesson], now.replace(hour=0, minute=0, second=0, microsecond=0))
+    window.db.sync_lessons([lesson], now - timedelta(days=1))
     window.active_lecture_id = lesson.external_id
     window.active_lecture_url = "https://mts-link.ru/event/overtime"
     monkeypatch.setattr(window, "_run", lambda _fn, done, _busy, failed=None: done("ended"))
@@ -427,8 +427,8 @@ def test_webinar_lookup_is_not_repeated_every_minute(window, monkeypatch):
 
 def test_schedule_failure_still_opens_an_already_found_room(window, monkeypatch):
     lesson = _running_lesson()
-    today = datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
-    window.db.sync_lessons([lesson], today)
+    since = datetime.now().astimezone() - timedelta(days=1)
+    window.db.sync_lessons([lesson], since)
     window.db.set_rule(lesson.subject_name, RuleMode.AUTO)
     window.db.set_resolved_link(lesson.external_id, "https://mts-link.ru/event/running")
     opened = []
@@ -462,7 +462,7 @@ def test_now_card_names_the_next_pair_and_its_mode(window):
         start_at=now + timedelta(minutes=30),
         end_at=now + timedelta(minutes=120),
     )
-    window.db.sync_lessons([lesson], now.replace(hour=0, minute=0, second=0, microsecond=0))
+    window.db.sync_lessons([lesson], now - timedelta(days=1))
     window.db.set_rule("Матанализ", RuleMode.AUTO)
 
     window._update_now_card()
@@ -503,7 +503,7 @@ def test_background_results_are_not_wiped_by_other_operations(window):
 def test_schedule_modes_are_shown_in_russian(window):
     now = datetime.now().astimezone()
     lesson = Lesson("l1", "Физика", "ЛК", now + timedelta(hours=1), now + timedelta(hours=2))
-    window.db.sync_lessons([lesson], now.replace(hour=0, minute=0, second=0, microsecond=0))
+    window.db.sync_lessons([lesson], now - timedelta(days=1))
     window.db.set_rule("Физика", RuleMode.IGNORE)
 
     window._fill_schedule()
@@ -515,8 +515,8 @@ def test_schedule_modes_are_shown_in_russian(window):
 
 
 def _watch_room_that_says_ended(window, monkeypatch, lesson):
-    today = datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
-    window.db.sync_lessons([lesson], today)
+    since = datetime.now().astimezone() - timedelta(days=1)
+    window.db.sync_lessons([lesson], since)
     room = "https://my.mts-link.ru/j/1/2"
     window.db.set_resolved_link(lesson.external_id, room)
     window.joined_lessons.add(lesson.external_id)
@@ -565,8 +565,8 @@ def test_a_room_that_ends_after_the_pair_just_finishes(window, monkeypatch):
 
 def test_a_rejected_room_is_not_reopened_from_the_cache(window, monkeypatch):
     lesson = _running_lesson("cached")
-    today = datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
-    window.db.sync_lessons([lesson], today)
+    since = datetime.now().astimezone() - timedelta(days=1)
+    window.db.sync_lessons([lesson], since)
     window.db.set_rule(lesson.subject_name, RuleMode.AUTO)
     window.db.set_resolved_link("cached", "https://my.mts-link.ru/j/1/2")
     window._reject_room("cached", "https://my.mts-link.ru/j/1/2")
@@ -640,8 +640,8 @@ def test_a_room_closed_five_minutes_in_is_followed_by_the_new_one(window, monkey
 
 
 def _active(window, lesson, url):
-    today = datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
-    window.db.sync_lessons([lesson], today)
+    since = datetime.now().astimezone() - timedelta(days=1)
+    window.db.sync_lessons([lesson], since)
     window.active_lecture_id = lesson.external_id
     window.active_lecture_url = url
     window.joined_lessons.add(lesson.external_id)
@@ -715,7 +715,7 @@ def test_the_previous_pair_never_takes_the_tab_of_the_next_one(window, monkeypat
     now = datetime.now().astimezone()
     a = _pair("A", now - timedelta(minutes=96), subject="Физика")  # ended 6 min ago
     b = _pair("B", now + timedelta(minutes=4), subject="Химия")  # starts in 4 min
-    window.db.sync_lessons([a, b], now.replace(hour=0, minute=0, second=0, microsecond=0))
+    window.db.sync_lessons([a, b], now - timedelta(days=1))
     window.db.set_rule("Физика", RuleMode.AUTO)
     window.db.set_resolved_link("A", "https://my.mts-link.ru/j/a")
     window.active_lecture_id = "B"
@@ -736,7 +736,7 @@ def test_a_large_lead_does_not_leave_the_running_pair_early(window, monkeypatch)
     a = _pair("A", now - timedelta(minutes=88), subject="Физика")  # ends in 2 min
     b = _pair("B", now + timedelta(minutes=8), subject="Химия")
     window.join_before.setValue(15)
-    window.db.sync_lessons([a, b], now.replace(hour=0, minute=0, second=0, microsecond=0))
+    window.db.sync_lessons([a, b], now - timedelta(days=1))
     window.db.set_rule("Химия", RuleMode.AUTO)
     window.db.set_resolved_link("B", "https://my.mts-link.ru/j/b")
     window.active_lecture_id = "A"
@@ -754,7 +754,7 @@ def test_a_double_pair_in_one_room_scans_the_second_pair_too(window, monkeypatch
     now = datetime.now().astimezone()
     first = _pair("first", now - timedelta(minutes=100))
     second = _pair("second", now - timedelta(minutes=1))
-    window.db.sync_lessons([first, second], now.replace(hour=0, minute=0, second=0, microsecond=0))
+    window.db.sync_lessons([first, second], now - timedelta(days=1))
     window.db.set_rule("Надёжность", RuleMode.AUTO)
     window.db.set_setting("marked_lessons", ["first"])
     window.active_lecture_id = "first"
@@ -772,8 +772,8 @@ def test_a_double_pair_in_one_room_scans_the_second_pair_too(window, monkeypatch
 
 def test_a_lookup_started_before_the_rejection_does_not_reopen_the_room(window, monkeypatch):
     lesson = _running_lesson("lost")
-    today = datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
-    window.db.sync_lessons([lesson], today)
+    since = datetime.now().astimezone() - timedelta(days=1)
+    window.db.sync_lessons([lesson], since)
     window.db.set_rule(lesson.subject_name, RuleMode.AUTO)
     window._reject_room("lost", "https://my.mts-link.ru/j/dead")
     opened = []
@@ -787,7 +787,7 @@ def test_a_lookup_started_before_the_rejection_does_not_reopen_the_room(window, 
 def test_an_automatic_open_is_refused_after_the_pair(window):
     now = datetime.now().astimezone()
     over = _pair("over", now - timedelta(minutes=100))
-    window.db.sync_lessons([over], now.replace(hour=0, minute=0, second=0, microsecond=0))
+    window.db.sync_lessons([over], now - timedelta(days=1))
 
     assert window._may_open("https://my.mts-link.ru/j/x", "over") is False
 
@@ -1221,8 +1221,8 @@ def test_a_lookup_waiting_for_a_deferred_sdo_sign_in_does_not_back_off(window, m
 def test_pairs_open_from_the_cached_schedule_without_a_pulse_session(window, monkeypatch):
     """With the session being renewed (or Pulse down) nothing used to open at all."""
     lesson = _running_lesson("cached")
-    today = datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
-    window.db.sync_lessons([lesson], today)
+    since = datetime.now().astimezone() - timedelta(days=1)
+    window.db.sync_lessons([lesson], since)
     window.db.set_rule(lesson.subject_name, RuleMode.AUTO)
     window.db.set_resolved_link("cached", "https://my.mts-link.ru/j/cached")
     window.mirea.session = {}
@@ -1250,7 +1250,7 @@ def test_the_next_pair_waits_while_the_earlier_one_looks_for_a_new_room(window):
     a = _pair("A", now - timedelta(minutes=72), subject="Физика")
     b = _pair("B", now + timedelta(minutes=28), subject="Химия")
     window.join_before.setValue(30)
-    window.db.sync_lessons([a, b], now.replace(hour=0, minute=0, second=0, microsecond=0))
+    window.db.sync_lessons([a, b], now - timedelta(days=1))
     window.room_lost_lessons.add("A")
 
     assert window._may_open("https://my.mts-link.ru/j/b", "B") is False
@@ -1260,8 +1260,8 @@ def test_the_next_pair_waits_while_the_earlier_one_looks_for_a_new_room(window):
 
 
 def _opened_by_hand(window, monkeypatch, lesson):
-    today = datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
-    window.db.sync_lessons([lesson], today)
+    since = datetime.now().astimezone() - timedelta(days=1)
+    window.db.sync_lessons([lesson], since)
     monkeypatch.setattr(window, "_enter_lecture_room", lambda: None)
     monkeypatch.setattr(window, "toggle_scanner", lambda: None)
     window.browser.lecture_url = "https://my.mts-link.ru/j/by-hand"
@@ -1285,8 +1285,8 @@ def test_opening_the_current_pair_by_hand_monitors_it(window, monkeypatch):
 
 def test_a_room_the_student_typed_in_is_not_replaced_by_the_sdo(window, monkeypatch):
     lesson = _running_lesson("typed")
-    today = datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
-    window.db.sync_lessons([lesson], today)
+    since = datetime.now().astimezone() - timedelta(days=1)
+    window.db.sync_lessons([lesson], since)
     window._save_lesson_link("typed", "https://my.mts-link.ru/j/typed", shown="")
     window.active_lecture_id = "typed"
     window.active_lecture_url = "https://my.mts-link.ru/j/typed"
@@ -1326,8 +1326,8 @@ def test_a_room_that_ended_behind_the_same_link_is_reloaded(window, monkeypatch)
     monkeypatch.setattr(
         window, "_run", lambda function, done, _busy, failed=None, **_kw: function()
     )
-    today = datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
-    window.db.sync_lessons([lesson], today)
+    since = datetime.now().astimezone() - timedelta(days=1)
+    window.db.sync_lessons([lesson], since)
 
     window._open_lecture(url, "again")
 
@@ -1336,8 +1336,8 @@ def test_a_room_that_ended_behind_the_same_link_is_reloaded(window, monkeypatch)
 
 def test_an_accepted_ask_pair_is_opened_again_after_a_failed_open(window, monkeypatch):
     lesson = _running_lesson("asked")
-    today = datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
-    window.db.sync_lessons([lesson], today)
+    since = datetime.now().astimezone() - timedelta(days=1)
+    window.db.sync_lessons([lesson], since)
     window.db.set_rule(lesson.subject_name, RuleMode.ASK)
     window.db.set_resolved_link("asked", "https://my.mts-link.ru/j/asked")
     window.prompted_lessons.add("asked")
@@ -1380,8 +1380,8 @@ def test_the_chat_fallback_is_spaced_and_capped(window, monkeypatch):
 
 def test_a_health_result_about_a_room_left_meanwhile_is_dropped(window, monkeypatch):
     lesson = _running_lesson("health")
-    today = datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
-    window.db.sync_lessons([lesson], today)
+    since = datetime.now().astimezone() - timedelta(days=1)
+    window.db.sync_lessons([lesson], since)
     window.active_lecture_id = "health"
     window.active_lecture_url = "https://my.mts-link.ru/j/old"
     pending = []
@@ -1408,8 +1408,8 @@ def test_opening_the_next_pair_by_hand_minutes_early_monitors_it(window, monkeyp
 
 def test_a_room_opened_by_hand_long_before_is_taken_over_without_a_question(window, monkeypatch):
     lesson = _running_lesson("early")
-    today = datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
-    window.db.sync_lessons([lesson], today)
+    since = datetime.now().astimezone() - timedelta(days=1)
+    window.db.sync_lessons([lesson], since)
     window.db.set_rule(lesson.subject_name, RuleMode.ASK)
     window.db.set_resolved_link("early", "https://my.mts-link.ru/j/early")
     window.browser.lecture_url = "https://my.mts-link.ru/j/early"

@@ -56,9 +56,13 @@ def test_only_the_built_program_outside_tests_is_watched(monkeypatch):
 
 def test_an_update_starts_a_separate_copy_with_its_own_watchdog(monkeypatch):
     monkeypatch.setenv(supervisor.CHILD_ENV, "1")
+    monkeypatch.setenv(supervisor.RESET_ENV, "0")
 
     environment = supervisor.child_environment()
     assert supervisor.CHILD_ENV not in environment
     # Without this the updated copy ran on the old copy's temporary folder and
     # lost its certificates when the old copy quit: "[Errno 2] No such file".
     assert environment[supervisor.RESET_ENV] == "1"
+    # The running copy's own environment is left as it was.
+    assert supervisor.os.environ[supervisor.CHILD_ENV] == "1"
+    assert supervisor.os.environ[supervisor.RESET_ENV] == "0"
