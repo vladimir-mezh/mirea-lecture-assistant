@@ -25,7 +25,7 @@ capture checks remain responsible for that distinction. No new wrong-room filter
 Verification on 2026-10-01: 403 tests passed, Ruff and diff checks passed.
 Packaged isolated-profile smoke exited 0 with HTTPS 200. The first request to
 GitHub's large homepage timed out; retry against robots.txt succeeded. Installed
-0.2.13 locally at C:\Users\wowan\Downloads\MireaLectureAssistant.exe; real startup
+0.2.13 locally at the user's Downloads folder; real startup
 confirmed valid saved session and 37 schedule entries. No test attendance/chat
 messages were sent to real lectures. Delivery branch: codex/reliability-0.2.11;
 master and GitHub release publication are separate actions.

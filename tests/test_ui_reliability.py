@@ -1727,3 +1727,46 @@ def test_start_with_windows_is_on_by_default_and_follows_the_program(window, mon
     window._autostart_toggled(False)
     assert calls[-1] == (False, "App.exe")
     assert window.db.get_setting("autostart") is False
+
+
+def _watched_running_room(window, monkeypatch, state):
+    lesson = _running_lesson("soft")
+    window.db.sync_lessons([lesson], datetime.now().astimezone() - timedelta(days=1))
+    window.active_lecture_id = "soft"
+    window.active_lecture_url = "https://my.mts-link.ru/j/soft"
+    monkeypatch.setattr(window, "_run", lambda _fn, done, _busy, failed=None: done(state))
+    reopened = []
+    monkeypatch.setattr(window, "_open_lecture", lambda *args, **kwargs: reopened.append(args))
+    monkeypatch.setattr(window, "_restart_lecture_browser", lambda: reopened.append("restart"))
+    clock = [1000.0]
+    monkeypatch.setattr("mirea_lecture_assistant.ui.time.monotonic", lambda: clock[0])
+    return reopened, clock
+
+
+def test_a_frozen_stream_reloads_the_room_once_not_every_ten_seconds(window, monkeypatch):
+    """A lecturer with the camera off must not be kicked out and back in all pair long."""
+    reopened, clock = _watched_running_room(window, monkeypatch, "stalled")
+
+    for _ in range(30):  # five minutes of health checks
+        window._lecture_watch_tick()
+        clock[0] += 10
+    assert len(reopened) == 1
+
+    clock[0] += 600
+    window._lecture_watch_tick()
+    assert len(reopened) == 2
+
+
+def test_failing_captures_reload_the_room_at_most_every_ten_minutes(window, monkeypatch):
+    """A computer too slow to capture is not fixed by reloading the lecture."""
+    reopened, clock = _watched_running_room(window, monkeypatch, "live")
+    monkeypatch.setattr(window.scan_timer, "isActive", lambda: True)
+    window.lecture_started_at = clock[0]
+    window.last_capture_at = clock[0]
+
+    for _ in range(30):
+        clock[0] += 10
+        window._lecture_watch_tick()
+
+    assert len(reopened) == 1
+    assert "restart" not in reopened

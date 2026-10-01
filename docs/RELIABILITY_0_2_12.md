@@ -62,7 +62,7 @@ restoration can resume work but cannot recover a QR already missed.
 - PyInstaller build completed; isolated populated-profile smoke test exited 0,
   main_window_ready and smoke_https_ok HTTP 200 were observed. Real authentication
   was disabled in the smoke profile.
-- Installed locally at C:\Users\wowan\Downloads\MireaLectureAssistant.exe.
+- Installed locally at the user's Downloads folder.
   SHA256: D161D5D48A642E1EB6EF657631035FCBE498B7B96A2975C3468B5E0592FD513A.
 - Live startup logs: version=0.2.12, stored_session_verified state=valid,
   schedule_loaded lesson_count=37; supervisor heartbeat updated every second.

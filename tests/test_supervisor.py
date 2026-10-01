@@ -6,7 +6,7 @@ ACCESS_VIOLATION = 0xC0000005
 
 
 def test_hung_child_is_terminated_as_its_own_tree(monkeypatch):
-    ticks = iter([0, supervisor.STARTUP_GRACE_SECONDS + 1])
+    clock = [0.0]
     killed = []
 
     class Process:
@@ -16,15 +16,20 @@ def test_hung_child_is_terminated_as_its_own_tree(monkeypatch):
             return None
 
         def wait(self, timeout):
-            return 1
+            if killed:
+                return 1
+            clock[0] += timeout  # the watchdog's own five-second poll
+            raise supervisor.subprocess.TimeoutExpired("app", timeout)
 
-    monkeypatch.setattr(supervisor.time, "monotonic", lambda: next(ticks))
+    monkeypatch.setattr(supervisor.time, "monotonic", lambda: clock[0])
     monkeypatch.setattr(supervisor.subprocess, "Popen", lambda *_a, **_kw: Process())
     monkeypatch.setattr(supervisor.subprocess, "run", lambda command, **_kw: killed.append(command))
     monkeypatch.setattr(supervisor.sys, "platform", "win32")
     monkeypatch.setattr(supervisor, "_log", lambda *_args: None)
     assert supervisor.monitored_call(["app.exe"], {}) == supervisor.CRASHED
     assert killed == [["taskkill", "/PID", "12345", "/T", "/F"]]
+    # Never before the startup grace ran out.
+    assert clock[0] > supervisor.STARTUP_GRACE_SECONDS
 
 
 def test_a_healthy_child_can_exit_without_a_forced_restart(monkeypatch):
@@ -99,3 +104,31 @@ def test_an_update_starts_a_separate_copy_with_its_own_watchdog(monkeypatch):
     # The running copy's own environment is left as it was.
     assert supervisor.os.environ[supervisor.CHILD_ENV] == "1"
     assert supervisor.os.environ[supervisor.RESET_ENV] == "0"
+
+
+def test_a_computer_waking_from_sleep_does_not_kill_the_app(monkeypatch, tmp_path):
+    """The heartbeat stops while the computer sleeps; the app beats again on waking."""
+    ticks = iter([0, 5, 3_600, 3_605, 3_610])
+    killed = []
+
+    class Process:
+        pid = 12345
+        returncode = 0
+
+        def __init__(self):
+            self.polls = 0
+
+        def poll(self):
+            self.polls += 1
+            return None if self.polls <= 4 else 0
+
+        def wait(self, timeout):
+            raise supervisor.subprocess.TimeoutExpired("app", timeout)
+
+    monkeypatch.setattr(supervisor.time, "monotonic", lambda: next(ticks))
+    monkeypatch.setattr(supervisor.subprocess, "Popen", lambda *_a, **_kw: Process())
+    monkeypatch.setattr(supervisor.subprocess, "run", lambda command, **_kw: killed.append(command))
+    monkeypatch.setattr(supervisor, "_log", lambda *_args: None)
+
+    assert supervisor.monitored_call(["app.exe"], {}) == 0
+    assert killed == []

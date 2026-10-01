@@ -530,7 +530,8 @@ class BrowserService:
             sample = await page.evaluate(MEDIA_PROGRESS, timeout=0.5)
             if self._media_stalled(sample, time.monotonic()):
                 log.warning("lecture_media_stalled")
-                return "unstable"
+                # Not a banner: the UI decides how often a reload is worth trying.
+                return "stalled"
         except CdpError:
             pass  # unsupported player: retain banner/DOM/capture checks
         return "live"
@@ -611,7 +612,7 @@ class BrowserService:
         log.info("lecture_join_clicked label=%s", label)
         await page.wait_for_timeout(2_000)
         state = await self._lecture_state_async()
-        return "joined" if state == "live" else "waiting"
+        return "joined" if state in ("live", "stalled") else "waiting"
 
     async def _fill_display_name(self, page, display_name: str) -> None:
         """Lobbies ask who is entering; an empty field keeps the button disabled."""

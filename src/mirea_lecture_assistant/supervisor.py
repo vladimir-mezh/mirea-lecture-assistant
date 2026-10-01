@@ -33,6 +33,9 @@ HEARTBEAT_ENV = "MIREA_ASSISTANT_HEARTBEAT"
 HEARTBEAT_TIMEOUT_SECONDS = 120
 STARTUP_GRACE_SECONDS = 180
 CRASH_COOLDOWN_SECONDS = 300
+# The loop below wakes every few seconds; a much longer gap means the computer
+# slept. The app had no chance to beat meanwhile and must not be killed for it.
+SLEEP_GAP_SECONDS = 30
 
 
 def monitored_call(command, env) -> int:
@@ -43,12 +46,17 @@ def monitored_call(command, env) -> int:
         started = time.monotonic()
         last_seen = started
         last_stamp = None
+        last_check = started
         while process.poll() is None:
             try:
                 stamp = heartbeat.stat().st_mtime_ns
             except FileNotFoundError:
                 stamp = None
             now = time.monotonic()
+            if now - last_check > SLEEP_GAP_SECONDS:
+                _log(f"system_resumed gap_seconds={now - last_check:.0f}")
+                started = last_seen = now
+            last_check = now
             if stamp is not None and stamp != last_stamp:
                 last_seen = now
                 last_stamp = stamp
@@ -67,7 +75,7 @@ def monitored_call(command, env) -> int:
                         capture_output=True,
                         timeout=15,
                         check=False,
-                        creationflags=subprocess.CREATE_NO_WINDOW,
+                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                     )
                 else:
                     process.kill()

@@ -82,6 +82,10 @@ ATTENDANCE_FAILURE_SPAN_SECONDS = 120
 # is over before then was the wrong room, or the teacher closed it and is about
 # to open another one.
 LEAVE_AFTER_END = timedelta(minutes=5)
+# A frozen stream or failing captures may come from the stream or the computer,
+# not from the tab: a reload is tried, but not again and again (each one leaves
+# and re-enters the room, and a QR shown meanwhile is missed).
+SOFT_RECOVERY_EVERY_SECONDS = 10 * 60
 # While a pair runs, the СДО is checked again for a newer room of this group:
 # often at the start, when teachers recreate rooms, rarely later.
 RECHECK_EARLY_WINDOW = timedelta(minutes=20)
@@ -644,6 +648,7 @@ class MainWindow(QMainWindow):
         self.entering_lecture_room = False
         self.lecture_recovery_failures = 0
         self.lecture_unstable_checks = 0
+        self.soft_recovery_at: float | None = None
         if os.environ.get("MIREA_ASSISTANT_SMOKE_TEST") != "1":
             QTimer.singleShot(0, self._restore_active_lecture)
         QTimer.singleShot(0, self._startup_auth)
@@ -2898,7 +2903,9 @@ class MainWindow(QMainWindow):
         self.active_lecture_url = self.browser.lecture_url
         log.info("lecture_opened lesson_id=%s browser=%s", lesson_id, browser_name)
         self._make_active(lesson_id)
-        self.statusBar().showMessage(f"Страница лекции загружена в {browser_name}; подключаемся…", 4000)
+        self.statusBar().showMessage(
+            f"Страница лекции загружена в {browser_name}; подключаемся…", 4000
+        )
         if self.minimize_on_open.isChecked():
             self._minimize_lecture("Сворачиваем окно лекции…")
         self._enter_lecture_room()
@@ -2945,16 +2952,19 @@ class MainWindow(QMainWindow):
                 state = "lost"
             else:
                 self.lecture_unstable_checks = 0
-            if state == "live":
-                if (
-                    self.scan_timer.isActive()
-                    and time.monotonic() - (self.last_capture_at or self.lecture_started_at) > 30
-                ):
-                    state = "lost"
-                    log.warning("lecture_capture_stale")
-                else:
-                    self.lecture_recovery_failures = 0
+            if state == "live" and (
+                self.scan_timer.isActive()
+                and time.monotonic() - (self.last_capture_at or self.lecture_started_at) > 30
+            ):
+                log.warning("lecture_capture_stale")
+                state = "stalled"
+            if state == "stalled":
+                if not self._soft_recovery_due():
                     return
+                state = "lost"
+            if state == "live":
+                self.lecture_recovery_failures = 0
+                return
             if state == "ended":
                 self._room_ended(lesson)
                 return
@@ -2984,6 +2994,18 @@ class MainWindow(QMainWindow):
             "Проверяем вкладку лекции…",
             failed=failed,
         )
+
+    def _soft_recovery_due(self) -> bool:
+        now = time.monotonic()
+        if self.soft_recovery_at is not None and now - self.soft_recovery_at < (
+            SOFT_RECOVERY_EVERY_SECONDS
+        ):
+            return False
+        self.soft_recovery_at = now
+        # The reloaded room gets the same 30 seconds as a new one before its
+        # captures count as stale again.
+        self.last_capture_at = now
+        return True
 
     def _enter_lecture_room(self):
         """Press the platform's entry control, with the student's name if asked for."""
