@@ -1990,5 +1990,5 @@ def test_the_max_extension_is_put_in_a_folder_to_add_to_the_browser(window, tmp_
         "manifest.json",
         "skip-max.js",
     ]
-    assert opened[0].toLocalFile() == str(folder)
+    assert Path(opened[0].toLocalFile()) == folder
     assert "Режим разработчика" in told[0][2]
