@@ -12,7 +12,6 @@ from string import Template
 
 from PySide6.QtCore import (
     QEvent,
-    QMimeData,
     QObject,
     QRunnable,
     Qt,
@@ -775,12 +774,18 @@ class MainWindow(QMainWindow):
         typed = False
         window = manual_code.foreground_window()
         if window is not None and bool(self.db.get_setting("type_manual_codes", True)):
-            title, window_class, pid = window
+            title, window_class, pid, program = window
             ours = self.browser.process is not None and pid == self.browser.process.pid
-            if not ours and manual_code.looks_like_mirea_page(title, window_class):
+            if not ours and manual_code.looks_like_mirea_page(title, window_class, program):
                 typed = manual_code.type_text(code)
             # The title tells why a code was or was not typed; the code is never logged.
-            log.info("manual_code_window class=%s ours=%s title=%r", window_class, ours, title[:80])
+            log.info(
+                "manual_code_window program=%s class=%s ours=%s title=%r",
+                program,
+                window_class,
+                ours,
+                title[:80],
+            )
         log.info("manual_code_delivered copied=True typed=%s", typed)
         self.tray.showMessage(
             "Код МИРЭА" + (" введён" if typed else " скопирован"),
@@ -791,17 +796,10 @@ class MainWindow(QMainWindow):
 
     def _copy_code(self, code: str):
         """Copy a one-time code, kept out of Windows' clipboard history and cloud sync."""
-        data = QMimeData()
-        data.setText(code)
-        never = (0).to_bytes(4, "little")
-        for name, value in (
-            ("ExcludeClipboardContentFromMonitorProcessing", b"\x01"),
-            ("CanIncludeInClipboardHistory", never),
-            ("CanUploadToCloudClipboard", never),
-        ):
-            data.setData(f'application/x-qt-windows-mime;value="{name}"', value)
         clipboard = QGuiApplication.clipboard()
-        clipboard.setMimeData(data)
+        if not manual_code.copy_secret(code):
+            # Plain text only: a QMimeData left on the clipboard crashed Qt's shutdown.
+            clipboard.setText(code)
 
         def forget():
             if clipboard.text() == code:

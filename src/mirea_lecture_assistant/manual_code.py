@@ -41,6 +41,24 @@ RECONNECT_SECONDS = (30, 120, 600)
 AUTH_FAILURE_PAUSE_SECONDS = 30 * 60
 # Windows of desktop browsers: Chrome, Edge, Яндекс, Opera, Brave, Vivaldi; Firefox.
 BROWSER_WINDOW_CLASSES = {"Chrome_WidgetWin_1", "MozillaWindowClass"}
+# Discord, VS Code, Slack and other Electron apps share Chrome's window class, so the
+# program itself must be a browser too: a code never lands in a chat named «МИРЭА».
+BROWSER_EXECUTABLES = {
+    "chrome.exe",
+    "chromium.exe",
+    "msedge.exe",
+    "browser.exe",  # Яндекс Браузер
+    "opera.exe",
+    "brave.exe",
+    "vivaldi.exe",
+    "arc.exe",
+    "thorium.exe",
+    "firefox.exe",
+    "librewolf.exe",
+    "waterfox.exe",
+    "floorp.exe",
+    "zen.exe",
+}
 MIREA_TITLE_MARKERS = ("mirea", "мирэа")
 
 
@@ -165,16 +183,18 @@ def idle_wait(mailbox, seconds: float, stop: threading.Event, ready=_socket_read
     return changed
 
 
-def looks_like_mirea_page(title: str, window_class: str) -> bool:
+def looks_like_mirea_page(title: str, window_class: str, executable: str) -> bool:
     """A desktop browser whose page title names MIREA (its sign-in page does)."""
     folded = title.casefold()
-    return window_class in BROWSER_WINDOW_CLASSES and any(
-        marker in folded for marker in MIREA_TITLE_MARKERS
+    return (
+        window_class in BROWSER_WINDOW_CLASSES
+        and executable.casefold() in BROWSER_EXECUTABLES
+        and any(marker in folded for marker in MIREA_TITLE_MARKERS)
     )
 
 
-def foreground_window() -> tuple[str, str, int] | None:
-    """(title, window class, process id) of the window in front, on Windows."""
+def foreground_window() -> tuple[str, str, int, str] | None:
+    """(title, window class, process id, program file name) of the window in front."""
     if sys.platform != "win32":
         return None
     import ctypes
@@ -190,7 +210,26 @@ def foreground_window() -> tuple[str, str, int] | None:
     user32.GetClassNameW(window, window_class, len(window_class))
     pid = wintypes.DWORD()
     user32.GetWindowThreadProcessId(window, ctypes.byref(pid))
-    return title.value, window_class.value, int(pid.value)
+    return title.value, window_class.value, int(pid.value), _program_name(int(pid.value))
+
+
+def _program_name(pid: int) -> str:
+    """The file name of a process's program, or "" when Windows does not tell."""
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.windll.kernel32
+    process = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+    if not process:
+        return ""
+    try:
+        path = ctypes.create_unicode_buffer(1024)
+        size = wintypes.DWORD(len(path))
+        if not kernel32.QueryFullProcessImageNameW(process, 0, path, ctypes.byref(size)):
+            return ""
+        return path.value.replace("/", "\\").rsplit("\\", 1)[-1]
+    finally:
+        kernel32.CloseHandle(process)
 
 
 def type_text(text: str) -> bool:
@@ -236,6 +275,71 @@ def type_text(text: str) -> bool:
     array = (INPUT * len(events))(*events)
     sent = ctypes.windll.user32.SendInput(len(events), array, ctypes.sizeof(INPUT))
     return sent == len(events)
+
+
+def copy_secret(text: str) -> bool:
+    """Put ``text`` on the Windows clipboard, kept out of its history and cloud sync.
+
+    Straight through the Win32 API: Qt's QMimeData given to the clipboard crashed
+    the process when Qt shut down with it still there, and a crash on «Выход»
+    would have the watchdog start the app again.
+    """
+    if sys.platform != "win32":
+        return False
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
+    # 64-bit handles and pointers: without these ctypes cuts them to 32 bits.
+    kernel32.GlobalAlloc.restype = wintypes.HGLOBAL
+    kernel32.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
+    kernel32.GlobalLock.restype = ctypes.c_void_p
+    kernel32.GlobalLock.argtypes = [wintypes.HGLOBAL]
+    kernel32.GlobalUnlock.argtypes = [wintypes.HGLOBAL]
+    kernel32.GlobalFree.argtypes = [wintypes.HGLOBAL]
+    user32.SetClipboardData.restype = wintypes.HANDLE
+    user32.SetClipboardData.argtypes = [wintypes.UINT, wintypes.HANDLE]
+    user32.OpenClipboard.argtypes = [wintypes.HWND]
+    user32.RegisterClipboardFormatW.argtypes = [wintypes.LPCWSTR]
+    user32.RegisterClipboardFormatW.restype = wintypes.UINT
+
+    def global_copy(data: bytes):
+        handle = kernel32.GlobalAlloc(0x0002, len(data))  # GMEM_MOVEABLE
+        if not handle:
+            return None
+        pointer = kernel32.GlobalLock(handle)
+        if not pointer:
+            kernel32.GlobalFree(handle)
+            return None
+        ctypes.memmove(pointer, data, len(data))
+        kernel32.GlobalUnlock(handle)
+        return handle
+
+    for _attempt in range(10):  # another program may hold the clipboard a moment
+        if user32.OpenClipboard(None):
+            break
+        time.sleep(0.05)
+    else:
+        return False
+    try:
+        user32.EmptyClipboard()
+        never = (0).to_bytes(4, "little")
+        items = [(13, text.encode("utf-16-le") + b"\0\0")]  # CF_UNICODETEXT
+        for name, value in (
+            ("ExcludeClipboardContentFromMonitorProcessing", b"\x01"),
+            ("CanIncludeInClipboardHistory", never),
+            ("CanUploadToCloudClipboard", never),
+        ):
+            items.append((user32.RegisterClipboardFormatW(name), value))
+        for clipboard_format, data in items:
+            handle = global_copy(data)
+            # The clipboard owns the memory once it takes it; free it otherwise.
+            if handle and not user32.SetClipboardData(clipboard_format, handle):
+                kernel32.GlobalFree(handle)
+        return True
+    finally:
+        user32.CloseClipboard()
 
 
 def own_code_window_is_open(own_until: float, login_running: bool) -> bool:
