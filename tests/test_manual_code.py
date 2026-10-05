@@ -101,6 +101,7 @@ def test_codes_are_typed_only_into_a_browser_showing_mirea(title, window_class, 
 
 def test_the_watcher_reports_each_new_code_once_and_sleeps_in_idle(monkeypatch):
     found = []
+    calls = []
 
     class Reader:
         polls = iter([None, "111111", None, "222222", None])
@@ -108,8 +109,10 @@ def test_the_watcher_reports_each_new_code_once_and_sleeps_in_idle(monkeypatch):
         def latest_uid(self, _account):
             return 40
 
-        def _poll(self, _mailbox, folders, _since, after_uid, checked, _foreign, foreign_ok):
-            assert folders == ["INBOX"] and after_uid >= 40 and foreign_ok is False
+        def _poll(self, _mailbox, folders, _since, after_uid, checked, _foreign, foreign_ok, **kw):
+            # Recorded, not asserted here: the watcher survives any error and
+            # would retry forever instead of failing the test.
+            calls.append((folders, after_uid >= 40, foreign_ok, kw))
             return next(self.polls, None)
 
     class Mailbox:
@@ -140,6 +143,8 @@ def test_the_watcher_reports_each_new_code_once_and_sleeps_in_idle(monkeypatch):
 
     assert found == ["111111", "222222"]
     assert idles == [manual_code.IDLE_REFRESH_SECONDS] * 3  # no polling loop in between
+    # Only letters about signing in: never a deadline reminder of the СДО.
+    assert all(call == (["INBOX"], True, False, {"sign_in_only": True}) for call in calls)
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="the Windows clipboard itself")

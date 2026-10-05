@@ -104,7 +104,14 @@ class CodeWatcher:
                     failures = 0
                     while not self._stop.is_set():
                         code = self.reader._poll(
-                            mailbox, folders, started, after_uid, checked, {}, False
+                            mailbox,
+                            folders,
+                            started,
+                            after_uid,
+                            checked,
+                            {},
+                            False,
+                            sign_in_only=True,
                         )
                         # Letters below the newest one seen need no second look.
                         inbox = [int(uid) for folder, uid in checked if folder == "INBOX"]

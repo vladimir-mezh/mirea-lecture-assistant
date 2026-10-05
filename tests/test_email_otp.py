@@ -534,3 +534,35 @@ def test_a_new_letter_is_read_even_if_its_date_lags_behind(imap):
         )
         == "482913"
     )
+
+
+def test_a_deadline_reminder_of_the_sdo_is_no_code():
+    """Its link carried the id of an assignment, six digits, once taken for a code."""
+    now = datetime.now(UTC)
+    raw = message(
+        "У вас есть задания, которые нужно сдать через 7 дней",
+        "Здравствуйте, Владимир Игоревич,\nСледующие задания необходимо сдать до "
+        "вторник 13 октября 2026.\nПерейти к элементу: "
+        "https://online-edu.mirea.ru/mod/assign/view.php?id=452311",
+        now,
+        "Не нужно отвечать на это сообщение <online@mirea.ru>",
+    )
+    assert extract_fresh_otp(raw, now) is None
+
+
+def test_the_watcher_takes_only_letters_about_signing_in():
+    from mirea_lecture_assistant.email_otp import _otp_candidate
+
+    now = datetime.now(UTC)
+    sign_in = message(
+        "012345 – ваш код #BC для входа в учётную запись РТУ МИРЭА",
+        "Введите код 012345 (#BC) для подтверждения входа.",
+        now,
+        "sso@mirea.ru",
+    )
+    course = message(
+        "Новое в курсе", "Код курса: 482913. Занятие перенесено.", now, "online@mirea.ru"
+    )
+
+    assert _otp_candidate(sign_in, now, sign_in_only=True) == ("012345", True)
+    assert _otp_candidate(course, now, sign_in_only=True) is None

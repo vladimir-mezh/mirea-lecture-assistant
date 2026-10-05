@@ -21,6 +21,14 @@ CONTEXT_CODE = re.compile(
     re.IGNORECASE,
 )
 SIX_DIGITS = re.compile(r"(?<!\d)(\d{6})(?!\d)")
+# A letter about signing in («…ваш код для входа в учётную запись РТУ МИРЭА»).
+# Other MIREA letters — СДО deadlines, news — carry six-digit numbers too: the
+# id of an assignment in a link was once taken for a code.
+SIGN_IN_LETTER = re.compile(
+    r"(?:для|при)\s+входа|подтвержд\w*\s+вход|вход\w*\s+в\s+уч[её]тн|"
+    r"sign[- ]?in|log[- ]?in|verification",
+    re.IGNORECASE,
+)
 HTML_TAG = re.compile(r"<[^>]+>")
 HTML_NOISE = re.compile(r"<(style|script|head)\b.*?</\1\s*>", re.IGNORECASE | re.DOTALL)
 MIREA_MARKERS = ("mirea", "мирэа")
@@ -264,12 +272,18 @@ def _message_text(message: Message) -> str:
 
 
 def _otp_candidate(
-    raw_message: bytes, not_before: datetime, *, check_date: bool = True
+    raw_message: bytes,
+    not_before: datetime,
+    *,
+    check_date: bool = True,
+    sign_in_only: bool = False,
 ) -> tuple[str, bool] | None:
     """Return (code, sent by MIREA) for a fresh code letter, otherwise None.
 
     ``check_date`` is off when the letter is known to be new by its UID: a
     sender whose clock lags a few seconds must not hide the real code.
+    ``sign_in_only`` takes only letters about signing in, whatever they say
+    about a "код": the always-on watcher of the student's own sign-ins uses it.
     """
     message = email.message_from_bytes(raw_message)
     if check_date:
@@ -289,10 +303,13 @@ def _otp_candidate(
     from_mirea = any(marker in f"{subject} {sender}".casefold() for marker in MIREA_MARKERS)
     body = _message_text(message)
     combined = f"{subject}\n{body}"
+    about_sign_in = bool(SIGN_IN_LETTER.search(combined))
+    if sign_in_only and not about_sign_in:
+        return None
     contextual = CONTEXT_CODE.search(combined)
     if contextual:
         return contextual.group(1), from_mirea
-    if from_mirea:
+    if from_mirea and about_sign_in:
         generic = SIX_DIGITS.search(combined)
         if generic:
             return generic.group(1), True
@@ -407,6 +424,8 @@ class ImapOtpReader:
         checked: set[tuple[str, bytes]],
         foreign: dict[str, float],
         accept_foreign: bool = False,
+        *,
+        sign_in_only: bool = False,
     ) -> str | None:
         for folder in folders:
             # A UID snapshot only exists for the inbox; UIDs differ per folder.
@@ -424,7 +443,10 @@ class ImapOtpReader:
                         continue
                     try:
                         candidate = _otp_candidate(
-                            row[1], not_before, check_date=folder_after is None
+                            row[1],
+                            not_before,
+                            check_date=folder_after is None,
+                            sign_in_only=sign_in_only,
                         )
                     except Exception:  # one broken letter must not stop the wait
                         log.debug("email_otp_letter_unreadable", exc_info=True)
