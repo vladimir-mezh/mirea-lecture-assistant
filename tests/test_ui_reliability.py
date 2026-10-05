@@ -1968,3 +1968,27 @@ def test_a_chat_app_named_mirea_is_never_typed_into(window, monkeypatch):
 
     assert typed == []
     assert QApplication.clipboard().text() == "482915"  # still one Ctrl+V away
+
+
+def test_the_max_extension_is_put_in_a_folder_to_add_to_the_browser(window, tmp_path, monkeypatch):
+    from mirea_lecture_assistant import paths
+
+    monkeypatch.setattr(paths, "data_dir", lambda: tmp_path)
+    opened, told = [], []
+    monkeypatch.setattr(
+        "mirea_lecture_assistant.ui.QDesktopServices.openUrl", lambda url: opened.append(url)
+    )
+    monkeypatch.setattr(
+        "mirea_lecture_assistant.ui.QMessageBox.information", lambda *args: told.append(args)
+    )
+
+    window._install_browser_extension()
+
+    folder = tmp_path / "browser-extension"
+    assert sorted(path.name for path in folder.iterdir()) == [
+        "README.txt",
+        "manifest.json",
+        "skip-max.js",
+    ]
+    assert Path(opened[0].toLocalFile()) == folder
+    assert "Режим разработчика" in told[0][2]
