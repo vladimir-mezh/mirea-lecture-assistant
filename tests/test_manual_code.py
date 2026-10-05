@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import imaplib
+import sys
 import threading
 
 import pytest
@@ -139,3 +140,33 @@ def test_the_watcher_reports_each_new_code_once_and_sleeps_in_idle(monkeypatch):
 
     assert found == ["111111", "222222"]
     assert idles == [manual_code.IDLE_REFRESH_SECONDS] * 3  # no polling loop in between
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="the Windows clipboard itself")
+def test_a_code_reaches_the_windows_clipboard_but_not_its_history():
+    import ctypes
+    from ctypes import wintypes
+
+    assert manual_code.copy_secret("482915")
+
+    user32, kernel32 = ctypes.windll.user32, ctypes.windll.kernel32
+    user32.GetClipboardData.restype = wintypes.HANDLE
+    kernel32.GlobalLock.restype = ctypes.c_void_p
+    kernel32.GlobalLock.argtypes = [wintypes.HGLOBAL]
+    assert user32.OpenClipboard(None)
+    try:
+        for name in (
+            "ExcludeClipboardContentFromMonitorProcessing",
+            "CanIncludeInClipboardHistory",
+            "CanUploadToCloudClipboard",
+        ):
+            assert user32.IsClipboardFormatAvailable(user32.RegisterClipboardFormatW(name))
+        handle = user32.GetClipboardData(13)  # CF_UNICODETEXT
+        pointer = kernel32.GlobalLock(handle)
+        try:
+            assert ctypes.wstring_at(pointer) == "482915"
+        finally:
+            kernel32.GlobalUnlock(handle)
+        user32.EmptyClipboard()
+    finally:
+        user32.CloseClipboard()

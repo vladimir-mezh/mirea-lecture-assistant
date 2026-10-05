@@ -1878,6 +1878,8 @@ def _code_window(window, monkeypatch, foreground):
     messages = []
     monkeypatch.setattr(manual_code, "foreground_window", lambda: foreground)
     monkeypatch.setattr(manual_code, "type_text", lambda code: typed.append(code) or True)
+    # Qt's own clipboard: under QT_QPA_PLATFORM=offscreen it is not the Windows one.
+    monkeypatch.setattr(manual_code, "copy_secret", lambda _code: False)
     monkeypatch.setattr(window.tray, "showMessage", lambda *args: messages.append(args))
     QApplication.clipboard().clear()
     return typed, messages
