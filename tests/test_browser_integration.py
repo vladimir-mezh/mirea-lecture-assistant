@@ -18,6 +18,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from typing import ClassVar
 
 import pytest
 import qrcode
@@ -89,6 +90,26 @@ WEBINARS = """<!doctype html><html><head><meta charset="utf-8"></head><body>
 </script></body></html>"""
 
 
+# MIREA's offer to confirm sign-ins through МАКС: a code form and a skip form.
+MAX_PAGE = """<!doctype html><html><head><meta charset="utf-8"><title>Вход в МИРЭА</title></head><body>
+<h1>Подтверждение через МАКС</h1>
+<form id="kc-max-otp-form" method="post"
+      action="/realms/mirea/login-actions/required-action?execution=max-account-config">
+  <input name="code" autofocus><button type="submit">Подтвердить</button>
+</form>
+<form id="kc-max-otp-skip-form" method="post"
+      action="/realms/mirea/login-actions/required-action?execution=max-account-config">
+  <input type="hidden" name="skip" value="true">
+  <input type="submit" value="Пропустить">
+</form></body></html>"""
+
+# Another required action: nothing on it may be pressed.
+PASSWORD_PAGE = """<!doctype html><html><head><meta charset="utf-8"></head><body>
+<form method="post" action="/realms/mirea/login-actions/required-action?execution=UPDATE_PASSWORD">
+  <input name="password-new"><button type="submit">Пропустить</button>
+</form></body></html>"""
+
+
 def _chrome() -> str | None:
     candidates = [
         os.environ.get("CHROME_PATH", ""),
@@ -110,9 +131,24 @@ def _free_port() -> int:
 
 class Site(http.server.BaseHTTPRequestHandler):
     qr_png = b""
+    posted: ClassVar[list[tuple[str, bytes]]] = []
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length") or 0)
+        Site.posted.append((self.path, self.rfile.read(length)))
+        body = b"<!doctype html><title>done</title>"
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def do_GET(self):
-        if self.path.startswith("/event/"):
+        if "execution=max-account-config" in self.path:
+            body, kind = MAX_PAGE.encode(), "text/html; charset=utf-8"
+        elif "execution=UPDATE_PASSWORD" in self.path:
+            body, kind = PASSWORD_PAGE.encode(), "text/html; charset=utf-8"
+        elif self.path.startswith("/event/"):
             body, kind = ROOM.encode(), "text/html; charset=utf-8"
         elif self.path == "/qr.png":
             body, kind = self.qr_png, "image/png"
@@ -161,7 +197,10 @@ def room(tmp_path_factory):
         f"--user-data-dir={profile}",
         "--no-first-run",
         "--no-proxy-server",
-        "--host-resolver-rules=MAP mts-link.ru 127.0.0.1, MAP online-edu.mirea.ru 127.0.0.1",
+        (
+            "--host-resolver-rules=MAP mts-link.ru 127.0.0.1, MAP online-edu.mirea.ru 127.0.0.1,"
+            " MAP sso.mirea.ru 127.0.0.1"
+        ),
         "about:blank",
     ]
     if sys.platform.startswith("linux"):
@@ -306,3 +345,45 @@ def test_empty_http_document_is_not_a_live_or_capturable_lecture(room):
     assert service.lecture_state() == "unstable"
     with pytest.raises(RuntimeError, match="ещё не загрузилась"):
         run_async(service.capture_page_state())
+
+
+EXTENSION_SCRIPT = Path(__file__).resolve().parents[1] / "browser_extension" / "skip-max.js"
+
+
+def _run_extension_on(service, url: str) -> None:
+    browser = run_async(service._connected_browser())
+    page = run_async(browser.new_page(background=True))
+    try:
+        run_async(page.goto(url, wait_until="domcontentloaded"))
+        script = EXTENSION_SCRIPT.read_text(encoding="utf-8")
+        run_async(page.evaluate("() => {" + script + "}"))
+        time.sleep(1.5)
+    finally:
+        run_async(page.close())
+
+
+def test_the_extension_presses_skip_on_the_max_offer(room):
+    service, http_port = room
+    Site.posted.clear()
+    url = (
+        f"http://sso.mirea.ru:{http_port}/realms/mirea/login-actions/required-action"
+        "?execution=max-account-config"
+    )
+
+    _run_extension_on(service, url)
+
+    # Exactly the skip form went out, not the code form.
+    assert [body for _path, body in Site.posted] == [b"skip=true"]
+
+
+def test_the_extension_presses_nothing_on_another_required_action(room):
+    service, http_port = room
+    Site.posted.clear()
+    url = (
+        f"http://sso.mirea.ru:{http_port}/realms/mirea/login-actions/required-action"
+        "?execution=UPDATE_PASSWORD"
+    )
+
+    _run_extension_on(service, url)
+
+    assert Site.posted == []

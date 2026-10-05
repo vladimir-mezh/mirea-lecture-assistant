@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import secrets
+import shutil
 import sys
 import threading
 import time
@@ -1249,6 +1250,15 @@ class MainWindow(QMainWindow):
             self.type_manual_codes.setEnabled(False)
         self.copy_manual_codes.toggled.connect(self.type_manual_codes.setEnabled)
         sign_in.addRow("", self.type_manual_codes)
+        max_extension = QPushButton(
+            "Расширение «пропуск МАКС» для браузера…", objectName="secondary"
+        )
+        max_extension.setToolTip(
+            "Само нажимает «Пропустить» на странице «Подтверждение через МАКС», "
+            "когда вы входите на сайт МИРЭА в своём браузере"
+        )
+        max_extension.clicked.connect(self._install_browser_extension)
+        sign_in.addRow("МАКС", max_extension)
 
         appearance = self._settings_section(sections, "Внешний вид")
         self.theme_choice = QComboBox()
@@ -1603,6 +1613,37 @@ class MainWindow(QMainWindow):
     def _apply_capture_quality(self):
         """A small lecture window must not shrink the frame the scanner sees."""
         self.browser.capture_size = (1920, 1080) if self.hd_capture.isChecked() else None
+
+    def _install_browser_extension(self):
+        """Put the МАКС-skipping extension in a folder of its own and say how to add it.
+
+        A browser takes an unpacked extension only from a folder the person picks
+        on its extensions page; the program can prepare the folder, not press that.
+        """
+        from .paths import data_dir, resource_path
+
+        target = data_dir() / "browser-extension"
+        try:
+            shutil.copytree(resource_path("browser_extension"), target, dirs_exist_ok=True)
+        except OSError as exc:
+            log.warning("browser_extension_copy_failed", exc_info=True)
+            QMessageBox.warning(self, "Расширение", f"Не удалось подготовить папку: {exc}")
+            return
+        log.info("browser_extension_prepared")
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(target)))
+        QMessageBox.information(
+            self,
+            "Расширение «пропуск МАКС»",
+            "Папка с расширением открыта. Чтобы добавить его в браузер:\n\n"
+            "1. Откройте страницу расширений: chrome://extensions "
+            "(Edge — edge://extensions, Яндекс — browser://extensions).\n"
+            "2. Включите «Режим разработчика».\n"
+            "3. Нажмите «Загрузить распакованное расширение» и выберите папку:\n"
+            f"{target}\n\n"
+            "Папку не удаляйте: браузер берёт расширение из неё. Расширение работает "
+            "только на sso.mirea.ru и нажимает «Пропустить», лишь когда страница сама "
+            "это предлагает.",
+        )
 
     def _open_logs_folder(self):
         from .paths import data_dir

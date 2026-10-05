@@ -1,0 +1,17 @@
+{
+  "manifest_version": 3,
+  "name": "МИРЭА: пропуск МАКС",
+  "version": "1.0.0",
+  "description": "Сам нажимает «Пропустить» на странице «Подтверждение через МАКС» при входе в МИРЭА.",
+  "content_scripts": [
+    {
+      "matches": [
+        "https://sso.mirea.ru/*"
+      ],
+      "js": [
+        "skip-max.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ]
+}
