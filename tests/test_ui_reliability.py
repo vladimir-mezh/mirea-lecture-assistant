@@ -1869,3 +1869,78 @@ def test_only_the_startup_cleanup_touches_unfinished_downloads(window, monkeypat
     window._check_for_updates(manual=True)  # possibly while a download runs
 
     assert calls == [True, False, False]
+
+
+def _code_window(window, monkeypatch, foreground):
+    from mirea_lecture_assistant import manual_code
+
+    typed = []
+    messages = []
+    monkeypatch.setattr(manual_code, "foreground_window", lambda: foreground)
+    monkeypatch.setattr(manual_code, "type_text", lambda code: typed.append(code) or True)
+    monkeypatch.setattr(window.tray, "showMessage", lambda *args: messages.append(args))
+    QApplication.clipboard().clear()
+    return typed, messages
+
+
+def test_a_code_for_my_own_browser_sign_in_is_copied_and_typed(window, monkeypatch):
+    typed, messages = _code_window(
+        window, monkeypatch, ("Вход в МИРЭА - Google Chrome", "Chrome_WidgetWin_1", 4242)
+    )
+
+    window._manual_code_arrived("482915")
+
+    assert QApplication.clipboard().text() == "482915"
+    assert typed == ["482915"]
+    assert "введён" in messages[0][0]
+
+
+def test_a_code_of_the_apps_own_sign_in_is_left_alone(window, monkeypatch):
+    typed, messages = _code_window(
+        window, monkeypatch, ("Вход в МИРЭА - Google Chrome", "Chrome_WidgetWin_1", 4242)
+    )
+    window.login_in_progress = True
+    window._manual_code_arrived("111111")
+    window.login_in_progress = False  # its letter may still arrive a little later
+    window._manual_code_arrived("222222")
+
+    assert QApplication.clipboard().text() == ""
+    assert typed == [] and messages == []
+
+
+def test_a_code_is_only_copied_when_no_mirea_page_is_in_front(window, monkeypatch):
+    typed, messages = _code_window(
+        window, monkeypatch, ("Входящие — Почта - Google Chrome", "Chrome_WidgetWin_1", 4242)
+    )
+
+    window._manual_code_arrived("735102")
+
+    assert QApplication.clipboard().text() == "735102"
+    assert typed == []
+    assert "Ctrl+V" in messages[0][1]
+
+
+def test_the_lecture_browser_of_the_app_is_never_typed_into(window, monkeypatch):
+    from types import SimpleNamespace
+
+    window.browser.process = SimpleNamespace(pid=4242)
+    typed, _messages = _code_window(
+        window, monkeypatch, ("Курс МИРЭА - Google Chrome", "Chrome_WidgetWin_1", 4242)
+    )
+
+    window._manual_code_arrived("735102")
+
+    assert typed == []
+    window.browser.process = None
+
+
+def test_manual_codes_can_be_switched_off(window, monkeypatch):
+    typed, messages = _code_window(
+        window, monkeypatch, ("Вход в МИРЭА - Google Chrome", "Chrome_WidgetWin_1", 4242)
+    )
+    window.db.set_setting("copy_manual_codes", False)
+
+    window._manual_code_arrived("482915")
+
+    assert QApplication.clipboard().text() == ""
+    assert typed == [] and messages == []

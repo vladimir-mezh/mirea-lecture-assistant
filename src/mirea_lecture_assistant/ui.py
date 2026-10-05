@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import secrets
+import sys
 import threading
 import time
 from datetime import UTC, datetime, timedelta
@@ -11,6 +12,7 @@ from string import Template
 
 from PySide6.QtCore import (
     QEvent,
+    QMimeData,
     QObject,
     QRunnable,
     Qt,
@@ -60,7 +62,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from . import __version__, autostart, updater
+from . import __version__, autostart, manual_code, updater
 from .async_runtime import run_async
 from .browser_service import BrowserService, NotSignedInError
 from .chat_detection import chat_baseline, classmates_report_attendance_issue
@@ -95,6 +97,11 @@ ATTENDANCE_FAILURE_SPAN_SECONDS = 120
 # to open another one.
 LEAVE_AFTER_END = timedelta(minutes=5)
 SETTINGS_PAGE = 3
+# A code letter that arrives this long after one of the app's own sign-ins is
+# still taken for its own; only later ones are the student's.
+OWN_CODE_GRACE_SECONDS = 120
+# A copied code is taken off the clipboard again after this long.
+CODE_CLIPBOARD_SECONDS = 90
 # A frozen stream or failing captures may come from the stream or the computer,
 # not from the tab: a reload is tried, but not again and again (each one leaves
 # and re-enters the room, and a QR shown meanwhile is missed).
@@ -367,6 +374,12 @@ class WorkerSignals(QObject):
     failed = Signal(str)
 
 
+class CodeSignals(QObject):
+    """Carries a code from the mailbox watcher's thread to the window's."""
+
+    arrived = Signal(str)
+
+
 class Worker(QRunnable):
     def __init__(
         self,
@@ -552,11 +565,32 @@ class SourcesDialog(QDialog):
 
 
 class MainWindow(QMainWindow):
+    # Until then a MIREA code letter belongs to the app's own sign-in (monotonic time).
+    own_codes_until = 0.0
+    _login_in_progress = False
+
+    @property
+    def login_in_progress(self) -> bool:
+        return self._login_in_progress
+
+    @login_in_progress.setter
+    def login_in_progress(self, running: bool) -> None:
+        if self._login_in_progress and not running:
+            # The letter of a sign-in that just ended may still be on its way.
+            self._claim_own_codes()
+        self._login_in_progress = running
+
+    def _claim_own_codes(self) -> None:
+        self.own_codes_until = max(self.own_codes_until, time.monotonic() + OWN_CODE_GRACE_SECONDS)
+
     def __init__(self, database: Database):
         super().__init__()
         self.db = database
         self.session_store = SessionStore()
         self.otp_reader = ImapOtpReader()
+        self.code_watcher: manual_code.CodeWatcher | None = None
+        self.code_signals = CodeSignals()
+        self.code_signals.arrived.connect(self._manual_code_arrived)
         try:
             session = self.session_store.load()
         except Exception:
@@ -695,6 +729,7 @@ class MainWindow(QMainWindow):
         self.update_cleanup_timer = QTimer(self)
         self.update_cleanup_timer.setInterval(5_000)
         self.update_cleanup_timer.timeout.connect(self._cleanup_old_version)
+        QTimer.singleShot(3_000, self._restart_code_watcher)
         if updater.can_self_update() and os.environ.get("MIREA_ASSISTANT_SMOKE_TEST") != "1":
             # An update needs a check (20 s) and a click first, so no download of
             # this copy can be running yet: leftovers of an interrupted one go too.
@@ -708,6 +743,71 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(FIRST_UPDATE_CHECK_MS, self._check_for_updates)
         if self.db.recovery:
             QTimer.singleShot(0, self._report_database_recovery)
+
+    def _restart_code_watcher(self):
+        """Watch the mailbox for codes of the student's own sign-ins, if wanted."""
+        if self.code_watcher is not None:
+            self.code_watcher.stop()
+            self.code_watcher = None
+        if os.environ.get("MIREA_ASSISTANT_SMOKE_TEST") == "1":
+            return
+        if not bool(self.db.get_setting("copy_manual_codes", True)):
+            return
+        try:
+            account = self.session_store.load_email_credentials()
+        except Exception:
+            log.warning("manual_code_watcher_no_credentials", exc_info=True)
+            return
+        if account is None:
+            return
+        self.code_watcher = manual_code.CodeWatcher(account, self.code_signals.arrived.emit)
+        self.code_watcher.start()
+
+    def _manual_code_arrived(self, code: str):
+        if manual_code.own_code_window_is_open(
+            self.own_codes_until, self.login_in_progress or self.sdo_sign_in_lock.locked()
+        ):
+            log.info("manual_code_ignored reason=app_sign_in")
+            return
+        if not bool(self.db.get_setting("copy_manual_codes", True)):
+            return
+        self._copy_code(code)
+        typed = False
+        window = manual_code.foreground_window()
+        if window is not None and bool(self.db.get_setting("type_manual_codes", True)):
+            title, window_class, pid = window
+            ours = self.browser.process is not None and pid == self.browser.process.pid
+            if not ours and manual_code.looks_like_mirea_page(title, window_class):
+                typed = manual_code.type_text(code)
+            # The title tells why a code was or was not typed; the code is never logged.
+            log.info("manual_code_window class=%s ours=%s title=%r", window_class, ours, title[:80])
+        log.info("manual_code_delivered copied=True typed=%s", typed)
+        self.tray.showMessage(
+            "Код МИРЭА" + (" введён" if typed else " скопирован"),
+            f"{code} — " + ("введён на странице входа" if typed else "вставьте его: Ctrl+V"),
+            QSystemTrayIcon.MessageIcon.Information,
+            15000,
+        )
+
+    def _copy_code(self, code: str):
+        """Copy a one-time code, kept out of Windows' clipboard history and cloud sync."""
+        data = QMimeData()
+        data.setText(code)
+        never = (0).to_bytes(4, "little")
+        for name, value in (
+            ("ExcludeClipboardContentFromMonitorProcessing", b"\x01"),
+            ("CanIncludeInClipboardHistory", never),
+            ("CanUploadToCloudClipboard", never),
+        ):
+            data.setData(f'application/x-qt-windows-mime;value="{name}"', value)
+        clipboard = QGuiApplication.clipboard()
+        clipboard.setMimeData(data)
+
+        def forget():
+            if clipboard.text() == code:
+                clipboard.clear()
+
+        QTimer.singleShot(CODE_CLIPBOARD_SECONDS * 1000, forget)
 
     def _cleanup_old_version(self, partial: bool = False):
         # Independent of update-check settings and of network availability.
@@ -1136,6 +1236,21 @@ class MainWindow(QMainWindow):
         test_email = QPushButton("Проверить подключение к почте", objectName="secondary")
         test_email.clicked.connect(self._test_email_connection)
         sign_in.addRow("", test_email)
+        self.copy_manual_codes = QCheckBox("Когда вхожу сам, копировать код из письма МИРЭА")
+        self.copy_manual_codes.setToolTip(
+            "Приложение ждёт письмо, не нагружая компьютер: почта сама сообщает о новом "
+            "письме. Коды для входов самого приложения не копируются."
+        )
+        sign_in.addRow("Мой вход", self.copy_manual_codes)
+        self.type_manual_codes = QCheckBox("и сразу вводить его на странице МИРЭА в браузере")
+        self.type_manual_codes.setToolTip(
+            "Только если впереди окно браузера со страницей МИРЭА; иначе код просто "
+            "лежит в буфере обмена — вставьте его Ctrl+V"
+        )
+        if sys.platform != "win32":
+            self.type_manual_codes.setEnabled(False)
+        self.copy_manual_codes.toggled.connect(self.type_manual_codes.setEnabled)
+        sign_in.addRow("", self.type_manual_codes)
 
         appearance = self._settings_section(sections, "Внешний вид")
         self.theme_choice = QComboBox()
@@ -1209,6 +1324,8 @@ class MainWindow(QMainWindow):
             self.close_tab_after,
             self.chat_fallback,
             self.auto_login,
+            self.copy_manual_codes,
+            self.type_manual_codes,
         ):
             check.toggled.connect(self._settings_changed)
         self.email_provider.currentIndexChanged.connect(self._settings_changed)
@@ -1343,6 +1460,11 @@ class MainWindow(QMainWindow):
         self.chat_fallback.setChecked(bool(self.db.get_setting("chat_fallback", True)))
         self.student_name.setText(self.db.get_setting("student_name", ""))
         self.auto_login.setChecked(bool(self.db.get_setting("auto_login", True)))
+        self.copy_manual_codes.setChecked(bool(self.db.get_setting("copy_manual_codes", True)))
+        self.type_manual_codes.setChecked(bool(self.db.get_setting("type_manual_codes", True)))
+        self.type_manual_codes.setEnabled(
+            sys.platform == "win32" and self.copy_manual_codes.isChecked()
+        )
         self.theme_choice.blockSignals(True)
         index = self.theme_choice.findData(self.db.get_setting("theme", "system"))
         self.theme_choice.setCurrentIndex(max(index, 0))
@@ -1391,6 +1513,9 @@ class MainWindow(QMainWindow):
         self.db.set_setting("chat_fallback", self.chat_fallback.isChecked())
         self.db.set_setting("student_name", self.student_name.text().strip())
         self.db.set_setting("auto_login", self.auto_login.isChecked())
+        self.db.set_setting("copy_manual_codes", self.copy_manual_codes.isChecked())
+        self.db.set_setting("type_manual_codes", self.type_manual_codes.isChecked())
+        self._restart_code_watcher()
         if self.student_name.text().strip() and self.group_edit.text().strip():
             self.chat_config_warned = False
         self.scan_timer.setInterval(self.scan_interval.value() * 1000)
@@ -2491,15 +2616,19 @@ class MainWindow(QMainWindow):
 
         username, password = credentials
         log.info("sdo_sign_in_started")
-        self.browser.run_on_new_page(
-            lambda page: sign_in(
-                page,
-                username=username,
-                password=password,
-                request_code=request_code,
-                reserve_attempt=reserve_attempt,
+        self._claim_own_codes()
+        try:
+            self.browser.run_on_new_page(
+                lambda page: sign_in(
+                    page,
+                    username=username,
+                    password=password,
+                    request_code=request_code,
+                    reserve_attempt=reserve_attempt,
+                )
             )
-        )
+        finally:
+            self._claim_own_codes()
         return True
 
     def _resolve_from_sources(self, lesson):
@@ -3801,6 +3930,8 @@ class MainWindow(QMainWindow):
     def _hand_over(self):
         """A newer version was started: quit and leave it the browser and the lecture."""
         self._persist_session()
+        if self.code_watcher is not None:
+            self.code_watcher.stop()
         self.force_exit = True
         self.tray.hide()
         QApplication.quit()
@@ -3808,6 +3939,8 @@ class MainWindow(QMainWindow):
     def _quit(self):
         log.info("quit_requested")
         self._persist_session()
+        if self.code_watcher is not None:
+            self.code_watcher.stop()
         self.force_exit = True
         self.tray.hide()
         try:
