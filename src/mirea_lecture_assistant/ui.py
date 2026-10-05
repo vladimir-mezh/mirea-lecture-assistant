@@ -775,12 +775,18 @@ class MainWindow(QMainWindow):
         typed = False
         window = manual_code.foreground_window()
         if window is not None and bool(self.db.get_setting("type_manual_codes", True)):
-            title, window_class, pid = window
+            title, window_class, pid, program = window
             ours = self.browser.process is not None and pid == self.browser.process.pid
-            if not ours and manual_code.looks_like_mirea_page(title, window_class):
+            if not ours and manual_code.looks_like_mirea_page(title, window_class, program):
                 typed = manual_code.type_text(code)
             # The title tells why a code was or was not typed; the code is never logged.
-            log.info("manual_code_window class=%s ours=%s title=%r", window_class, ours, title[:80])
+            log.info(
+                "manual_code_window program=%s class=%s ours=%s title=%r",
+                program,
+                window_class,
+                ours,
+                title[:80],
+            )
         log.info("manual_code_delivered copied=True typed=%s", typed)
         self.tray.showMessage(
             "Код МИРЭА" + (" введён" if typed else " скопирован"),

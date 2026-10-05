@@ -41,6 +41,24 @@ RECONNECT_SECONDS = (30, 120, 600)
 AUTH_FAILURE_PAUSE_SECONDS = 30 * 60
 # Windows of desktop browsers: Chrome, Edge, Яндекс, Opera, Brave, Vivaldi; Firefox.
 BROWSER_WINDOW_CLASSES = {"Chrome_WidgetWin_1", "MozillaWindowClass"}
+# Discord, VS Code, Slack and other Electron apps share Chrome's window class, so the
+# program itself must be a browser too: a code never lands in a chat named «МИРЭА».
+BROWSER_EXECUTABLES = {
+    "chrome.exe",
+    "chromium.exe",
+    "msedge.exe",
+    "browser.exe",  # Яндекс Браузер
+    "opera.exe",
+    "brave.exe",
+    "vivaldi.exe",
+    "arc.exe",
+    "thorium.exe",
+    "firefox.exe",
+    "librewolf.exe",
+    "waterfox.exe",
+    "floorp.exe",
+    "zen.exe",
+}
 MIREA_TITLE_MARKERS = ("mirea", "мирэа")
 
 
@@ -165,16 +183,18 @@ def idle_wait(mailbox, seconds: float, stop: threading.Event, ready=_socket_read
     return changed
 
 
-def looks_like_mirea_page(title: str, window_class: str) -> bool:
+def looks_like_mirea_page(title: str, window_class: str, executable: str) -> bool:
     """A desktop browser whose page title names MIREA (its sign-in page does)."""
     folded = title.casefold()
-    return window_class in BROWSER_WINDOW_CLASSES and any(
-        marker in folded for marker in MIREA_TITLE_MARKERS
+    return (
+        window_class in BROWSER_WINDOW_CLASSES
+        and executable.casefold() in BROWSER_EXECUTABLES
+        and any(marker in folded for marker in MIREA_TITLE_MARKERS)
     )
 
 
-def foreground_window() -> tuple[str, str, int] | None:
-    """(title, window class, process id) of the window in front, on Windows."""
+def foreground_window() -> tuple[str, str, int, str] | None:
+    """(title, window class, process id, program file name) of the window in front."""
     if sys.platform != "win32":
         return None
     import ctypes
@@ -190,7 +210,26 @@ def foreground_window() -> tuple[str, str, int] | None:
     user32.GetClassNameW(window, window_class, len(window_class))
     pid = wintypes.DWORD()
     user32.GetWindowThreadProcessId(window, ctypes.byref(pid))
-    return title.value, window_class.value, int(pid.value)
+    return title.value, window_class.value, int(pid.value), _program_name(int(pid.value))
+
+
+def _program_name(pid: int) -> str:
+    """The file name of a process's program, or "" when Windows does not tell."""
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.windll.kernel32
+    process = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+    if not process:
+        return ""
+    try:
+        path = ctypes.create_unicode_buffer(1024)
+        size = wintypes.DWORD(len(path))
+        if not kernel32.QueryFullProcessImageNameW(process, 0, path, ctypes.byref(size)):
+            return ""
+        return path.value.replace("/", "\\").rsplit("\\", 1)[-1]
+    finally:
+        kernel32.CloseHandle(process)
 
 
 def type_text(text: str) -> bool:

@@ -80,16 +80,22 @@ def test_a_server_without_idle_is_reported():
 
 
 @pytest.mark.parametrize(
-    ("title", "window_class", "expected"),
+    ("title", "window_class", "program", "expected"),
     [
-        ("Вход в МИРЭА - Google Chrome", "Chrome_WidgetWin_1", True),
-        ("Sign in to mirea — Mozilla Firefox", "MozillaWindowClass", True),
-        ("Входящие — Почта Mail.ru - Google Chrome", "Chrome_WidgetWin_1", False),
-        ("МИРЭА — Блокнот", "Notepad", False),  # not a browser: never typed into
+        ("Вход в МИРЭА - Google Chrome", "Chrome_WidgetWin_1", "chrome.exe", True),
+        ("Вход в МИРЭА — Яндекс Браузер", "Chrome_WidgetWin_1", "browser.exe", True),
+        ("Вход в МИРЭА - Microsoft Edge", "Chrome_WidgetWin_1", "msedge.exe", True),
+        ("Sign in to mirea — Mozilla Firefox", "MozillaWindowClass", "firefox.exe", True),
+        ("Входящие — Почта Mail.ru - Google Chrome", "Chrome_WidgetWin_1", "chrome.exe", False),
+        # Electron apps share Chrome's window class: a chat named МИРЭА is no sign-in page.
+        ("#мирэа - Discord", "Chrome_WidgetWin_1", "Discord.exe", False),
+        ("МИРЭА — Visual Studio Code", "Chrome_WidgetWin_1", "Code.exe", False),
+        ("МИРЭА — Блокнот", "Notepad", "notepad.exe", False),
+        ("Вход в МИРЭА - Google Chrome", "Chrome_WidgetWin_1", "", False),  # unknown program
     ],
 )
-def test_codes_are_typed_only_into_a_browser_showing_mirea(title, window_class, expected):
-    assert manual_code.looks_like_mirea_page(title, window_class) is expected
+def test_codes_are_typed_only_into_a_browser_showing_mirea(title, window_class, program, expected):
+    assert manual_code.looks_like_mirea_page(title, window_class, program) is expected
 
 
 def test_the_watcher_reports_each_new_code_once_and_sleeps_in_idle(monkeypatch):
