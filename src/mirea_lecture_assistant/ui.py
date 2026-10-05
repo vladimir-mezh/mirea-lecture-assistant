@@ -12,7 +12,6 @@ from string import Template
 
 from PySide6.QtCore import (
     QEvent,
-    QMimeData,
     QObject,
     QRunnable,
     Qt,
@@ -797,17 +796,10 @@ class MainWindow(QMainWindow):
 
     def _copy_code(self, code: str):
         """Copy a one-time code, kept out of Windows' clipboard history and cloud sync."""
-        data = QMimeData()
-        data.setText(code)
-        never = (0).to_bytes(4, "little")
-        for name, value in (
-            ("ExcludeClipboardContentFromMonitorProcessing", b"\x01"),
-            ("CanIncludeInClipboardHistory", never),
-            ("CanUploadToCloudClipboard", never),
-        ):
-            data.setData(f'application/x-qt-windows-mime;value="{name}"', value)
         clipboard = QGuiApplication.clipboard()
-        clipboard.setMimeData(data)
+        if not manual_code.copy_secret(code):
+            # Plain text only: a QMimeData left on the clipboard crashed Qt's shutdown.
+            clipboard.setText(code)
 
         def forget():
             if clipboard.text() == code:
