@@ -387,3 +387,26 @@ def test_the_extension_presses_nothing_on_another_required_action(room):
     _run_extension_on(service, url)
 
     assert Site.posted == []
+
+
+def test_a_running_browser_holds_its_profile(room, tmp_path):
+    service, _http_port = room
+    chrome_profile = service.profile_dir.parent  # the fixture's --user-data-dir
+    assert BrowserService(chrome_profile).profile_in_use()
+    assert not BrowserService(tmp_path / "unused").profile_in_use()
+
+
+def test_an_unresponsive_browser_on_the_profile_gets_no_second_launch(room, monkeypatch):
+    """The real case behind a window full of about:blank tabs."""
+    service, _http_port = room
+    other = BrowserService(service.profile_dir.parent)
+    other._find_browser = service._find_browser
+    launched = []
+    monkeypatch.setattr(type(other), "_cdp_available", staticmethod(lambda _port: False))
+    monkeypatch.setattr(type(other), "_await_running_browser", lambda _self: False)
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **kw: launched.append(a))
+
+    with pytest.raises(RuntimeError, match="не отвечает"):
+        other.ensure_running()
+
+    assert launched == []

@@ -97,6 +97,8 @@ ATTENDANCE_FAILURE_SPAN_SECONDS = 120
 # to open another one.
 LEAVE_AFTER_END = timedelta(minutes=5)
 SETTINGS_PAGE = 3
+# Room names Pulse gives online pairs; any other room is a real classroom.
+ONLINE_ROOM_MARKERS = ("online", "онлайн", "дистан", "сдо", "вебинар", "mts", "мтс")
 # A code letter that arrives this long after one of the app's own sign-ins is
 # still taken for its own; only later ones are the student's.
 OWN_CODE_GRACE_SECONDS = 120
@@ -2473,6 +2475,16 @@ class MainWindow(QMainWindow):
                 return True
         return False
 
+    @staticmethod
+    def _in_person(lesson) -> bool:
+        """A pair with a lecture room of its own, not «Дистанционно» or the СДО."""
+        room = (lesson.room or "").strip().casefold()
+        return (
+            bool(room)
+            and not lesson.is_online
+            and not any(marker in room for marker in ONLINE_ROOM_MARKERS)
+        )
+
     def _manual_link(self, lesson_id: str) -> str:
         """The room the student typed in for this pair, unless it just turned out closed."""
         url = self.db.get_setting("manual_links", {}).get(lesson_id, "")
@@ -2506,6 +2518,10 @@ class MainWindow(QMainWindow):
             if lesson.external_id in self.joined_lessons:
                 continue
             if mode is RuleMode.IGNORE:
+                continue
+            if self._in_person(lesson) and not self._manual_link(lesson.external_id):
+                # A pair in a lecture room has no webinar to look for: the browser
+                # is left alone instead of reading the СДО all pair long.
                 continue
             if (
                 active is not None

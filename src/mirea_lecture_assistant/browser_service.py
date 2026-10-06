@@ -98,6 +98,10 @@ BACKGROUND_FLAGS = (
 
 
 LIVENESS_TIMEOUT_SECONDS = 2.0
+# After a launch that did not give us control of the browser, the next one waits.
+# Starting Chrome on a profile it already runs only adds a tab to that browser:
+# repeated, it filled the app's window with about:blank tabs.
+FAILED_LAUNCH_PAUSE_SECONDS = 10 * 60
 
 
 class BrowserService:
@@ -160,6 +164,7 @@ class BrowserService:
         self._capture_slow_until = 0.0
         self._media_progress = None
         self._media_progress_at = 0.0
+        self._launch_blocked_until = 0.0
 
     @property
     def is_running(self) -> bool:
@@ -257,10 +262,53 @@ class BrowserService:
         return endpoint_alive(port, LIVENESS_TIMEOUT_SECONDS, expected_id=self._browser_id)
 
     def ensure_running(self) -> str | None:
-        """Start the profile's browser on a blank tab, leaving any lecture alone."""
+        """Start the profile's browser on a blank tab, leaving any lecture alone.
+
+        Started for background work (reading the СДО), the window opens minimized
+        and inactive: it must not jump in front of what the student is doing.
+        """
         if self.is_running:
             return None
-        return self.open(self.BLANK_PAGE, muted=True, width=1100, height=760)
+        return self.open(self.BLANK_PAGE, muted=True, width=1100, height=760, background=True)
+
+    def profile_in_use(self) -> bool:
+        """Whether a browser runs on this profile now, answering to us or not."""
+        if sys.platform == "win32":
+            # Chrome keeps this file open, without write sharing, while it runs.
+            lock = self.profile_dir / "lockfile"
+            if not lock.exists():
+                return False
+            try:
+                handle = os.open(lock, os.O_RDWR)
+            except PermissionError:
+                return True
+            except OSError:
+                return False
+            os.close(handle)
+            return False
+        try:
+            owner = os.readlink(self.profile_dir / "SingletonLock")  # "host-pid"
+        except OSError:
+            return False
+        pid = owner.rsplit("-", 1)[-1]
+        if not pid.isdigit():
+            return True
+        try:
+            os.kill(int(pid), 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return True
+
+    def _await_running_browser(self, seconds: float = 6.0) -> bool:
+        """Give a busy browser on our profile a few more seconds to answer."""
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            if self.is_running:
+                return True
+            time.sleep(0.5)
+        return False
 
     def _recorded_browser_id(self, name: str) -> str | None:
         try:
@@ -290,6 +338,7 @@ class BrowserService:
         width: int = 520,
         height: int = 360,
         force_navigation: bool = False,
+        background: bool = False,
     ) -> str:
         blank = url == self.BLANK_PAGE
         if not blank and not url.lower().startswith(("https://", "http://")):
@@ -307,7 +356,17 @@ class BrowserService:
         # it on that guess left the profile locked and no tab controllable at all.
         if self.is_running and self.muted is not None and self.muted != muted:
             self.close()
+        if not self.is_running and self.profile_in_use() and not self._await_running_browser():
+            # Launching again would only add a tab to that browser, never give us
+            # control of it; wait until it answers or is closed.
+            log.warning("browser_profile_busy_without_control")
+            raise RuntimeError(
+                "Браузер приложения запущен, но не отвечает. Если окно браузера "
+                "приложения открыто, закройте его — оно откроется заново"
+            )
         if not self.is_running:
+            if time.monotonic() < self._launch_blocked_until:
+                raise RuntimeError("Браузер приложения недавно не запустился; повторим позже")
             self.port = self._free_port()
             args = [
                 executable,
@@ -322,21 +381,31 @@ class BrowserService:
             if muted:
                 args.append("--mute-audio")
             args.append(url)
-            self.process = subprocess.Popen(args, close_fds=True)
+            self.process = subprocess.Popen(args, close_fds=True, **_launch_options(background))
             self.muted = muted
             deadline = time.monotonic() + self.LAUNCH_TIMEOUT_SECONDS
             while time.monotonic() < deadline:
                 if self._cdp_available(self.port):
                     break
+                handed_over = self.process is not None and self.process.poll() is not None
+                if handed_over and time.monotonic() > deadline - 9:
+                    # It handed the tab to a browser already on this profile and quit.
+                    log.warning("browser_launch_handed_over_to_running_browser")
+                    break
                 time.sleep(0.15)
-            else:
+            if not self._cdp_available(self.port):
                 # Recording the port before this point overwrote a working one with
                 # a dead guess, and the next run could no longer find the browser.
                 self.port = None
+                self._launch_blocked_until = time.monotonic() + FAILED_LAUNCH_PAUSE_SECONDS
                 raise RuntimeError(f"{browser_name} запущен, но управление вкладкой недоступно")
             self._remember_port(self.port)
         elif not blank:
+            new_room = url != self.lecture_url
             self._navigate(url, force_navigation=force_navigation)
+            if new_room:
+                # The window may still be minimized from background work.
+                self._show_window()
         if not blank:
             self.lecture_url = url
             run_async(self._wait_lecture_loaded_async(), timeout=20)
@@ -908,6 +977,25 @@ class BrowserService:
         self._capture_override = None
         await browser.close_browser()
 
+    def _show_window(self) -> None:
+        try:
+            run_async(self._show_window_async(), timeout=5)
+        except Exception:  # a hidden window is no reason to fail the lecture
+            log.debug("browser_window_show_failed", exc_info=True)
+
+    async def _show_window_async(self) -> None:
+        browser = await self._connected_browser()
+        page = self._pick_lecture_page(browser.pages)
+        if page is None:
+            return
+        window = await browser.send("Browser.getWindowForTarget", {"targetId": page.target_id})
+        if window.get("bounds", {}).get("windowState") == "minimized":
+            await browser.send(
+                "Browser.setWindowBounds",
+                {"windowId": window["windowId"], "bounds": {"windowState": "normal"}},
+            )
+            log.info("browser_window_shown")
+
     def minimize(self) -> bool:
         """Minimize the controlled lecture window. Native implementation is Windows-first."""
         if not self.is_running or sys.platform != "win32":
@@ -973,3 +1061,17 @@ class BrowserService:
 
         user32.EnumWindows(enum_proc_type(callback), 0)
         return found
+
+
+def _launch_options(background: bool) -> dict:
+    """Start the browser minimized and inactive when it is wanted only for background work.
+
+    The same way a shortcut set to «Run: Minimized» does it: Chrome takes the
+    show state of its first window from the process's startup information.
+    """
+    if not background or sys.platform != "win32":
+        return {}
+    info = subprocess.STARTUPINFO()
+    info.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    info.wShowWindow = 7  # SW_SHOWMINNOACTIVE
+    return {"startupinfo": info}

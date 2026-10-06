@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass
+from typing import ClassVar
 
 import pytest
 
 from mirea_lecture_assistant import browser_service
+from mirea_lecture_assistant.async_runtime import run_async
 from mirea_lecture_assistant.browser_service import BrowserService
 
 LECTURE = "https://mts-link.ru/event/12345"
@@ -795,3 +798,103 @@ def test_a_live_browser_slow_to_answer_is_not_taken_for_dead(tmp_path):
         assert service.is_running
     finally:
         server.shutdown()
+
+
+def test_a_busy_browser_on_the_profile_is_never_launched_again(service, monkeypatch):
+    """Each launch on a busy profile added an about:blank tab to that browser."""
+    launched = []
+    monkeypatch.setattr(type(service), "is_running", property(lambda _self: False))
+    monkeypatch.setattr(type(service), "profile_in_use", lambda _self: True)
+    monkeypatch.setattr(type(service), "_await_running_browser", lambda _self: False)
+    monkeypatch.setattr(type(service), "_find_browser", lambda _self: ("Google Chrome", "chrome"))
+    monkeypatch.setattr(browser_service.subprocess, "Popen", lambda *a, **kw: launched.append(a))
+
+    for _ in range(5):
+        with pytest.raises(RuntimeError, match="не отвечает"):
+            service.ensure_running()
+
+    assert launched == []
+
+
+def test_a_launch_that_gave_no_control_is_not_repeated_at_once(service, monkeypatch):
+    launched = []
+
+    class HandedOver:
+        def poll(self):
+            return 0  # passed its tab to a browser already running, then quit
+
+    monkeypatch.setattr(type(service), "is_running", property(lambda _self: False))
+    monkeypatch.setattr(type(service), "profile_in_use", lambda _self: False)
+    monkeypatch.setattr(type(service), "_find_browser", lambda _self: ("Google Chrome", "chrome"))
+    monkeypatch.setattr(type(service), "_cdp_available", staticmethod(lambda _port: False))
+    monkeypatch.setattr(type(service), "LAUNCH_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(
+        browser_service.subprocess, "Popen", lambda *a, **kw: launched.append(a) or HandedOver()
+    )
+
+    with pytest.raises(RuntimeError, match="недоступно"):
+        service.ensure_running()
+    for _ in range(5):
+        with pytest.raises(RuntimeError, match="повторим позже"):
+            service.ensure_running()
+
+    assert len(launched) == 1
+
+
+def test_background_work_starts_the_browser_minimized_and_inactive(service, monkeypatch):
+    options = []
+    monkeypatch.setattr(type(service), "is_running", property(lambda _self: False))
+    monkeypatch.setattr(type(service), "profile_in_use", lambda _self: False)
+    monkeypatch.setattr(type(service), "_find_browser", lambda _self: ("Google Chrome", "chrome"))
+    monkeypatch.setattr(type(service), "_free_port", staticmethod(lambda: 49335))
+    monkeypatch.setattr(type(service), "_cdp_available", staticmethod(lambda port: port == 49335))
+    monkeypatch.setattr(browser_service, "_launch_options", lambda background: {"bg": background})
+    monkeypatch.setattr(browser_service.subprocess, "Popen", lambda *_a, **kw: options.append(kw))
+
+    service.ensure_running()
+
+    assert options[0]["bg"] is True
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="the Windows show state")
+def test_the_background_show_state_is_minimized_without_activation():
+    info = browser_service._launch_options(True)["startupinfo"]
+    assert info.wShowWindow == 7  # SW_SHOWMINNOACTIVE
+    assert browser_service._launch_options(False) == {}
+
+
+def test_a_new_lecture_shows_a_window_minimized_by_background_work(service):
+    sent = []
+
+    class Page:
+        target_id = "lecture"
+        url = LECTURE
+
+        def is_closed(self):
+            return False
+
+    class Browser:
+        pages: ClassVar[list] = [Page()]
+
+        async def send(self, method, params):
+            sent.append((method, params))
+            if method == "Browser.getWindowForTarget":
+                return {"windowId": 7, "bounds": {"windowState": state}}
+            return {}
+
+    async def connected():
+        return Browser()
+
+    service.lecture_url = LECTURE
+    service._connected_browser = connected
+    state = "minimized"
+    run_async(service._show_window_async())
+    assert sent[-1] == (
+        "Browser.setWindowBounds",
+        {"windowId": 7, "bounds": {"windowState": "normal"}},
+    )
+
+    sent.clear()
+    state = "normal"  # left as the student put it
+    run_async(service._show_window_async())
+    assert [method for method, _ in sent] == ["Browser.getWindowForTarget"]
