@@ -1992,3 +1992,36 @@ def test_the_max_extension_is_put_in_a_folder_to_add_to_the_browser(window, tmp_
     ]
     assert Path(opened[0].toLocalFile()) == folder
     assert "Режим разработчика" in told[0][2]
+
+
+def _lookups_for(window, monkeypatch, room, *, online=False, manual=""):
+    lesson = _running_lesson("room-check")
+    lesson.room = room
+    lesson.is_online = online
+    window.db.sync_lessons([lesson], datetime.now().astimezone() - timedelta(days=1))
+    window.db.set_rule(lesson.subject_name, RuleMode.AUTO)
+    if manual:
+        window.db.set_setting("manual_links", {lesson.external_id: manual})
+    looked_up, opened = [], []
+    monkeypatch.setattr(window, "_resolve_from_sources", lambda item: looked_up.append(item))
+    monkeypatch.setattr(window, "_open_lecture", lambda *args, **kw: opened.append(args))
+    window._evaluate_current_lessons(window.db.list_lessons())
+    return looked_up, opened
+
+
+def test_a_pair_in_a_lecture_room_leaves_the_browser_alone(window, monkeypatch):
+    looked_up, opened = _lookups_for(window, monkeypatch, "А-101")
+    assert looked_up == [] and opened == []
+
+
+@pytest.mark.parametrize("room", ["Дистанционно", "СДО", "online", ""])
+def test_an_online_pair_still_looks_for_its_room(window, monkeypatch, room):
+    looked_up, _opened = _lookups_for(window, monkeypatch, room)
+    assert len(looked_up) == 1
+
+
+def test_a_room_typed_in_by_hand_opens_even_for_a_classroom_pair(window, monkeypatch):
+    _looked_up, opened = _lookups_for(
+        window, monkeypatch, "А-101", manual="https://my.mts-link.ru/j/1/2"
+    )
+    assert opened and opened[0][0] == "https://my.mts-link.ru/j/1/2"
