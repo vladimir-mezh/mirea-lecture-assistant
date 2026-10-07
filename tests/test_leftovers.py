@@ -102,7 +102,7 @@ def test_extension_copy_drops_files_a_newer_version_removed(tmp_path):
 
     source, target = tmp_path / "source", tmp_path / "target"
     source.mkdir()
-    (source / "manifest.json").write_text("{}")
+    (source / "manifest.json").write_text('{"version": "1.0.0"}')
     (source / "bridge-config.json").write_text("{}")
     target.mkdir()
     (target / "old-script.js").write_text("old")

@@ -115,3 +115,76 @@ def test_only_dedicated_profile_password_preferences_change(tmp_path):
     assert prefs["profile"]["unrelated"] == 42
     assert prefs["safebrowsing"]["enabled"] is True
     assert prefs["profile"]["password_manager_leak_detection"] is False
+
+
+def _post(bridge, path, origin=ORIGIN, user_agent="Mozilla/5.0 Chrome/141.0 YaBrowser/25.8"):
+    request = urllib.request.Request(
+        f"http://127.0.0.1:{bridge.port}{path}",
+        data=json.dumps({"watch": "0" * 64}).encode(),
+        headers={
+            "Origin": origin,
+            "Authorization": "Bearer " + bridge.token,
+            "Content-Type": "application/json",
+            "User-Agent": user_agent,
+        },
+        method="POST",
+    )
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    return opener.open(request, timeout=5)
+
+
+def test_the_extension_says_hello_and_the_app_knows_its_browser():
+    bridge = CodeBridge()
+    bridge.start()
+    try:
+        assert bridge.extension_seen is None
+        _post(bridge, "/hello").read()
+        assert bridge.extension_seen is not None
+        assert bridge.extension_browser == "Яндекс Браузер"
+    finally:
+        bridge.stop()
+
+
+def test_a_web_page_cannot_pretend_to_be_the_extension():
+    bridge = CodeBridge()
+    bridge.start()
+    try:
+        with pytest.raises(urllib.error.HTTPError):
+            _post(bridge, "/hello", origin="https://evil.example")
+        assert bridge.extension_seen is None
+    finally:
+        bridge.stop()
+
+
+@pytest.mark.parametrize(
+    ("agent", "name"),
+    [
+        ("Mozilla/5.0 Chrome/141.0.0.0 Safari/537.36", "Google Chrome"),
+        ("Mozilla/5.0 Chrome/141.0.0.0 Safari/537.36 Edg/141.0", "Microsoft Edge"),
+        ("Mozilla/5.0 Chrome/141.0.0.0 Safari/537.36 OPR/123.0", "Opera"),
+    ],
+)
+def test_browser_names(agent, name):
+    from mirea_lecture_assistant.code_bridge import browser_name
+
+    assert browser_name(agent) == name
+
+
+def test_the_folder_stamp_changes_with_the_code_not_with_the_pairing_key(tmp_path):
+    from mirea_lecture_assistant.code_bridge import extension_stamp
+    from mirea_lecture_assistant.paths import resource_path
+
+    source = tmp_path / "source"
+    import shutil
+
+    shutil.copytree(resource_path("browser_extension"), source)
+    target = tmp_path / "target"
+    bridge = CodeBridge()
+    bridge.prepare_extension(source, target)
+    stamped = json.loads((target / "manifest.json").read_text(encoding="utf-8"))
+    assert stamped["version_name"].endswith(extension_stamp(source))
+    before = extension_stamp(source)
+    (source / "bridge-config.json").write_text('{"port": 5, "token": "x"}')
+    assert extension_stamp(source) == before
+    (source / "email-code.js").write_text("// newer code")
+    assert extension_stamp(source) != before

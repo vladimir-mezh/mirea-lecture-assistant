@@ -20,7 +20,12 @@
   };
 
   let pressed = null;
+  // After the extension updates itself, a fresh copy of this script takes over
+  // the open tab; the old copy (cut off from the extension) must stand down.
+  const connected = !!globalThis.chrome?.runtime?.id;
+  const orphaned = () => connected && !globalThis.chrome?.runtime?.id;
   const press = () => {
+    if (orphaned()) return true;
     const button = skipButton();
     if (!button) return false;
     if (pressed === button) return false;

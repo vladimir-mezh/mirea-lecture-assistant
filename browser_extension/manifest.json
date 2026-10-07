@@ -1,19 +1,30 @@
 {
   "manifest_version": 3,
-  "name": "МИРЭА: пропуск МАКС",
-  "version": "1.1.0",
-  "background": {"service_worker": "code-worker.js"},
-  "host_permissions": ["http://127.0.0.1/*"],
-  "description": "Сам нажимает «Пропустить» на странице «Подтверждение через МАКС» при входе в МИРЭА.",
+  "name": "МИРЭА: помощник входа",
+  "version": "1.2.0",
+  "background": {
+    "service_worker": "code-worker.js"
+  },
+  "host_permissions": [
+    "http://127.0.0.1/*",
+    "https://sso.mirea.ru/*"
+  ],
+  "description": "Нажимает «Пропустить» на «Подтверждении через МАКС» и вводит код из почты при входе в МИРЭА. Работает вместе с MIREA Lecture Assistant.",
   "content_scripts": [
     {
       "matches": [
         "https://sso.mirea.ru/*"
       ],
       "js": [
-        "skip-max.js", "email-code.js"
+        "skip-max.js",
+        "email-code.js"
       ],
       "run_at": "document_idle"
     }
+  ],
+  "permissions": [
+    "alarms",
+    "scripting",
+    "storage"
   ]
 }

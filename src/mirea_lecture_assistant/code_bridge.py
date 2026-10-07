@@ -6,6 +6,7 @@ wildcard CORS, or web-page access. An ambiguous pair of login tabs gets no code.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
@@ -29,6 +30,9 @@ class CodeBridge:
         self.server: ThreadingHTTPServer | None = None
         self.stopped = False
         self.expiry_timer: threading.Timer | None = None
+        # The extension says hello every minute while its browser runs.
+        self.extension_seen: float | None = None
+        self.extension_browser = ""
 
     def start(self):
         bridge = self
@@ -60,7 +64,11 @@ class CodeBridge:
                     if not isinstance(key, str) or not re.fullmatch(r"[a-f0-9]{64}", key):
                         self.send_error(400)
                         return
-                    result = bridge.request(self.path, key, data.get("receipt"), origin)
+                    if self.path == "/hello":
+                        bridge.greet(self.headers.get("User-Agent", ""))
+                        result = {}
+                    else:
+                        result = bridge.request(self.path, key, data.get("receipt"), origin)
                     body = json.dumps(result).encode("utf-8")
                     self.send_response(200)
                     self.send_header("Content-Type", "application/json")
@@ -86,8 +94,19 @@ class CodeBridge:
     def port(self):
         return self.server.server_port if self.server else 0
 
+    def greet(self, user_agent: str) -> None:
+        self.extension_browser = browser_name(user_agent)
+        self.extension_seen = time.time()
+
     def prepare_extension(self, source: Path, target: Path):
         shutil.copytree(source, target, dirs_exist_ok=True)
+        # The extension compares this stamp with the one it was loaded with
+        # and reloads itself when they differ: updates need no clicks.
+        manifest = json.loads((source / "manifest.json").read_text(encoding="utf-8"))
+        manifest["version_name"] = f"{manifest['version']} {extension_stamp(source)}"
+        (target / "manifest.json").write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
         # Files a newer version no longer has would linger in the browser's copy.
         wanted = {path.relative_to(source) for path in source.rglob("*")}
         for path in sorted(target.rglob("*"), reverse=True):
@@ -182,3 +201,26 @@ class CodeBridge:
             self.server.shutdown()
             self.server.server_close()
             self.server = None
+
+
+def extension_stamp(source: Path) -> str:
+    """A short hash of the extension's own files (not of its pairing key)."""
+    digest = hashlib.sha256()
+    for path in sorted(source.rglob("*")):
+        if path.is_file() and path.name != "bridge-config.json":
+            digest.update(path.relative_to(source).as_posix().encode() + b"\0")
+            digest.update(path.read_bytes())
+    return digest.hexdigest()[:12]
+
+
+def browser_name(user_agent: str) -> str:
+    """Which Chromium browser it is, from the extension's own requests."""
+    for marker, name in (
+        ("YaBrowser/", "Яндекс Браузер"),
+        ("Edg/", "Microsoft Edge"),
+        ("OPR/", "Opera"),
+        ("Vivaldi/", "Vivaldi"),
+    ):
+        if marker in user_agent:
+            return name
+    return "Google Chrome" if "Chrome/" in user_agent else "браузер"

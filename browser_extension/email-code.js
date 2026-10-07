@@ -12,7 +12,13 @@
         input.value || input.name === 'password') return null;
     return input;
   };
+  let observer = null, timer = null;
+  const connected = !!globalThis.chrome?.runtime?.id;
   const watch = () => {
+    if (connected && !globalThis.chrome?.runtime?.id) {
+      // The extension updated itself and runs a fresh copy of this script here.
+      observer?.disconnect(); clearInterval(timer); return;
+    }
     const candidate = locate();
     if (!candidate) { field = null; nonce = ''; return; }
     if (candidate === field && Date.now() - requestedAt < 180000) return;
@@ -34,8 +40,8 @@
     respond({filled: field.value === message.code});
     field = null; nonce = '';
   });
-  new MutationObserver(watch).observe(document.documentElement,
-    {subtree: true, childList: true, attributes: true});
-  setInterval(watch, 5000);
+  observer = new MutationObserver(watch);
+  observer.observe(document.documentElement, {subtree: true, childList: true, attributes: true});
+  timer = setInterval(watch, 5000);
   watch();
 })();
