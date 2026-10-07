@@ -127,6 +127,7 @@ CHAT_BUTTONS = "button, [role='button']"
 CHAT_PLACEHOLDER_RE = re.compile(r"введите сообщение", re.IGNORECASE)
 # Chrome throttles and stops painting background, minimised or covered windows;
 # the lecture is captured exactly while it is in the background.
+DISK_CACHE_BYTES = 100 * 1024 * 1024
 BACKGROUND_FLAGS = (
     "--disable-background-timer-throttling",
     "--disable-backgrounding-occluded-windows",
@@ -415,6 +416,8 @@ class BrowserService:
                 "--window-position=20,20",
                 "--no-first-run",
                 "--no-default-browser-check",
+                # Lectures are live streams: a large cache only takes disk space.
+                f"--disk-cache-size={DISK_CACHE_BYTES}",
                 *BACKGROUND_FLAGS,
             ]
             if muted:
