@@ -16,6 +16,24 @@ Both access and write permissions default to off. A live adapter heartbeat is no
 
 The config points to a stable `McpLauncher.exe`, which selects `mcp/current.json`. Updating the adapter does not require editing client configuration. Already running clients keep their previous executable; restart the client to select an updated version.
 
+## Connecting AI clients automatically
+
+The MCP tab lists AI clients found on the PC by their own settings folders and connects one with a click: it installs the adapter if needed, enables access and adds a single `mirea-lecture-assistant` entry (`McpLauncher.exe --profile <profile> --client-name <client>`) to the client's settings.
+
+| Client | Settings file |
+| --- | --- |
+| Claude Desktop | `%APPDATA%\Claude\claude_desktop_config.json` (Store version: `%LOCALAPPDATA%\Packages\Claude_*\LocalCache\Roaming\Claude\…`) |
+| Claude Code | `claude mcp add --scope user …` (falls back to `~/.claude.json`) |
+| Codex | `~/.codex/config.toml`, `[mcp_servers.mirea-lecture-assistant]` |
+| Cursor | `~/.cursor/mcp.json` |
+| Windsurf | `~/.codeium/windsurf/mcp_config.json` |
+| VS Code (Copilot) | `%APPDATA%\Code\User\mcp.json`, `servers` with `type: stdio` |
+| Cline | `…\globalStorage\saoudrizwan.claude-dev\settings\cline_mcp_settings.json` |
+| Gemini CLI | `~/.gemini/settings.json` |
+| LM Studio | `~/.lmstudio/mcp.json` |
+
+Only that entry is added, replaced or removed. A file that does not parse as plain JSON/TOML (comments, damage) is left untouched and the person is offered the manual configuration instead. The previous file is kept as `<file>.mirea-backup`, and the new one replaces it atomically.
+
 ## Independent updates
 
 - Updating Lecture Assistant replaces only its own `.exe`. MCP lives in the profile (`%LOCALAPPDATA%\MireaLectureAssistant\mcp`), so the adapter, the `mcp_enabled`/`mcp_allow_changes` settings and the client configuration survive it. The new copy publishes a new pairing token, which the adapter reads on its next request.

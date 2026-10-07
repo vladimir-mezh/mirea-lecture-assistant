@@ -194,3 +194,29 @@ def test_cleanup_without_a_valid_install_touches_nothing(tmp_path):
     (tmp_path / "versions" / "0.1.0").mkdir(parents=True)
     assert clean_leftovers(tmp_path)
     assert (tmp_path / "versions" / "0.1.0").exists()
+
+
+def test_one_click_connects_a_found_ai_client(window, tmp_path, monkeypatch):
+    from mirea_lecture_assistant import ai_clients, ui
+
+    install_archive(window._mcp_root(), archive(), "0.1.0")
+    config = tmp_path / "cursor-mcp.json"
+    cursor = ai_clients.Client("cursor", "Cursor", [config])
+    monkeypatch.setattr(ui.ai_clients, "supported", lambda: True)
+    monkeypatch.setattr(ui.ai_clients, "detect", lambda: [cursor])
+    monkeypatch.setattr(window.mcp_access, "start", lambda: None)
+    monkeypatch.setattr(window, "_run", lambda function, done, *_a, **_k: done(function()))
+    told = []
+    monkeypatch.setattr(ui.QMessageBox, "information", lambda *args: told.append(args[2]))
+
+    window._show_page(ui.MCP_PAGE)
+    buttons = [b.text() for b in window.ai_clients_box.findChildren(ui.QPushButton)]
+    assert buttons == ["Подключить"]
+    window._connect_ai_client(cursor)
+
+    assert window.mcp_enabled.isChecked()
+    assert ai_clients.NAME in json.loads(config.read_text(encoding="utf-8"))["mcpServers"]
+    assert told and told[0].startswith("Готово")
+    window._refresh_ai_clients()
+    labels = [label.text() for label in window.ai_clients_box.findChildren(ui.QLabel)]
+    assert labels == ["Cursor — ✓ подключён"]
