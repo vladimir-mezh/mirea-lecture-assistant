@@ -57,6 +57,7 @@ from PySide6.QtWidgets import (
     QSystemTrayIcon,
     QTableWidget,
     QTableWidgetItem,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -64,11 +65,14 @@ from PySide6.QtWidgets import (
 from . import (
     __version__,
     ai_clients,
+    ai_duty,
     autostart,
     browsers,
+    diagnostics,
     leftovers,
     manual_code,
     mcp_install,
+    plan_b,
     updater,
 )
 from .async_runtime import run_async
@@ -142,6 +146,29 @@ AUTO_LOGIN_RETRY_MINUTES = (2, 5, 15)
 MANUAL_OPEN_LEAD = timedelta(minutes=60)
 # How often the cached schedule is checked for a pair to open, with or without Pulse.
 LESSON_CHECK_MS = 15_000
+# The app checks itself this long into every online pair it should be in.
+DUTY_CHECK_MINUTES = (5, 20)
+DUTY_REPAIRS = {
+    "retry_login": "войти в MIREA заново с сохранёнными данными",
+    "refresh_schedule": "обновить расписание",
+    "reopen_lecture": "заново найти и открыть комнату текущей пары",
+    "restart_browser": "перезапустить браузер приложения с комнатой пары",
+    "start_scanner": "включить QR-сканирование",
+}
+MCP_INFO = (
+    "MCP — это способ подключить к приложению вашу нейросеть: Claude, Codex, Cursor и "
+    "другие. Через MCP нейросеть видит, что происходит в приложении, и может помочь, "
+    "но паролей, кодов из писем, QR-кодов и чата лекций она не видит.\n\n"
+    "Что можно попросить у нейросети после подключения:\n"
+    "• «Какие у меня сегодня пары и на какие приложение зайдёт само?»\n"
+    "• «Почему приложение не отметило меня на прошлой паре?»\n"
+    "• «Проверь, всё ли в порядке с приложением, и почини, если что-то не так»\n"
+    "• «Не заходи на физкультуру» (нужно разрешить изменения)\n\n"
+    "ИИ-дежурный: если включить, приложение само проверяет себя на каждой онлайн-паре. "
+    "Если всё в порядке, нейросеть не вызывается и ничего не тратится. Если что-то "
+    "сломалось, приложение само зовёт Codex или Claude Code: тот разбирается, чинит и "
+    "присылает отчёт."
+)
 # New releases are looked for this often, and the first time soon after start.
 UPDATE_CHECK_MS = 6 * 60 * 60 * 1000
 FIRST_UPDATE_CHECK_MS = 20_000
@@ -402,6 +429,14 @@ class McpSignals(QObject):
     requested = Signal(object)
 
 
+class DutySignals(QObject):
+    """Results of the AI on duty and of network checks, back to the window's thread."""
+
+    finished = Signal(int)
+    network = Signal(object, object)
+    report_posted = Signal(object)
+
+
 class Worker(QRunnable):
     def __init__(
         self,
@@ -636,6 +671,15 @@ class MainWindow(QMainWindow):
         self.mcp_signals.requested.connect(self._mcp_rpc)
         self.mcp_access = McpAccess(data_dir(), self.mcp_signals.requested.emit)
         self.mcp_busy = False
+        self.auth_state = "unknown"
+        self.duty_signals = DutySignals()
+        self.duty_signals.finished.connect(self._duty_finished)
+        self.duty_signals.network.connect(self._duty_network_checked)
+        self.duty_signals.report_posted.connect(self._duty_report_posted)
+        self.duty_checked: set[str] = set()
+        self.duty_running = False
+        self.duty_report: dict | None = None
+        self.tray_click = None
         # Old MCP versions go once no AI client runs them, as the app's own .old does.
         self.mcp_leftovers = True
         try:
@@ -1025,6 +1069,44 @@ class MainWindow(QMainWindow):
         except OSError:
             log.warning("autostart_sync_failed", exc_info=True)
 
+    def _plan_b_times(self) -> list[datetime]:
+        """When Windows should start the app: shortly before each online pair this week."""
+        now = datetime.now().astimezone()
+        lead = timedelta(minutes=self.join_before.value() + 2)
+        times = sorted(
+            {
+                lesson.start_at - lead
+                for lesson in self.db.list_lessons()
+                if now < lesson.start_at - lead < now + timedelta(days=7)
+                and self.db.get_rule(lesson.subject_name) is not RuleMode.IGNORE
+                and not (self._in_person(lesson) and not self._manual_link(lesson.external_id))
+            }
+        )
+        return [moment.astimezone().replace(tzinfo=None) for moment in times]
+
+    def _sync_plan_b(self):
+        """Rewrite the Task Scheduler task when the pairs or the program's place change."""
+        if not plan_b.available() or os.environ.get("MIREA_ASSISTANT_SMOKE_TEST") == "1":
+            return
+        executable = updater.current_executable()
+        if self.db.get_setting("plan_b", True):
+            times = self._plan_b_times()
+            signature = [str(executable), [t.isoformat() for t in times[: plan_b.MAX_TRIGGERS]]]
+            if self.db.get_setting("plan_b_signature", None) == signature:
+                return
+            self.db.set_setting("plan_b_signature", signature)
+            work = partial(plan_b.install, executable, times)
+        else:
+            if self.db.get_setting("plan_b_signature", None) is None:
+                return
+            self.db.set_setting("plan_b_signature", None)
+            work = plan_b.remove
+        threading.Thread(target=work, name="plan-b", daemon=True).start()
+
+    def _plan_b_toggled(self, checked: bool):
+        self.db.set_setting("plan_b", bool(checked))
+        self._sync_plan_b()
+
     def _autostart_toggled(self, checked: bool):
         self.db.set_setting("autostart", bool(checked))
         if not autostart.available():
@@ -1118,21 +1200,36 @@ class MainWindow(QMainWindow):
             QShortcut(QKeySequence(f"Ctrl+{index + 1}"), self, partial(self._show_page, index))
         QShortcut(QKeySequence("F5"), self, self.refresh_schedule)
 
-    def _page_shell(self, title: str, subtitle: str):
+    def _page_shell(self, title: str, subtitle: str, info: str = ""):
         page = QWidget()
         layout = QVBoxLayout(page)
         layout.setContentsMargins(30, 26, 30, 26)
         heading = QLabel(title, objectName="pageTitle")
         hint = QLabel(subtitle, objectName="muted")
         hint.setWordWrap(True)
-        layout.addWidget(heading)
+        if info:
+            row = QHBoxLayout()
+            row.addWidget(heading)
+            button = QToolButton(text="ⓘ")
+            button.setToolTip("Что это и как пользоваться")
+            button.setAutoRaise(True)
+            button.setStyleSheet("font-size: 18px;")
+            button.clicked.connect(lambda: QMessageBox.information(self, title, info))
+            row.addWidget(button)
+            row.addStretch()
+            layout.addLayout(row)
+            self.page_info_buttons = [*getattr(self, "page_info_buttons", []), button]
+        else:
+            layout.addWidget(heading)
         layout.addWidget(hint)
         layout.addSpacing(12)
         return page, layout
 
     def _mcp_page(self):
         page, layout = self._page_shell(
-            "MCP", "Отдельное подключение вашего ИИ-клиента. Собственных моделей и чата здесь нет."
+            "MCP",
+            "Подключение вашей нейросети к приложению. Собственных моделей и чата здесь нет.",
+            info=MCP_INFO,
         )
         self.mcp_status = QLabel()
         self.mcp_status.setWordWrap(True)
@@ -1151,6 +1248,46 @@ class MainWindow(QMainWindow):
             lambda enabled: self.db.set_setting("mcp_allow_changes", enabled)
         )
         layout.addWidget(self.mcp_allow_changes)
+        self.mcp_allow_repair = QCheckBox(
+            "Разрешить ИИ чинить приложение: повторный вход, перезапуск браузера и сканера"
+        )
+        self.mcp_allow_repair.setChecked(bool(self.db.get_setting("mcp_allow_repair", False)))
+        self.mcp_allow_repair.toggled.connect(
+            lambda enabled: self.db.set_setting("mcp_allow_repair", enabled)
+        )
+        layout.addWidget(self.mcp_allow_repair)
+        duty_title = QLabel("ИИ-дежурный на парах", objectName="section")
+        layout.addSpacing(8)
+        layout.addWidget(duty_title)
+        self.duty_enabled = QCheckBox(
+            "Проверять приложение на каждой онлайн-паре и звать ИИ при сбое"
+        )
+        self.duty_enabled.setToolTip(
+            "Через 5 и 20 минут после начала пары приложение проверяет себя само, бесплатно. "
+            "Нейросеть запускается, только если что-то не так: тогда тратится немного токенов"
+        )
+        self.duty_enabled.setChecked(bool(self.db.get_setting("duty_enabled", False)))
+        self.duty_enabled.toggled.connect(self._duty_toggled)
+        layout.addWidget(self.duty_enabled)
+        agent_row = QHBoxLayout()
+        agent_row.addWidget(QLabel("Кто дежурит:"))
+        self.duty_agent = QComboBox()
+        self.duty_agent.currentIndexChanged.connect(self._duty_agent_chosen)
+        agent_row.addWidget(self.duty_agent, 1)
+        self.duty_check_button = QPushButton("Проверить сейчас", objectName="secondary")
+        self.duty_check_button.clicked.connect(lambda: self._duty_check(None, "manual"))
+        agent_row.addWidget(self.duty_check_button)
+        layout.addLayout(agent_row)
+        self.duty_status = QLabel()
+        self.duty_status.setWordWrap(True)
+        layout.addWidget(self.duty_status)
+        self.duty_report_button = QPushButton(
+            "Отправить отчёт разработчику", objectName="secondary"
+        )
+        self.duty_report_button.clicked.connect(self._open_duty_report)
+        self.duty_report_button.hide()
+        layout.addWidget(self.duty_report_button)
+        self._refresh_duty_agents()
         clients_title = QLabel("ИИ-клиенты на этом компьютере", objectName="section")
         layout.addSpacing(8)
         layout.addWidget(clients_title)
@@ -1340,6 +1477,389 @@ class MainWindow(QMainWindow):
             failed=failed,
         )
 
+    # --- health, repair and the AI on duty ------------------------------------
+
+    def _tray_message_clicked(self):
+        action, self.tray_click = self.tray_click, None
+        if action is not None:
+            action()
+
+    def _current_online_lesson(self, now=None):
+        """The online pair on right now that the app should be in, if any."""
+        now = now or datetime.now().astimezone()
+        lessons = [
+            lesson
+            for lesson in self.db.list_lessons()
+            if lesson.start_at <= now <= lesson.end_at
+            and self.db.get_rule(lesson.subject_name) is not RuleMode.IGNORE
+            and not (self._in_person(lesson) and not self._manual_link(lesson.external_id))
+        ]
+        return max(lessons, key=lambda lesson: lesson.start_at) if lessons else None
+
+    def _health_report(self) -> dict:
+        """What is wrong right now, in words and with the repairs that may help."""
+        now = datetime.now().astimezone()
+        problems = []
+
+        def problem(code, text, actions):
+            problems.append({"code": code, "text": text, "actions": actions})
+
+        if self.auth_state != "signed_in" and not self.login_in_progress:
+            problem("signed_out", "Приложение не вошло в MIREA", ["retry_login"])
+        if (
+            self.schedule_failing_since is not None
+            and time.monotonic() - self.schedule_failing_since > 10 * 60
+        ):
+            problem(
+                "schedule_failing",
+                "Расписание не обновляется больше 10 минут",
+                ["refresh_schedule", "retry_login"],
+            )
+        lesson = self._current_online_lesson(now)
+        lesson_info = None
+        if lesson is not None:
+            mode = self.db.get_rule(lesson.subject_name)
+            wanted = mode is RuleMode.AUTO or lesson.external_id in self.accepted_lessons
+            marked = self._attendance_already_marked(lesson.external_id)
+            in_room = lesson.external_id == self.active_lecture_id
+            minutes = int((now - lesson.start_at).total_seconds() // 60)
+            lesson_info = {
+                "subject": lesson.subject_name,
+                "start": lesson.start_at.isoformat(),
+                "end": lesson.end_at.isoformat(),
+                "minutes_since_start": minutes,
+                "mode": mode.value,
+                "in_room": in_room,
+                "attendance_marked": marked,
+                "scanner_running": self.scan_timer.isActive(),
+                "last_capture_age_seconds": round(time.monotonic() - self.last_capture_at)
+                if self.last_capture_at
+                else None,
+            }
+            opening = self.opening_lecture_id == lesson.external_id
+            if wanted and not marked and not in_room and not opening and minutes >= 3:
+                known = bool(
+                    self.db.get_resolved_link(lesson.external_id)
+                    or self._manual_link(lesson.external_id)
+                    or lesson.source_url
+                )
+                problem(
+                    "not_in_room",
+                    (
+                        "Пара идёт, комната найдена, но приложение не в ней"
+                        if known
+                        else "Пара идёт, а комнату вебинара пока не нашли (возможно, "
+                        "преподаватель её ещё не создал)"
+                    ),
+                    ["reopen_lecture", "refresh_schedule"],
+                )
+            elif in_room and not marked:
+                if not self.browser.probably_running:
+                    problem(
+                        "browser_closed",
+                        "Браузер с лекцией закрыт",
+                        ["reopen_lecture", "restart_browser"],
+                    )
+                elif not self.scan_timer.isActive():
+                    problem("scanner_stopped", "QR-сканирование выключено", ["start_scanner"])
+                elif self.last_capture_at and time.monotonic() - self.last_capture_at > 60:
+                    problem(
+                        "capture_stale",
+                        "Кадры лекции не обновляются больше минуты",
+                        ["reopen_lecture", "restart_browser"],
+                    )
+        return {
+            "verdict": "problem" if problems else "ok",
+            "problems": problems,
+            "lesson": lesson_info,
+            "app_version": __version__,
+            "signed_in": self.auth_state == "signed_in",
+            "repairs_allowed": self.mcp_allow_repair.isChecked(),
+        }
+
+    def _repair(self, action: str) -> dict:
+        """Start one repair; its effect shows in the health report a minute later."""
+        lesson = self._current_online_lesson()
+        if action == "retry_login":
+            self._retry_login_now()
+        elif action == "refresh_schedule":
+            self.refresh_schedule()
+        elif action == "reopen_lecture":
+            if self.active_lecture_id and self.active_lecture_url:
+                self._open_lecture(self.active_lecture_url, self.active_lecture_id, force=True)
+            elif lesson is not None:
+                self.joined_lessons.discard(lesson.external_id)
+                url = (
+                    self.db.get_resolved_link(lesson.external_id)
+                    or self._manual_link(lesson.external_id)
+                    or lesson.source_url
+                )
+                if url and url not in self._rejected_rooms(lesson.external_id):
+                    self._open_lecture(url, lesson.external_id, force=True)
+                else:
+                    self._resolve_from_sources(lesson)
+            else:
+                raise ValueError("Сейчас нет онлайн-пары, которую нужно открыть")
+        elif action == "restart_browser":
+            if not self.active_lecture_id:
+                raise ValueError("Браузер с лекцией сейчас не нужен: пара не открыта")
+            self._restart_lecture_browser()
+        elif action == "start_scanner":
+            if not self.active_lecture_id:
+                raise ValueError("Сначала нужно открыть комнату пары (reopen_lecture)")
+            if not self.scan_timer.isActive():
+                self.toggle_scanner()
+        else:
+            raise ValueError("Неизвестное действие; доступны: " + ", ".join(DUTY_REPAIRS))
+        log.info("mcp_repair_started action=%s", action)
+        return {"started": action, "next": "Через 60–90 секунд проверьте wait_and_check"}
+
+    def _private_values(self) -> list[str]:
+        values = [self.db.get_setting("student_name", ""), self.db.get_setting("group", "")]
+        try:
+            account = self.session_store.load_email_credentials()
+            if account:
+                values += [account.address, account.imap_username]
+        except Exception:
+            log.debug("report_private_values_without_mail", exc_info=True)
+        values.append(os.environ.get("USERNAME", ""))
+        return [str(value) for value in values if value]
+
+    def _record_fix_report(self, summary: str, fixed: bool) -> dict:
+        """Keep the AI's report (scrubbed) and send it to the developer when possible."""
+        from .paths import data_dir
+
+        text = diagnostics.scrub(str(summary), private=self._private_values())
+        health = self._health_report()
+        problems = ", ".join(p["code"] for p in health["problems"]) or "нет"
+        title = ("ИИ-дежурный починил: " if fixed else "ИИ-дежурный не смог починить: ") + (
+            text.splitlines()[0][:80] if text.strip() else "без описания"
+        )
+        body = (
+            f"{text}\n\n---\nВерсия приложения: {__version__}\n"
+            f"Проблемы сейчас: {problems}\n"
+            "_Отчёт ИИ-дежурного MIREA Lecture Assistant; личные данные удалены._"
+        )
+        folder = data_dir() / "reports"
+        folder.mkdir(parents=True, exist_ok=True)
+        path = folder / f"report-{time.strftime('%Y%m%d-%H%M%S')}.md"
+        path.write_text(f"# {title}\n\n{body}\n", encoding="utf-8")
+        self.duty_report = {"title": title, "body": body, "fixed": bool(fixed), "url": None}
+        today = time.strftime("%Y-%m-%d")
+        sent = self.db.get_setting("duty_reports_sent", {})
+        if not isinstance(sent, dict) or sent.get("day") != today:
+            sent = {"day": today, "count": 0}
+        log.info("ai_duty_report fixed=%s", bool(fixed))
+        if sent["count"] < 3:  # never a flood of issues from one PC
+            sent["count"] += 1
+            self.db.set_setting("duty_reports_sent", sent)
+            threading.Thread(
+                target=lambda: self.duty_signals.report_posted.emit(
+                    ai_duty.post_issue(title, body)
+                ),
+                name="duty-report",
+                daemon=True,
+            ).start()
+        self._show_duty_report()
+        return {"saved": True}
+
+    def _duty_report_posted(self, url):
+        if self.duty_report is not None:
+            self.duty_report["url"] = url
+        self._show_duty_report()
+
+    def _show_duty_report(self):
+        report = self.duty_report
+        if not report:
+            return
+        state = "починил" if report["fixed"] else "не смог починить"
+        if report.get("url"):
+            self.duty_status.setText(f"ИИ-дежурный {state}. Отчёт отправлен разработчику.")
+            self.duty_report_button.hide()
+        else:
+            self.duty_status.setText(f"ИИ-дежурный {state}. Отчёт сохранён.")
+            self.duty_report_button.show()
+
+    def _open_duty_report(self):
+        report = self.duty_report
+        if report:
+            QDesktopServices.openUrl(QUrl(ai_duty.issue_url(report["title"], report["body"])))
+
+    def _refresh_duty_agents(self):
+        agents = ai_duty.available() if ai_clients.supported() else []
+        self.duty_agents = {agent.key: agent for agent in agents}
+        wanted = self.db.get_setting("duty_agent", "")
+        self.duty_agent.blockSignals(True)
+        self.duty_agent.clear()
+        for agent in agents:
+            self.duty_agent.addItem(agent.name, agent.key)
+        index = self.duty_agent.findData(wanted)
+        self.duty_agent.setCurrentIndex(max(index, 0))
+        self.duty_agent.blockSignals(False)
+        self.duty_agent.setEnabled(bool(agents))
+        if not agents:
+            self.duty_status.setText(
+                "Нужен Codex или Claude Code: они умеют работать без окна. Без них приложение "
+                "всё равно проверяет себя на парах и сообщает о сбоях."
+            )
+        elif not self.duty_report:
+            self.duty_status.setText("")
+
+    def _duty_agent_chosen(self, _index):
+        self.db.set_setting("duty_agent", self.duty_agent.currentData() or "")
+
+    def _duty_agent(self):
+        agents = getattr(self, "duty_agents", {})
+        return agents.get(self.duty_agent.currentData() or "") or next(iter(agents.values()), None)
+
+    def _duty_toggled(self, enabled: bool):
+        self.db.set_setting("duty_enabled", bool(enabled))
+        if not enabled:
+            return
+        # Everything the duty needs, switched on together.
+        self.mcp_allow_repair.setChecked(True)
+        agent = self._duty_agent()
+        client = next(
+            (c for c in getattr(self, "ai_clients_found", []) if agent and c.key == agent.key),
+            None,
+        )
+        launcher, profile = self._mcp_root() / "McpLauncher.exe", self.mcp_access.root
+        if client is not None and ai_clients.status(client, launcher, profile) != "connected":
+            self._connect_ai_client(client)
+        elif mcp_install.installed(self._mcp_root()) is None:
+            self._install_mcp()
+        if not self.mcp_enabled.isChecked():
+            self.mcp_enabled.setChecked(True)
+
+    def _duty_tick(self):
+        """Five and twenty minutes into the pair: check once, at each mark."""
+        lesson = self._current_online_lesson()
+        if lesson is None:
+            return
+        elapsed = datetime.now().astimezone() - lesson.start_at
+        for minutes in DUTY_CHECK_MINUTES:
+            key = f"{lesson.external_id}:{minutes}"
+            if (
+                timedelta(minutes=minutes) <= elapsed < timedelta(minutes=minutes + 10)
+                and key not in self.duty_checked
+            ):
+                self.duty_checked.add(key)
+                self._duty_check(lesson, f"+{minutes}")
+
+    def _duty_check(self, lesson, mark: str):
+        report = self._health_report()
+        if report["verdict"] == "ok":
+            log.info("duty_check_ok mark=%s", mark)
+            if mark == "manual":
+                self.duty_status.setText("Проверено: всё в порядке, ИИ не понадобился.")
+            return
+        codes = ",".join(p["code"] for p in report["problems"])
+        log.warning("duty_check_problem mark=%s problems=%s", mark, codes)
+        if mark == "manual":
+            self.duty_status.setText("Нашли проблему, проверяем сеть…")
+        threading.Thread(
+            target=lambda: self.duty_signals.network.emit(report, diagnostics.network_report()),
+            name="duty-network",
+            daemon=True,
+        ).start()
+
+    def _duty_network_checked(self, report, network):
+        problems = "; ".join(p["text"] for p in report["problems"])
+        if network["verdict"] == "vpn_suspected":
+            # The app cannot repair a VPN and neither can an AI: say what to do.
+            log.warning("duty_vpn_suspected")
+            self.tray_click = self._show_vpn_help
+            self.tray.showMessage(
+                "Похоже, мешает VPN",
+                "Сайты МИРЭА не открываются, а остальной интернет работает. "
+                "Нажмите, чтобы узнать, как это исправить.",
+                QSystemTrayIcon.MessageIcon.Warning,
+                20000,
+            )
+            self.duty_status.setText("Похоже, мешает VPN. Нажмите «Как настроить VPN».")
+            return
+        if network["verdict"] == "offline":
+            self.tray.showMessage(
+                "Нет интернета",
+                "Приложение не может зайти на пару: компьютер не в сети.",
+                QSystemTrayIcon.MessageIcon.Warning,
+                15000,
+            )
+            return
+        agent = self._duty_agent()
+        if not self.duty_enabled.isChecked() or agent is None or self.duty_running:
+            self.tray_click = self._restore
+            self.tray.showMessage(
+                "Проблема на паре",
+                problems
+                + "\nПриложение продолжает пытаться само. Включите ИИ-дежурного на вкладке "
+                "MCP, чтобы такие сбои чинились сами.",
+                QSystemTrayIcon.MessageIcon.Warning,
+                15000,
+            )
+            return
+        self._start_duty_agent(agent, problems)
+
+    def _start_duty_agent(self, agent, problems: str):
+        from .paths import data_dir
+
+        if not self.mcp_enabled.isChecked():
+            self.mcp_enabled.setChecked(True)
+        self.mcp_allow_repair.setChecked(True)
+        self.duty_running = True
+        self.duty_report = None
+        self.duty_status.setText(f"{agent.name} разбирается с проблемой: {problems}")
+        self.tray.showMessage(
+            "ИИ-дежурный чинит приложение",
+            f"{problems}\n{agent.name} разбирается, это займёт несколько минут.",
+            QSystemTrayIcon.MessageIcon.Information,
+            10000,
+        )
+        root = data_dir()
+        threading.Thread(
+            target=lambda: self.duty_signals.finished.emit(
+                ai_duty.run(agent, root / "ai-duty", root / "logs", context=problems)
+            ),
+            name="ai-duty",
+            daemon=True,
+        ).start()
+
+    def _duty_finished(self, code: int):
+        self.duty_running = False
+        report = self.duty_report
+        if report is None:
+            fixed = self._health_report()["verdict"] == "ok"
+            self.duty_status.setText(
+                "ИИ-дежурный закончил: "
+                + ("всё в порядке." if fixed else "проблема осталась.")
+                + ("" if code == 0 else " (завершился с ошибкой, подробности в журнале)")
+            )
+        else:
+            fixed = report["fixed"]
+        self.tray.showMessage(
+            "ИИ-дежурный",
+            "Приложение снова работает." if fixed else "Починить не удалось. Откройте приложение.",
+            QSystemTrayIcon.MessageIcon.Information
+            if fixed
+            else QSystemTrayIcon.MessageIcon.Warning,
+            10000,
+        )
+
+    def _show_vpn_help(self):
+        from .paths import data_dir
+
+        folder = diagnostics.write_bypass_files(data_dir() / "vpn")
+        box = QMessageBox(self)
+        box.setWindowTitle("Как настроить VPN")
+        box.setIcon(QMessageBox.Icon.Information)
+        box.setText(diagnostics.VPN_HELP)
+        open_folder = box.addButton("Открыть папку с файлами", QMessageBox.ButtonRole.ActionRole)
+        box.addButton(QMessageBox.StandardButton.Close)
+        self._restore()
+        box.exec()
+        if box.clickedButton() is open_folder:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))
+
     def _install_mcp(self, then=None):
         if self.mcp_busy:
             return
@@ -1383,6 +1903,7 @@ class MainWindow(QMainWindow):
     def _mcp_rpc(self, job):
         if job.cancelled:
             return
+        deferred = False  # answered later, from a timer or a thread
         try:
             if not self.mcp_enabled.isChecked() or not self.mcp_access.server:
                 raise ValueError("MCP access is disabled")
@@ -1392,6 +1913,11 @@ class MainWindow(QMainWindow):
                 raise ValueError("Changes are disabled in the MCP tab")
             if write and self._settings_dirty():
                 raise ValueError("Save or discard unsaved settings before using MCP")
+            if method == "repair" and not self.mcp_allow_repair.isChecked():
+                raise ValueError(
+                    "Починка выключена: попросите пользователя включить «Разрешить ИИ чинить "
+                    "приложение» на вкладке MCP"
+                )
             if method == "status":
                 result = {
                     "app_version": __version__,
@@ -1458,16 +1984,99 @@ class MainWindow(QMainWindow):
                 result = {
                     "rules": {subject: self.db.get_rule(subject).value for subject in subjects}
                 }
+            elif method in {"check_health", "wait_and_check"}:
+                seconds = 0
+                if method == "wait_and_check":
+                    seconds = params.get("seconds", 60)
+                    if type(seconds) is not int or not 0 <= seconds <= 120:
+                        raise ValueError("seconds: целое число от 0 до 120")
+                deferred = True
+                QTimer.singleShot(seconds * 1000, partial(self._answer_health, job))
+                return
+            elif method == "repair":
+                result = self._repair(str(params.get("action", "")))
+            elif method == "get_recent_problems":
+                from .paths import data_dir
+
+                result = {
+                    "problems": diagnostics.recent_problems(data_dir() / "logs" / "app.log"),
+                    "note": "Только время, уровень, модуль и название события; без значений.",
+                }
+            elif method == "get_attendance_history":
+                events = []
+                for event in self.db.recent_qr_events(50):
+                    lesson = self.db.get_lesson(event.lesson_id) if event.lesson_id else None
+                    events.append(
+                        {
+                            "time": event.detected_at.isoformat(),
+                            "subject": lesson.subject_name if lesson else None,
+                            "status": event.status,
+                        }
+                    )
+                marked = set(self.db.get_setting("marked_lessons", []))
+                result = {
+                    "qr_events": events,
+                    "marked_lessons": [
+                        {"subject": lesson.subject_name, "start": lesson.start_at.isoformat()}
+                        for lesson in self.db.list_lessons()
+                        if lesson.external_id in marked
+                    ],
+                }
+            elif method == "get_vpn_help":
+                from .paths import data_dir
+
+                folder = diagnostics.write_bypass_files(data_dir() / "vpn")
+                result = {
+                    "help": diagnostics.VPN_HELP,
+                    "files_folder": str(folder),
+                    "addresses": [host for host, _ip in diagnostics.BYPASS],
+                }
+                self.tray_click = self._show_vpn_help
+                self.tray.showMessage(
+                    "Как настроить VPN",
+                    "Нажмите, чтобы открыть инструкцию и файл со списком адресов.",
+                    QSystemTrayIcon.MessageIcon.Information,
+                    20000,
+                )
+            elif method == "report_fix":
+                summary, fixed = params.get("summary"), params.get("fixed")
+                if not isinstance(summary, str) or not summary.strip() or type(fixed) is not bool:
+                    raise ValueError("summary: текст, fixed: true/false")
+                result = self._record_fix_report(summary[:4000], fixed)
             else:
                 raise ValueError("Unsupported MCP method")
             job.result = {"result": result}
         except ValueError as exc:
             job.result = {"error": str(exc)}
-        except Exception:  # noqa: BLE001 - never send exception contents/secrets to the client
-            log.warning("mcp_request_failed")
+        except Exception:  # never send exception contents/secrets to the client
+            log.warning("mcp_request_failed", exc_info=True)
             job.result = {"error": "Application could not complete the request"}
         finally:
+            if not deferred:
+                job.done.set()
+
+    def _answer_health(self, job):
+        """The health report, with a network check when something is wrong."""
+        if job.cancelled:
+            return
+        try:
+            report = self._health_report()
+        except Exception:  # never send exception contents to the client
+            log.warning("mcp_health_failed", exc_info=True)
+            job.result = {"error": "Application could not complete the request"}
             job.done.set()
+            return
+        if report["verdict"] == "ok":
+            job.result = {"result": report}
+            job.done.set()
+            return
+
+        def with_network():
+            report["network"] = diagnostics.network_report(timeout=4)
+            job.result = {"result": report}
+            job.done.set()
+
+        threading.Thread(target=with_network, name="mcp-health", daemon=True).start()
 
     def _schedule_page(self):
         page, layout = self._page_shell(
@@ -1723,6 +2332,15 @@ class MainWindow(QMainWindow):
         self.autostart_check.setChecked(bool(self.db.get_setting("autostart", True)))
         self.autostart_check.toggled.connect(self._autostart_toggled)
         startup.addRow("", self.autostart_check)
+        self.plan_b_check = QCheckBox("Запускать приложение перед каждой онлайн-парой")
+        self.plan_b_check.setToolTip(
+            "Подстраховка: если приложение закрыли или оно упало, Windows сама запустит "
+            "его за пару минут до онлайн-пары (Планировщик заданий, без прав администратора)"
+        )
+        self.plan_b_check.setEnabled(plan_b.available())
+        self.plan_b_check.setChecked(bool(self.db.get_setting("plan_b", True)))
+        self.plan_b_check.toggled.connect(self._plan_b_toggled)
+        startup.addRow("", self.plan_b_check)
 
         updates = self._settings_section(sections, "Обновления")
         updates.addRow("Установлена версия", QLabel(__version__))
@@ -1876,6 +2494,7 @@ class MainWindow(QMainWindow):
         exit_action.triggered.connect(self._quit)
         menu.addAction(exit_action)
         self.tray.setContextMenu(menu)
+        self.tray.messageClicked.connect(self._tray_message_clicked)
         self.tray.activated.connect(
             lambda reason: (
                 self._restore()
@@ -1900,6 +2519,7 @@ class MainWindow(QMainWindow):
         self.pages.setCurrentIndex(index)
         if index == MCP_PAGE:
             self._refresh_ai_clients()
+            self._refresh_duty_agents()
         for i, button in enumerate(self.nav_buttons):
             button.setChecked(i == index)
 
@@ -2232,6 +2852,7 @@ class MainWindow(QMainWindow):
         self.activity_label.setText(f"⟳ {latest}" + (f" (+{extra})" if extra else ""))
 
     def _set_auth_state(self, state: str):
+        self.auth_state = state
         text, colour = AUTH_STATES[state]
         self.auth_status.setText(text)
         self.auth_status.setStyleSheet(f"color: {colour}; padding: 12px 18px;")
@@ -2933,6 +3554,7 @@ class MainWindow(QMainWindow):
         # The merged cache, not the raw reply: a day Pulse failed to return must
         # not hide the pair that is on right now.
         self._evaluate_current_lessons(self.db.list_lessons())
+        self._sync_plan_b()
 
     def _superseded(self, lesson, now: datetime, lessons=None) -> bool:
         """Whether a later pair now owns the tab instead of ``lesson``.
@@ -2978,6 +3600,7 @@ class MainWindow(QMainWindow):
 
     def _evaluate_cached_lessons(self):
         self._evaluate_current_lessons(self.db.list_lessons())
+        self._duty_tick()
 
     def _restore_active_lecture(self):
         """Resume only a room actually monitored before a crash/update, not old links."""

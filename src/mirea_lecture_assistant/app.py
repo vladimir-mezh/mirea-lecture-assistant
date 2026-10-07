@@ -8,7 +8,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import __version__, autostart
+from . import __version__, autostart, plan_b
 from .async_runtime import async_runtime_healthy, shutdown_async_runtime
 from .database import Database
 from .logging_setup import configure_logging
@@ -234,8 +234,8 @@ def main() -> int:
         log.info("second_instance_blocked")
         if os.environ.get("MIREA_ASSISTANT_SMOKE_TEST") == "1":
             return 0
-        if autostart.launched_at_sign_in(sys.argv):
-            return 0  # started with Windows while already running: nothing to do
+        if autostart.launched_at_sign_in(sys.argv) or plan_b.launched_by_plan_b(sys.argv):
+            return 0  # started by Windows while already running: nothing to do
         answer = ask_running_copy_to_show(root)
         if answer == "shown":
             log.info("second_instance_showed_running_copy")
@@ -274,7 +274,10 @@ def main() -> int:
             f"Приложение не смогло запуститься: {exc}\n\nПодробности — в журнале:\n{log_path}",
         )
         return STARTUP_FAILED  # the watchdog does not start it again
-    if autostart.launched_at_sign_in(sys.argv):
+    if plan_b.launched_by_plan_b(sys.argv):
+        # Started by the task before a pair: it was not running, so it will be now.
+        log.info("started_by_plan_b")
+    elif autostart.launched_at_sign_in(sys.argv):
         # Started with Windows: straight to the tray, no window over the desktop.
         log.info("started_at_sign_in")
     else:

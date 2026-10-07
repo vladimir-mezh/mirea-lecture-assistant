@@ -16,6 +16,24 @@ Both access and write permissions default to off. A live adapter heartbeat is no
 
 The config points to a stable `McpLauncher.exe`, which selects `mcp/current.json`. Updating the adapter does not require editing client configuration. Already running clients keep their previous executable; restart the client to select an updated version.
 
+## Health, repair and the AI on duty (0.2.32)
+
+New application methods (protocol 1; an older app answers "Unsupported MCP method"):
+
+| Method | Effect |
+| --- | --- |
+| `check_health` | Verdict `ok`/`problem`, problems with suggested repair actions, the current pair; adds a network check (MIREA sites, internet, VPN adapters) only when something is wrong |
+| `wait_and_check` | The same after waiting up to 120 s, to see whether a repair worked |
+| `repair` | `retry_login`, `refresh_schedule`, `reopen_lecture`, `restart_browser`, `start_scanner`; needs the separate «Разрешить ИИ чинить приложение» permission |
+| `get_recent_problems` | Latest warnings/errors of the log as time, level, module and event name only |
+| `get_attendance_history` | QR events and marked pairs (subjects and times, no QR data) |
+| `get_vpn_help` | How to let MIREA and MTS Link bypass a VPN; writes `mirea-bypass-amnezia.json` and `mirea-bypass.txt` |
+| `report_fix` | The AI's summary; scrubbed of names, group, e-mail, codes, tokenised links and user paths, kept in `reports/`, filed as a GitHub issue through the user's signed-in `gh` (≤3 a day) or offered as a prefilled issue link |
+
+The app checks itself 5 and 20 minutes into every online pair it should attend. An `ok` check costs nothing. On a problem it first checks the network: a suspected VPN or no internet is explained to the user directly. Otherwise, if the AI on duty is enabled, it runs `codex exec --sandbox read-only -` or `claude -p --allowedTools mcp__mirea-lecture-assistant` with the duty prompt on stdin, from an empty working folder, with a 10-minute limit; the output is kept in `logs/ai-duty-*.log`.
+
+Plan B: a Task Scheduler task of the current user (`MIREA Lecture Assistant - контроль пар`) starts the app with `--plan-b` a couple of minutes before each online pair of the coming week; a running copy makes it exit at once.
+
 ## Connecting AI clients automatically
 
 The MCP tab lists AI clients found on the PC by their own settings folders and connects one with a click: it installs the adapter if needed, enables access and adds a single `mirea-lecture-assistant` entry (`McpLauncher.exe --profile <profile> --client-name <client>`) to the client's settings.
