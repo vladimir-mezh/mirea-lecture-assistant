@@ -61,7 +61,16 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from . import __version__, autostart, browsers, leftovers, manual_code, mcp_install, updater
+from . import (
+    __version__,
+    ai_clients,
+    autostart,
+    browsers,
+    leftovers,
+    manual_code,
+    mcp_install,
+    updater,
+)
 from .async_runtime import run_async
 from .browser_service import BrowserService, NotSignedInError
 from .browser_warning import dismiss_password_notice
@@ -100,6 +109,7 @@ ATTENDANCE_FAILURE_SPAN_SECONDS = 120
 # to open another one.
 LEAVE_AFTER_END = timedelta(minutes=5)
 SETTINGS_PAGE = 3
+MCP_PAGE = 4
 # Room names Pulse gives online pairs; any other room is a real classroom.
 ONLINE_ROOM_MARKERS = ("online", "онлайн", "дистан", "сдо", "вебинар", "mts", "мтс")
 # A code letter that arrives this long after one of the app's own sign-ins is
@@ -1141,12 +1151,22 @@ class MainWindow(QMainWindow):
             lambda enabled: self.db.set_setting("mcp_allow_changes", enabled)
         )
         layout.addWidget(self.mcp_allow_changes)
-        self.mcp_config_button = QPushButton("Скопировать конфигурацию подключения")
+        clients_title = QLabel("ИИ-клиенты на этом компьютере", objectName="section")
+        layout.addSpacing(8)
+        layout.addWidget(clients_title)
+        self.ai_clients_box = QWidget()
+        self.ai_clients_layout = QVBoxLayout(self.ai_clients_box)
+        self.ai_clients_layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self.ai_clients_box)
+        self.mcp_config_button = QPushButton(
+            "Другой клиент? Скопировать конфигурацию", objectName="secondary"
+        )
         self.mcp_config_button.clicked.connect(self._copy_mcp_config)
         layout.addWidget(self.mcp_config_button)
         hint = QLabel(
-            "Установите MCP, разрешите подключение и добавьте конфигурацию в ИИ-клиент "
-            "с поддержкой локального MCP (stdio). Клиент сам запускает MCP.\n\n"
+            "Нажмите «Подключить» у своего ИИ-клиента: приложение само скачает MCP, "
+            "включит подключение и пропишет его в настройках клиента. Чужие настройки "
+            "клиента не меняются. Клиент сам запускает MCP.\n\n"
             "Без разрешения изменений доступны только диагностика и чтение настроек. "
             "Пароли, коды входа, QR и сообщения лекций недоступны. При обновлении MCP "
             "переподключите его в ИИ-клиенте; Lecture Assistant обновлять не нужно."
@@ -1210,7 +1230,117 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Не удалось включить MCP-подключение", 5000)
         self._refresh_mcp_status()
 
-    def _install_mcp(self):
+    def _refresh_ai_clients(self):
+        """One row per AI client found here: its state and the one button it needs."""
+        while self.ai_clients_layout.count():
+            widget = self.ai_clients_layout.takeAt(0).widget()
+            if widget is not None:
+                widget.setParent(None)  # gone now, not at the next event loop pass
+                widget.deleteLater()
+        found = ai_clients.detect() if ai_clients.supported() else []
+        self.ai_clients_found = found
+        if not found:
+            note = QLabel(
+                "Не нашли ИИ-клиентов с локальным MCP: Claude Desktop, Claude Code, Codex, "
+                "Cursor, Windsurf, VS Code, Cline, Gemini CLI, LM Studio. Установите любой, "
+                "и он появится здесь."
+            )
+            note.setWordWrap(True)
+            self.ai_clients_layout.addWidget(note)
+            return
+        launcher, profile = self._mcp_root() / "McpLauncher.exe", self.mcp_access.root
+        for client in found:
+            state = ai_clients.status(client, launcher, profile)
+            row = QWidget()
+            line = QHBoxLayout(row)
+            line.setContentsMargins(0, 0, 0, 0)
+            label = QLabel(
+                client.name
+                + {
+                    "connected": " — ✓ подключён",
+                    "outdated": " — подключён по старому пути",
+                    "absent": "",
+                }[state]
+            )
+            line.addWidget(label, 1)
+            button = QPushButton(
+                {"connected": "Отключить", "outdated": "Обновить", "absent": "Подключить"}[state],
+                objectName="secondary" if state == "connected" else "",
+            )
+            button.setEnabled(not self.mcp_busy)
+            if state == "connected":
+                button.clicked.connect(partial(self._disconnect_ai_client, client))
+            else:
+                button.clicked.connect(partial(self._connect_ai_client, client))
+            line.addWidget(button)
+            self.ai_clients_layout.addWidget(row)
+
+    def _connect_ai_client(self, client):
+        """Everything one click needs: MCP installed, access on, the client's settings."""
+        if self.mcp_busy:
+            return
+        if mcp_install.installed(self._mcp_root()) is None:
+            self._install_mcp(then=lambda: self._connect_ai_client(client))
+            return
+        if not self.mcp_enabled.isChecked():
+            self.mcp_enabled.setChecked(True)  # saves the setting and opens access
+        launcher, profile = self._mcp_root() / "McpLauncher.exe", self.mcp_access.root
+
+        def connect():
+            try:
+                ai_clients.connect(client, launcher, profile)
+            except ai_clients.NotSafe:
+                return False
+            return True
+
+        def done(connected):
+            self._refresh_ai_clients()
+            if not connected:
+                QMessageBox.warning(
+                    self,
+                    "MCP",
+                    f"Файл настроек {client.name} нельзя безопасно изменить автоматически "
+                    "(в нём комментарии или ошибка), поэтому мы его не трогали. Нажмите "
+                    "«Другой клиент? Скопировать конфигурацию» и добавьте её в настройки "
+                    "клиента вручную.",
+                )
+                return
+            QMessageBox.information(
+                self,
+                "MCP",
+                f"Готово: MIREA Lecture Assistant подключён к {client.name}.\n\n"
+                f"{client.restart}\n\nПосле этого можно попросить ИИ, например: "
+                "«Покажи моё расписание» или «Какие у меня настройки?».",
+            )
+
+        def failed(message):
+            self._refresh_ai_clients()
+            QMessageBox.warning(self, "MCP", f"Не удалось подключить {client.name}: {message}")
+
+        self._run(
+            connect,
+            done,
+            f"Подключаем {client.name}…",
+            failed=failed,
+        )
+
+    def _disconnect_ai_client(self, client):
+        def done(_result):
+            self._refresh_ai_clients()
+            self.statusBar().showMessage(f"MCP отключён от {client.name}", 5000)
+
+        def failed(message):
+            self._refresh_ai_clients()
+            QMessageBox.warning(self, "MCP", f"Не удалось отключить {client.name}: {message}")
+
+        self._run(
+            lambda: ai_clients.disconnect(client),
+            done,
+            f"Отключаем {client.name}…",
+            failed=failed,
+        )
+
+    def _install_mcp(self, then=None):
         if self.mcp_busy:
             return
         self.mcp_busy = True
@@ -1228,6 +1358,8 @@ class MainWindow(QMainWindow):
             self.mcp_leftovers = True
             self._sync_mcp_access()
             self.statusBar().showMessage(f"MCP {release['version']} установлен", 5000)
+            if then is not None:
+                then()
 
         def failed(_message):
             self.mcp_busy = False
@@ -1766,6 +1898,8 @@ class MainWindow(QMainWindow):
             log.info("settings_unsaved_changes_discarded")
             self.statusBar().showMessage("Несохранённые изменения настроек отменены", 4000)
         self.pages.setCurrentIndex(index)
+        if index == MCP_PAGE:
+            self._refresh_ai_clients()
         for i, button in enumerate(self.nav_buttons):
             button.setChecked(i == index)
 
