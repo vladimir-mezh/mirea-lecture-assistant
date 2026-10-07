@@ -362,7 +362,7 @@ def test_wait_uses_one_connection_for_many_polls(imap):
     polls = []
     original_poll = ImapOtpReader._poll
 
-    def poll(self, *args):
+    def poll(self, *args, **_kwargs):
         polls.append(1)
         if len(polls) == 4:
             server.folders["INBOX"].append((11, code_letter))
@@ -566,3 +566,28 @@ def test_the_watcher_takes_only_letters_about_signing_in():
 
     assert _otp_candidate(sign_in, now, sign_in_only=True) == ("012345", True)
     assert _otp_candidate(course, now, sign_in_only=True) is None
+
+
+def test_code_mark_is_read_from_the_letter_and_the_page():
+    from mirea_lecture_assistant.email_otp import _otp_candidate, code_tag
+
+    now = datetime.now(UTC)
+    raw = message(
+        "147789 – ваш код #A2 для входа в учетную запись РТУ МИРЭА",
+        "Ваш код для входа: 147789",
+        now,
+    )
+    code, from_mirea = _otp_candidate(raw, now - timedelta(minutes=1))
+    assert code == "147789" and code.tag == "A2" and from_mirea
+    assert code_tag("Введите код (#1F), отправленный на личную почту") == "1F"
+    assert code_tag("Введите код, отправленный на почту") is None
+
+
+def test_only_a_code_of_the_same_attempt_goes_to_the_page():
+    from mirea_lecture_assistant.email_otp import Code, tags_agree
+
+    code = Code("147789")
+    code.tag = "A2"
+    assert tags_agree("A2", code) and tags_agree("a2", code)
+    assert not tags_agree("1F", code)
+    assert tags_agree(None, code) and tags_agree("1F", "147789")  # unknown never blocks

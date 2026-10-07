@@ -169,3 +169,36 @@ test('app not running: hello fails quietly', async () => {
   await w.settle();
   assert.equal(w.calls.reloads, 0);
 });
+
+test('the page mark goes with the request, and a left code form means signed in', async () => {
+  let listener;
+  const bodies = [];
+  const context = {
+    crypto: webcrypto, TextEncoder, Uint8Array, URL, Date, AbortSignal,
+    setTimeout: (f) => setTimeout(f, 1),
+    fetch: async (url, options) => {
+      if (url === 'extension:config') return {json: async () => ({port: 1, token: 'fixture'})};
+      bodies.push([url.replace(/^.*\//, '/'), JSON.parse(options.body)]);
+      return {ok: true, json: async () => url.endsWith('/poll') ?
+        {code: '147789', receipt: 'r'} : {}};
+    },
+    chrome: {
+      ...lifecycle(),
+      runtime: {getURL: () => 'extension:config', onMessage: {addListener: f => {listener = f;}},
+        onStartup: {addListener() {}}, onInstalled: {addListener() {}}},
+      tabs: {
+        sendMessage: async (_tab, message) => message.type === 'mirea-probe' ? {ready: true} :
+          message.type === 'mirea-fill' ? {filled: true} : {},
+        get: async () => ({url: undefined}),  // moved on to Пульс
+      },
+    },
+  };
+  vm.runInNewContext(source('code-worker.js'), context);
+  listener({type: 'mirea-watch', nonce: 'n', tag: 'A2'}, {frameId: 0, tab: {id: 3},
+    url: 'https://sso.mirea.ru/realms/mirea/login-actions/authenticate'});
+  for (let i = 0; i < 100 && !bodies.some(([p]) => p === '/signed-in'); i++) {
+    await new Promise(r => setTimeout(r, 5));
+  }
+  assert.equal(bodies.find(([p]) => p === '/poll')[1].tag, 'A2');
+  assert(bodies.some(([p]) => p === '/signed-in'));
+});

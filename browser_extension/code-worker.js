@@ -1,16 +1,26 @@
 // Code delivery never depends on which tab/window currently has keyboard focus.
 const active = new Set();
-async function request(path, watch, receipt) {
+async function request(path, watch, receipt, tag) {
   const config = await (await fetch(chrome.runtime.getURL('bridge-config.json'),
     {cache: 'no-store'})).json();
   if (!config.port || !config.token) throw new Error('Bridge not paired');
   const response = await fetch(`http://127.0.0.1:${config.port}${path}`, {
     method: 'POST', headers: {'Content-Type': 'application/json',
       Authorization: `Bearer ${config.token}`},
-    body: JSON.stringify({watch, receipt}), signal: AbortSignal.timeout(25000),
+    body: JSON.stringify({watch, receipt, tag}), signal: AbortSignal.timeout(25000),
   });
   if (!response.ok) throw new Error('Bridge unavailable');
   return response.json();
+}
+async function leftCodeForm(tabId) {
+  for (let i = 0; i < 30; i++) {
+    await new Promise(resolve => setTimeout(resolve, 1000));
+    let tab;
+    try { tab = await chrome.tabs.get(tabId); } catch (_) { return false; }
+    // No URL: the tab moved on to a site this extension has no access to (Пульс, СДО).
+    if (!tab.url || !tab.url.includes('/login-actions/authenticate')) return true;
+  }
+  return false;
 }
 chrome.runtime.onMessage.addListener((message, sender) => {
   if (message.type !== 'mirea-watch' || sender.frameId !== 0 || !sender.tab) return;
@@ -18,6 +28,8 @@ chrome.runtime.onMessage.addListener((message, sender) => {
   if (url.origin !== 'https://sso.mirea.ru' ||
       !url.pathname.includes('/login-actions/authenticate')) return;
   const id = `${sender.tab.id}:${message.nonce}`;
+  const tag = typeof message.tag === 'string' && /^[0-9A-Z]{1,6}$/.test(message.tag) ?
+    message.tag : undefined;
   if (active.has(id) || typeof message.nonce !== 'string' || message.nonce.length > 64) return;
   active.add(id);
   (async () => {
@@ -29,11 +41,16 @@ chrome.runtime.onMessage.addListener((message, sender) => {
         const probe = await chrome.tabs.sendMessage(sender.tab.id,
           {type: 'mirea-probe', nonce: message.nonce}, {frameId: 0});
         if (!probe?.ready) break;
-        const result = await request('/poll', watch);
+        const result = await request('/poll', watch, undefined, tag);
         if (result.code) {
           const filled = await chrome.tabs.sendMessage(sender.tab.id,
             {type: 'mirea-fill', nonce: message.nonce, code: result.code}, {frameId: 0});
-          if (filled?.filled) await request('/ack', watch, result.receipt);
+          if (filled?.filled) {
+            await request('/ack', watch, result.receipt);
+            // The page submits a full code itself; once it has left the code form
+            // the sign-in went through, and the app says so instead of «Ctrl+V».
+            if (await leftCodeForm(sender.tab.id)) await request('/signed-in', watch);
+          }
           break;
         }
       }

@@ -29,6 +29,9 @@ SIGN_IN_LETTER = re.compile(
     r"sign[- ]?in|log[- ]?in|verification",
     re.IGNORECASE,
 )
+# MIREA marks each code: the page asks for «код (#1F)», the letter says «ваш код #1F».
+# A code is used only where the marks agree; a letter from an earlier attempt is not.
+CODE_TAG = re.compile(r"код\w*\s*\(?\s*#\s*([0-9a-z]{1,6})(?![0-9a-z])", re.IGNORECASE)
 HTML_TAG = re.compile(r"<[^>]+>")
 HTML_NOISE = re.compile(r"<(style|script|head)\b.*?</\1\s*>", re.IGNORECASE | re.DOTALL)
 MIREA_MARKERS = ("mirea", "мирэа")
@@ -271,6 +274,30 @@ def _message_text(message: Message) -> str:
     return "\n".join(chunks)
 
 
+class Code(str):
+    """An emailed code, with the mark («#1F») of the sign-in it belongs to, if any."""
+
+    tag: str | None = None
+
+
+def code_tag(text: str) -> str | None:
+    """The mark of the code a page asks for, or a letter carries: «#1F» -> "1F"."""
+    match = CODE_TAG.search(text or "")
+    return match.group(1).upper() if match else None
+
+
+def _tagged(code: str, tag: str | None) -> Code:
+    result = Code(code)
+    result.tag = tag
+    return result
+
+
+def tags_agree(page_tag: str | None, code: str) -> bool:
+    """Whether a code may go to a page: unknown marks never block, different ones do."""
+    letter_tag = getattr(code, "tag", None)
+    return not (page_tag and letter_tag and page_tag.upper() != letter_tag.upper())
+
+
 def _otp_candidate(
     raw_message: bytes,
     not_before: datetime,
@@ -306,13 +333,14 @@ def _otp_candidate(
     about_sign_in = bool(SIGN_IN_LETTER.search(combined))
     if sign_in_only and not about_sign_in:
         return None
+    tag = code_tag(combined)
     contextual = CONTEXT_CODE.search(combined)
     if contextual:
-        return contextual.group(1), from_mirea
+        return _tagged(contextual.group(1), tag), from_mirea
     if from_mirea and about_sign_in:
         generic = SIX_DIGITS.search(combined)
         if generic:
-            return generic.group(1), True
+            return _tagged(generic.group(1), tag), True
     return None
 
 
@@ -426,6 +454,7 @@ class ImapOtpReader:
         accept_foreign: bool = False,
         *,
         sign_in_only: bool = False,
+        tag: str | None = None,
     ) -> str | None:
         for folder in folders:
             # A UID snapshot only exists for the inbox; UIDs differ per folder.
@@ -454,6 +483,10 @@ class ImapOtpReader:
                     if candidate is None:
                         continue
                     code, from_mirea = candidate
+                    if not tags_agree(tag, code):
+                        # A letter of another sign-in attempt: wait for the right one.
+                        log.info("email_otp_other_attempt_skipped")
+                        continue
                     if from_mirea:
                         return code
                     foreign.setdefault(code, time.monotonic())
@@ -474,6 +507,7 @@ class ImapOtpReader:
         *,
         after_uid: int | None = None,
         accept_foreign: bool = False,
+        tag: str | None = None,
     ) -> str:
         """Wait for the emailed code over one IMAP connection.
 
@@ -506,6 +540,7 @@ class ImapOtpReader:
                             checked,
                             foreign,
                             accept_foreign,
+                            tag=tag,
                         )
                         if code:
                             log.info(
