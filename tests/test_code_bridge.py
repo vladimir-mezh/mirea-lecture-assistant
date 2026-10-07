@@ -60,11 +60,19 @@ def test_loopback_requires_pairing_key_and_extension_origin(caplog):
     try:
         bridge.publish("123456")
         url = f"http://127.0.0.1:{bridge.port}/poll"
+
         def post(origin, token):
-            request = urllib.request.Request(url, json.dumps({"watch": WATCH}).encode(),
-                headers={"Origin": origin, "Authorization": "Bearer " + token,
-                         "Content-Type": "application/json"})
+            request = urllib.request.Request(
+                url,
+                json.dumps({"watch": WATCH}).encode(),
+                headers={
+                    "Origin": origin,
+                    "Authorization": "Bearer " + token,
+                    "Content-Type": "application/json",
+                },
+            )
             return urllib.request.urlopen(request, timeout=2)
+
         for origin, token in [(ORIGIN, "wrong"), ("https://sso.mirea.ru", bridge.token)]:
             with pytest.raises(urllib.error.HTTPError) as exc:
                 post(origin, token)
@@ -78,15 +86,20 @@ def test_loopback_requires_pairing_key_and_extension_origin(caplog):
 
 def test_current_video_frame_bypasses_compositor(tmp_path, monkeypatch):
     service = BrowserService(tmp_path)
+
     class Page:
         async def evaluate(self, js, *args, **kwargs):
             return base64.b64encode(b"fresh frame").decode() if "toDataURL" in js else "chat"
+
         async def screenshot(self, **kwargs):
             raise AssertionError("Compositor must not be used for a decoded video")
+
     async def active():
         return Page()
+
     async def size(_page):
         pass
+
     monkeypatch.setattr(service, "_active_page", active)
     monkeypatch.setattr(service, "_apply_capture_size", size)
     assert asyncio.run(service.capture_page_state()) == (b"fresh frame", "chat")

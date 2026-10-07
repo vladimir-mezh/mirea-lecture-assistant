@@ -81,7 +81,10 @@ CHAT_TEXT = "s => {" + DEEP_ALL_JS + " return deepAll(s).map(e => e.innerText ||
 
 # Read decoded media pixels, not Chrome's compositor (which can stop painting a
 # minimised window). Cross-origin/tainted videos fall back to a fresh screenshot.
-VIDEO_FRAME = "() => {" + DEEP_ALL_JS + """
+VIDEO_FRAME = (
+    "() => {"
+    + DEEP_ALL_JS
+    + """
   const frames = [];
   for (const v of deepAll('video')) {
     if (v.readyState < 2 || v.paused || !v.videoWidth || !v.videoHeight) continue;
@@ -109,6 +112,7 @@ VIDEO_FRAME = "() => {" + DEEP_ALL_JS + """
   for (const c of frames) { ctx.drawImage(c, 0, y); y += c.height; }
   return out.toDataURL('image/png').split(',')[1];
 }"""
+)
 
 
 class NotSignedInError(RuntimeError):
@@ -634,7 +638,9 @@ class BrowserService:
             sample = await page.evaluate(MEDIA_PROGRESS, timeout=0.5)
             if sample is None and urlparse(page.url).path.startswith("/event/"):
                 media = await page.evaluate(
-                    "() => {" + DEEP_ALL_JS + """
+                    "() => {"
+                    + DEEP_ALL_JS
+                    + """
                     return deepAll('video, canvas, iframe').length +
                       deepAll('img').filter(img => {
                         const r = img.getBoundingClientRect();

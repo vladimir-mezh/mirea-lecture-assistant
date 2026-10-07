@@ -15,8 +15,11 @@ pytest_plugins = ["test_ui_reliability"]
 
 def archive(version="0.1.0", **manifest_changes):
     files = {"MireaAssistantMcp.exe": b"MZ-fixture", "McpLauncher.exe": b"MZ-launcher"}
-    manifest = {"version": version, "app_protocol": 1,
-                "sha256": {name: hashlib.sha256(data).hexdigest() for name, data in files.items()}}
+    manifest = {
+        "version": version,
+        "app_protocol": 1,
+        "sha256": {name: hashlib.sha256(data).hexdigest() for name, data in files.items()},
+    }
     manifest.update(manifest_changes)
     out = io.BytesIO()
     with zipfile.ZipFile(out, "w") as bundle:
@@ -37,7 +40,8 @@ def test_separate_install_and_stable_launcher_follow_independent_versions(tmp_pa
     assert "token" not in json.dumps(config)
     install_archive(root, archive("0.2.0"), "0.2.0")
     assert installed(root)["version"] == "0.2.0"
-    assert (root / "versions" / "0.1.0" / "MireaAssistantMcp.exe").exists()
+    # Nothing runs the old version here, so it is removed right away.
+    assert not (root / "versions" / "0.1.0").exists()
     assert config == client_config(root, tmp_path)
 
 
@@ -59,8 +63,10 @@ def test_archive_traversal_is_rejected(tmp_path):
     assert not (tmp_path.parent / "outside.exe").exists()
 
 
-@pytest.mark.parametrize("values", [{"password": "secret"}, {"scan_interval": True},
-                                    {"scan_interval": 6}, {"group": "bad\ntext"}])
+@pytest.mark.parametrize(
+    "values",
+    [{"password": "secret"}, {"scan_interval": True}, {"scan_interval": 6}, {"group": "bad\ntext"}],
+)
 def test_settings_whitelist_and_strict_types(values):
     with pytest.raises(ValueError):
         validate_settings(values)
@@ -113,3 +119,78 @@ def test_cancelled_queued_request_cannot_change_settings(window):
     job = ApiJob("update_settings", {"settings": {"mute_lecture": False}}, cancelled=True)
     window._mcp_rpc(job)
     assert window.db.get_setting("mute_lecture", True) is True
+
+
+def test_old_versions_and_interrupted_installs_are_removed(tmp_path):
+    from mirea_lecture_assistant.mcp_install import clean_leftovers
+
+    install_archive(tmp_path, archive(), "0.1.0")
+    (tmp_path / "versions" / ".staging-0.1.5-x").mkdir()
+    install_archive(tmp_path, archive("0.2.0"), "0.2.0")
+
+    assert sorted(p.name for p in (tmp_path / "versions").iterdir()) == ["0.2.0"]
+    assert installed(tmp_path)["version"] == "0.2.0"
+    assert clean_leftovers(tmp_path)
+
+
+def test_a_version_an_ai_client_still_runs_stays_until_it_is_released(tmp_path, monkeypatch):
+    from pathlib import Path
+
+    from mirea_lecture_assistant.mcp_install import clean_leftovers
+
+    install_archive(tmp_path, archive(), "0.1.0")
+    running = tmp_path / "versions" / "0.1.0" / "MireaAssistantMcp.exe"
+    unlink = Path.unlink
+
+    def locked(path, missing_ok=False):
+        if path == running:
+            raise PermissionError("in use")  # how Windows refuses a running program
+        unlink(path, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", locked)
+    install_archive(tmp_path, archive("0.2.0"), "0.2.0")
+    assert running.exists() and (running.parent / "manifest.json").exists()
+    assert not clean_leftovers(tmp_path)
+
+    monkeypatch.setattr(Path, "unlink", unlink)
+    assert clean_leftovers(tmp_path)
+    assert not running.parent.exists()
+
+
+def test_a_new_launcher_replaces_the_running_one_by_rename(tmp_path, monkeypatch):
+    from mirea_lecture_assistant.mcp_install import clean_leftovers
+
+    install_archive(tmp_path, archive(), "0.1.0")
+    launcher = tmp_path / "McpLauncher.exe"
+    assert launcher.read_bytes() == b"MZ-launcher"
+
+    files = {"MireaAssistantMcp.exe": b"MZ-fixture-2", "McpLauncher.exe": b"MZ-launcher-2"}
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w") as bundle:
+        for name, data in files.items():
+            bundle.writestr(name, data)
+        manifest = {
+            "version": "0.2.0",
+            "app_protocol": 1,
+            "sha256": {n: hashlib.sha256(d).hexdigest() for n, d in files.items()},
+        }
+        bundle.writestr("manifest.json", json.dumps(manifest))
+        bundle.writestr("README.md", "Fixture")
+        bundle.writestr("LICENSE", "MIT Fixture")
+    install_archive(tmp_path, out.getvalue(), "0.2.0")
+
+    assert launcher.read_bytes() == b"MZ-launcher-2"
+    assert clean_leftovers(tmp_path)
+    assert sorted(p.name for p in tmp_path.iterdir()) == [
+        "McpLauncher.exe",
+        "current.json",
+        "versions",
+    ]
+
+
+def test_cleanup_without_a_valid_install_touches_nothing(tmp_path):
+    from mirea_lecture_assistant.mcp_install import clean_leftovers
+
+    (tmp_path / "versions" / "0.1.0").mkdir(parents=True)
+    assert clean_leftovers(tmp_path)
+    assert (tmp_path / "versions" / "0.1.0").exists()

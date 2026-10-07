@@ -2075,3 +2075,31 @@ def test_a_room_typed_in_by_hand_opens_even_for_a_classroom_pair(window, monkeyp
         window, monkeypatch, "А-101", manual="https://my.mts-link.ru/j/1/2"
     )
     assert opened and opened[0][0] == "https://my.mts-link.ru/j/1/2"
+
+
+def test_an_empty_event_page_before_the_end_is_reopened_rarely(window, monkeypatch):
+    """A room that has not started yet has no video: no reload at every check."""
+    lesson = _running_lesson("waiting-room")
+    since = datetime.now().astimezone() - timedelta(days=1)
+    window.db.sync_lessons([lesson], since)
+    room = "https://my.mts-link.ru/j/1/2"
+    window.active_lecture_id = lesson.external_id
+    window.active_lecture_url = room
+    reopened = []
+    monkeypatch.setattr(
+        window, "_open_lecture", lambda url, lesson_id, force=False: reopened.append(url)
+    )
+    monkeypatch.setattr(
+        window,
+        "_run",
+        lambda function, done, *_args, **_kwargs: (
+            done("inactive") if function == window.browser.lecture_state else None
+        ),
+    )
+    monkeypatch.setattr(type(window.browser), "probably_running", property(lambda _self: True))
+
+    for _ in range(6):
+        window._lecture_watch_tick()
+
+    assert reopened == [room]
+    assert window.active_lecture_id == "waiting-room"

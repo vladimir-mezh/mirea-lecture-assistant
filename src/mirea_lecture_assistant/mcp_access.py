@@ -1,4 +1,5 @@
 """Versioned local API for the separately installed MCP, not an embedded AI."""
+
 from __future__ import annotations
 
 import json
@@ -13,13 +14,20 @@ from pathlib import Path
 log = logging.getLogger(__name__)
 PROTOCOL = 1
 SETTINGS = {
-    "group": (str, "", None), "student_name": (str, "", None),
-    "join_before": (int, 5, (0, 30)), "scan_interval": (int, 2, (1, 5)),
-    "direct_capture": (bool, True, None), "hd_capture": (bool, True, None),
-    "compact_window": (bool, True, None), "mute_lecture": (bool, True, None),
-    "minimize_on_open": (bool, True, None), "minimize_after_qr": (bool, True, None),
-    "close_tab_after": (bool, True, None), "auto_login": (bool, True, None),
-    "copy_manual_codes": (bool, True, None), "type_manual_codes": (bool, True, None),
+    "group": (str, "", None),
+    "student_name": (str, "", None),
+    "join_before": (int, 5, (0, 30)),
+    "scan_interval": (int, 2, (1, 5)),
+    "direct_capture": (bool, True, None),
+    "hd_capture": (bool, True, None),
+    "compact_window": (bool, True, None),
+    "mute_lecture": (bool, True, None),
+    "minimize_on_open": (bool, True, None),
+    "minimize_after_qr": (bool, True, None),
+    "close_tab_after": (bool, True, None),
+    "auto_login": (bool, True, None),
+    "copy_manual_codes": (bool, True, None),
+    "type_manual_codes": (bool, True, None),
 }
 
 
@@ -60,6 +68,7 @@ class McpAccess:
         if self.server:
             return
         access = self
+
         class Handler(BaseHTTPRequestHandler):
             def log_message(self, *_args):
                 pass
@@ -72,10 +81,12 @@ class McpAccess:
                 try:
                     length = int(self.headers.get("Content-Length", "0"))
                     allowed = (
-                        self.path == "/rpc" and not self.headers.get("Origin")
+                        self.path == "/rpc"
+                        and not self.headers.get("Origin")
                         and self.headers.get("Host") == f"127.0.0.1:{access.server.server_port}"
-                        and secrets.compare_digest(self.headers.get("Authorization", ""),
-                                                   "Bearer " + access.token)
+                        and secrets.compare_digest(
+                            self.headers.get("Authorization", ""), "Bearer " + access.token
+                        )
                         and self.headers.get("Content-Type") == "application/json"
                     )
                     if not allowed or not 0 < length <= 16384:
@@ -99,7 +110,9 @@ class McpAccess:
                             access.clients[client_id] = {
                                 "name": str(client.get("name", "MCP"))[:80],
                                 "version": str(client.get("version", "unknown"))[:30],
-                                "state": "connected" if client.get("state") == "connected" else "waiting",
+                                "state": "connected"
+                                if client.get("state") == "connected"
+                                else "waiting",
                                 "seen": time.monotonic(),
                             }
                     if method in {"heartbeat", "disconnect"}:
@@ -131,8 +144,12 @@ class McpAccess:
         self.root.mkdir(parents=True, exist_ok=True)
         path = self.root / "mcp-connection.json"
         temporary = path.with_suffix(".tmp")
-        temporary.write_text(json.dumps({"protocol": PROTOCOL, "port": self.server.server_port,
-                                        "token": self.token}), encoding="utf-8")
+        temporary.write_text(
+            json.dumps(
+                {"protocol": PROTOCOL, "port": self.server.server_port, "token": self.token}
+            ),
+            encoding="utf-8",
+        )
         temporary.replace(path)
         log.info("mcp_access_started protocol=%s", PROTOCOL)
 

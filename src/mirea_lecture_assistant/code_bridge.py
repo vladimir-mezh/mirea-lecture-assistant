@@ -3,6 +3,7 @@
 Codes live only in memory for 90 seconds. No keyboard injection, access logs,
 wildcard CORS, or web-page access. An ambiguous pair of login tabs gets no code.
 """
+
 from __future__ import annotations
 
 import json
@@ -108,11 +109,13 @@ class CodeBridge:
             self.pending = (code, receipt, time.monotonic() + 90, None)
             if self.expiry_timer:
                 self.expiry_timer.cancel()
+
             def expire():
                 with self.condition:
                     if self.pending and self.pending[1] == receipt:
                         self.pending = None
                         self.condition.notify_all()
+
             self.expiry_timer = threading.Timer(90, expire)
             self.expiry_timer.daemon = True
             self.expiry_timer.start()
@@ -122,8 +125,12 @@ class CodeBridge:
         watcher = origin + ":" + key
         with self.condition:
             if path == "/ack":
-                if (self.pending and self.pending[1] == receipt
-                        and self.pending[2] > time.monotonic() and self.pending[3] == watcher):
+                if (
+                    self.pending
+                    and self.pending[1] == receipt
+                    and self.pending[2] > time.monotonic()
+                    and self.pending[3] == watcher
+                ):
                     self.pending = None
                     self.watchers.pop(watcher, None)
                     self.delivered()

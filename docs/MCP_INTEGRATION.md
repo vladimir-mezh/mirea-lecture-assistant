@@ -1,4 +1,4 @@
-# Optional MCP integration — Lecture Assistant 0.2.27
+# Optional MCP integration — Lecture Assistant 0.2.28
 
 MCP is an independent project: https://github.com/vladimir-mezh/mirea-lecture-assistant-mcp
 
@@ -14,7 +14,14 @@ The application has no built-in model, AI chat, API key field or MCP SDK depende
 
 Both access and write permissions default to off. A live adapter heartbeat is not proof that an AI model has issued a tool request: the page distinguishes waiting for the first request from connected. Clients expire after 35 seconds without heartbeats.
 
-The config points to a stable `McpLauncher.exe`, which selects `mcp/current.json`. Updating the adapter does not require editing client configuration. Already running clients keep their previous executable; restart the client to select an updated version. Older adapter binaries are retained for this reason. The release archive contains the adapter, launcher, manifest, README and MIT license.
+The config points to a stable `McpLauncher.exe`, which selects `mcp/current.json`. Updating the adapter does not require editing client configuration. Already running clients keep their previous executable; restart the client to select an updated version.
+
+## Independent updates
+
+- Updating Lecture Assistant replaces only its own `.exe`. MCP lives in the profile (`%LOCALAPPDATA%\MireaLectureAssistant\mcp`), so the adapter, the `mcp_enabled`/`mcp_allow_changes` settings and the client configuration survive it. The new copy publishes a new pairing token, which the adapter reads on its next request.
+- Updating MCP never touches the application: a new `versions/<version>` folder is added and `current.json` is switched atomically.
+- Older adapter versions are removed like the application's own `.old` file: right after an update and then every few seconds, but only while no AI client runs them (Windows keeps a running program locked). Interrupted `.staging-*` folders go too, never during an install.
+- A newer `McpLauncher.exe` replaces the old one by renaming the running launcher to `McpLauncher.exe.<random>.old`, removed once released. The release archive contains the adapter, launcher, manifest, README and MIT license.
 
 ## API contract v1
 
@@ -46,4 +53,4 @@ Adapter releases may extend their own implementation independently while retaini
 - Packaged application 0.2.27 smoke startup exited normally without a decompression error.
 - No real lecture messages, attendance actions, QR deliveries or credential exports were used in these tests. An actual AI client still needs to be configured by the user; tests do not claim that a model has connected to the real profile.
 
-Branch `codex/add-optional-mcp` also includes the preceding browser reliability fixes documented in `BROWSER_RELIABILITY_0_2_26.md`. No application master merge or application GitHub release is performed by this task.
+Released in Lecture Assistant 0.2.28 together with the browser reliability fixes documented in `BROWSER_RELIABILITY_0_2_26.md`.

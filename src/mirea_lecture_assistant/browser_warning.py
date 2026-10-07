@@ -3,6 +3,7 @@
 No keyboard events, focus changes, password changes, or global security settings.
 The built-in Windows accessibility API invokes the notice's Close/OK button.
 """
+
 from __future__ import annotations
 
 import base64
@@ -57,13 +58,24 @@ def dismiss_password_notice() -> bool:
         return False
     try:
         result = subprocess.run(
-            ["powershell.exe", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden",
-             "-EncodedCommand", base64.b64encode(SCRIPT.encode("utf-16-le")).decode("ascii")],
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=6,
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-NonInteractive",
+                "-WindowStyle",
+                "Hidden",
+                "-EncodedCommand",
+                base64.b64encode(SCRIPT.encode("utf-16-le")).decode("ascii"),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=6,
             check=False,
-            creationflags=subprocess.CREATE_NO_WINDOW,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
-        closed = result.returncode == 0 and result.stdout.strip().isdigit() and int(result.stdout) > 0
+        closed = (
+            result.returncode == 0 and result.stdout.strip().isdigit() and int(result.stdout) > 0
+        )
         if closed:
             log.info("browser_password_notice_closed")
         return closed

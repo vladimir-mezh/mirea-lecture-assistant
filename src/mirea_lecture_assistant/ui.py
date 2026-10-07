@@ -624,6 +624,8 @@ class MainWindow(QMainWindow):
         self.mcp_signals.requested.connect(self._mcp_rpc)
         self.mcp_access = McpAccess(data_dir(), self.mcp_signals.requested.emit)
         self.mcp_busy = False
+        # Old MCP versions go once no AI client runs them, as the app's own .old does.
+        self.mcp_leftovers = True
         try:
             session = self.session_store.load()
         except Exception:
@@ -799,8 +801,10 @@ class MainWindow(QMainWindow):
     def _manual_code_entered(self):
         log.info("manual_code_delivered copied=True typed=True via=extension")
         self.tray.showMessage(
-            "Код МИРЭА введён", "Код введён в поле почтового подтверждения в браузере",
-            QSystemTrayIcon.MessageIcon.Information, 15000,
+            "Код МИРЭА введён",
+            "Код введён в поле почтового подтверждения в браузере",
+            QSystemTrayIcon.MessageIcon.Information,
+            15000,
         )
 
     def _restart_code_watcher(self):
@@ -1134,9 +1138,9 @@ class MainWindow(QMainWindow):
         hint.setWordWrap(True)
         layout.addWidget(hint)
         repository = QPushButton("Репозиторий и релизы MCP", objectName="secondary")
-        repository.clicked.connect(lambda: QDesktopServices.openUrl(
-            QUrl(f"https://github.com/{mcp_install.REPOSITORY}")
-        ))
+        repository.clicked.connect(
+            lambda: QDesktopServices.openUrl(QUrl(f"https://github.com/{mcp_install.REPOSITORY}"))
+        )
         layout.addWidget(repository)
         layout.addStretch()
         return page
@@ -1145,6 +1149,9 @@ class MainWindow(QMainWindow):
         return self.mcp_access.root / "mcp"
 
     def _refresh_mcp_status(self):
+        if self.mcp_leftovers and not self.mcp_busy:
+            # Never during an install: its staging folder is not a leftover yet.
+            self.mcp_leftovers = not mcp_install.clean_leftovers(self._mcp_root())
         release = mcp_install.installed(self._mcp_root())
         installed = release is not None
         self.mcp_enabled.setEnabled(installed)
@@ -1152,8 +1159,11 @@ class MainWindow(QMainWindow):
         self.mcp_config_button.setEnabled(installed)
         self.mcp_install_button.setEnabled(not self.mcp_busy)
         self.mcp_install_button.setText(
-            "Устанавливаем…" if self.mcp_busy else
-            "Проверить обновление MCP" if installed else "Скачать и установить MCP"
+            "Устанавливаем…"
+            if self.mcp_busy
+            else "Проверить обновление MCP"
+            if installed
+            else "Скачать и установить MCP"
         )
         lines = [f"Установлен MCP {release['version']}" if installed else "MCP не установлен"]
         if not self.mcp_access.server:
@@ -1163,7 +1173,9 @@ class MainWindow(QMainWindow):
             if not clients:
                 lines.append("Ожидает подключения ИИ-клиента")
             for client in clients:
-                state = "подключён" if client["state"] == "connected" else "ожидает первого запроса ИИ"
+                state = (
+                    "подключён" if client["state"] == "connected" else "ожидает первого запроса ИИ"
+                )
                 lines.append(f"{client['name']} · MCP {client['version']} · {state}")
         self.mcp_status.setText("\n".join(lines))
 
@@ -1187,21 +1199,30 @@ class MainWindow(QMainWindow):
             return
         self.mcp_busy = True
         self._refresh_mcp_status()
+
         def install():
             release = mcp_install.latest()
             current = mcp_install.installed(self._mcp_root())
             if current and not updater.is_newer(release["version"], current["version"]):
                 return current
             return mcp_install.install(self._mcp_root(), release)
+
         def done(release):
             self.mcp_busy = False
+            self.mcp_leftovers = True
             self._sync_mcp_access()
             self.statusBar().showMessage(f"MCP {release['version']} установлен", 5000)
+
         def failed(_message):
             self.mcp_busy = False
             self._refresh_mcp_status()
-            QMessageBox.warning(self, "MCP", "Не удалось установить MCP. "
-                                "Проверьте интернет и доступность релиза; текущая версия сохранена.")
+            QMessageBox.warning(
+                self,
+                "MCP",
+                "Не удалось установить MCP. "
+                "Проверьте интернет и доступность релиза; текущая версия сохранена.",
+            )
+
         self._run(install, done, "Скачиваем отдельный MCP…", failed=failed)
 
     def _copy_mcp_config(self):
@@ -1224,19 +1245,26 @@ class MainWindow(QMainWindow):
             if write and self._settings_dirty():
                 raise ValueError("Save or discard unsaved settings before using MCP")
             if method == "status":
-                result = {"app_version": __version__, "protocol": 1,
-                          "session_present": bool(self.mirea.session),
-                          "scanner_running": self.scan_timer.isActive(),
-                          "last_capture_age_seconds": round(time.monotonic() - self.last_capture_at, 1)
-                          if self.last_capture_at else None,
-                          "active_lesson_id": self.active_lecture_id,
-                          "changes_allowed": self.mcp_allow_changes.isChecked()}
+                result = {
+                    "app_version": __version__,
+                    "protocol": 1,
+                    "session_present": bool(self.mirea.session),
+                    "scanner_running": self.scan_timer.isActive(),
+                    "last_capture_age_seconds": round(time.monotonic() - self.last_capture_at, 1)
+                    if self.last_capture_at
+                    else None,
+                    "active_lesson_id": self.active_lecture_id,
+                    "changes_allowed": self.mcp_allow_changes.isChecked(),
+                }
             elif method == "get_settings":
-                result = {key: self.db.get_setting(key, default)
-                          for key, (_, default, _) in MCP_SETTINGS.items()}
-                result["schema"] = {key: {"type": kind.__name__, "default": default,
-                                         "range": bounds}
-                                    for key, (kind, default, bounds) in MCP_SETTINGS.items()}
+                result = {
+                    key: self.db.get_setting(key, default)
+                    for key, (_, default, _) in MCP_SETTINGS.items()
+                }
+                result["schema"] = {
+                    key: {"type": kind.__name__, "default": default, "range": bounds}
+                    for key, (kind, default, bounds) in MCP_SETTINGS.items()
+                }
             elif method == "update_settings":
                 values = validate_settings(params.get("settings"))
                 # One transaction, so a rejected/partial update cannot leak through.
@@ -1244,9 +1272,11 @@ class MainWindow(QMainWindow):
 
                 with self.db.connection() as conn:
                     for key, value in values.items():
-                        conn.execute("INSERT INTO settings(key,value) VALUES(?,?) "
-                                     "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                                     (key, json.dumps(value, ensure_ascii=False)))
+                        conn.execute(
+                            "INSERT INTO settings(key,value) VALUES(?,?) "
+                            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                            (key, json.dumps(value, ensure_ascii=False)),
+                        )
                 self._load_settings()
                 self.scan_timer.setInterval(self.scan_interval.value() * 1000)
                 if {"copy_manual_codes", "type_manual_codes"} & values.keys():
@@ -1255,10 +1285,18 @@ class MainWindow(QMainWindow):
                 result = {"updated": sorted(values)}
                 log.info("mcp_settings_updated keys=%s", ",".join(sorted(values)))
             elif method == "get_schedule":
-                result = {"lessons": [{"id": lesson.external_id, "subject": lesson.subject_name,
-                                      "type": lesson.lesson_type,
-                                      "start": lesson.start_at.isoformat(), "end": lesson.end_at.isoformat()}
-                                     for lesson in self.db.list_lessons()[:200]]}
+                result = {
+                    "lessons": [
+                        {
+                            "id": lesson.external_id,
+                            "subject": lesson.subject_name,
+                            "type": lesson.lesson_type,
+                            "start": lesson.start_at.isoformat(),
+                            "end": lesson.end_at.isoformat(),
+                        }
+                        for lesson in self.db.list_lessons()[:200]
+                    ]
+                }
             elif method in {"get_subject_rules", "set_subject_rule"}:
                 subjects = sorted({lesson.subject_name for lesson in self.db.list_lessons()})
                 if method == "set_subject_rule":
@@ -1269,7 +1307,9 @@ class MainWindow(QMainWindow):
                     self._fill_schedule()
                     self._update_now_card()
                     log.info("mcp_subject_rule_updated")
-                result = {"rules": {subject: self.db.get_rule(subject).value for subject in subjects}}
+                result = {
+                    "rules": {subject: self.db.get_rule(subject).value for subject in subjects}
+                }
             else:
                 raise ValueError("Unsupported MCP method")
             job.result = {"result": result}
@@ -3496,7 +3536,9 @@ class MainWindow(QMainWindow):
                 if lesson and datetime.now().astimezone() >= lesson.end_at + LEAVE_AFTER_END:
                     self._finish_active_lecture("ended_landing_page")
                     return
-                state = "lost"
+                # Before the end it may be a room that has not started yet: reopen
+                # it as rarely as a stalled stream, not at every check.
+                state = "stalled"
             else:
                 self.lecture_inactive_checks = 0
             if state == "unstable":
