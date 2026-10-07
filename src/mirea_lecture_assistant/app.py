@@ -304,5 +304,5 @@ def main() -> int:
         shutdown_async_runtime()
     except Exception:
         log.warning("async_runtime_shutdown_failed", exc_info=True)
-    log.info("application_exit code=%s", exit_code)
+    log.info("application_exit exit_code=%s", exit_code)
     return exit_code
