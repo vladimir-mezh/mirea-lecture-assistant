@@ -61,7 +61,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from . import __version__, autostart, manual_code, mcp_install, updater
+from . import __version__, autostart, leftovers, manual_code, mcp_install, updater
 from .async_runtime import run_async
 from .browser_service import BrowserService, NotSignedInError
 from .browser_warning import dismiss_password_notice
@@ -767,6 +767,14 @@ class MainWindow(QMainWindow):
         self.update_cleanup_timer.timeout.connect(self._cleanup_old_version)
         QTimer.singleShot(3_000, self._restart_code_watcher)
         QTimer.singleShot(0, self._start_code_bridge)
+        # Unpacked copies left by killed runs (100+ MB each): once a minute after
+        # start, when the start itself is done, then every six hours.
+        self.leftovers_timer = QTimer(self)
+        self.leftovers_timer.setInterval(6 * 60 * 60 * 1000)
+        self.leftovers_timer.timeout.connect(self._clean_runtime_leftovers)
+        if os.environ.get("MIREA_ASSISTANT_SMOKE_TEST") != "1":
+            QTimer.singleShot(60_000, self._clean_runtime_leftovers)
+            self.leftovers_timer.start()
         self.mcp_timer = QTimer(self)
         self.mcp_timer.timeout.connect(self._refresh_mcp_status)
         self.mcp_timer.start(5_000)
@@ -784,6 +792,11 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(FIRST_UPDATE_CHECK_MS, self._check_for_updates)
         if self.db.recovery:
             QTimer.singleShot(0, self._report_database_recovery)
+
+    def _clean_runtime_leftovers(self):
+        threading.Thread(
+            target=leftovers.clean_runtime_folders, name="runtime-leftovers", daemon=True
+        ).start()
 
     def _start_code_bridge(self):
         from .paths import data_dir, resource_path

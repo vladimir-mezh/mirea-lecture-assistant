@@ -88,6 +88,14 @@ class CodeBridge:
 
     def prepare_extension(self, source: Path, target: Path):
         shutil.copytree(source, target, dirs_exist_ok=True)
+        # Files a newer version no longer has would linger in the browser's copy.
+        wanted = {path.relative_to(source) for path in source.rglob("*")}
+        for path in sorted(target.rglob("*"), reverse=True):
+            if path.relative_to(target) not in wanted:
+                if path.is_dir():
+                    shutil.rmtree(path, ignore_errors=True)
+                else:
+                    path.unlink(missing_ok=True)
         # This is a local pairing key, NOT a mailbox password or an OTP. It is
         # not web-accessible and is regenerated on every application launch.
         config = {"port": self.port, "token": self.token}

@@ -4,6 +4,7 @@ import gc
 import json
 import logging
 import os
+import shutil
 import sqlite3
 import threading
 import time
@@ -157,6 +158,16 @@ class Database:
             return None
         for old in sorted(folder.glob("assistant-*.sqlite3"))[:-keep]:
             old.unlink(missing_ok=True)
+        # The app never keeps programs here: an .exe is a hand-made copy of an
+        # old version, ~50 MB the updater's own .old handling already covers.
+        for program in folder.glob("*.exe"):
+            try:
+                program.unlink()
+            except OSError:
+                pass
+        # Damaged files put aside by a recovery: the latest few are enough.
+        for old in sorted(self.path.parent.glob("db-backup-*"))[:-3]:
+            shutil.rmtree(old, ignore_errors=True)
         return target
 
     @staticmethod
