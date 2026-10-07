@@ -61,7 +61,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from . import __version__, autostart, leftovers, manual_code, mcp_install, updater
+from . import __version__, autostart, browsers, leftovers, manual_code, mcp_install, updater
 from .async_runtime import run_async
 from .browser_service import BrowserService, NotSignedInError
 from .browser_warning import dismiss_password_notice
@@ -111,6 +111,8 @@ CODE_CLIPBOARD_SECONDS = 90
 # not from the tab: a reload is tried, but not again and again (each one leaves
 # and re-enters the room, and a QR shown meanwhile is missed).
 SOFT_RECOVERY_EVERY_SECONDS = 10 * 60
+# The extension says hello every minute while its browser runs.
+EXTENSION_ONLINE_SECONDS = 3 * 60
 # While a pair runs, the СДО is checked again for a newer room of this group:
 # often at the start, when teachers recreate rooms, rarely later.
 RECHECK_EARLY_WINDOW = timedelta(minutes=20)
@@ -777,6 +779,7 @@ class MainWindow(QMainWindow):
             self.leftovers_timer.start()
         self.mcp_timer = QTimer(self)
         self.mcp_timer.timeout.connect(self._refresh_mcp_status)
+        self.mcp_timer.timeout.connect(self._refresh_extension_status)
         self.mcp_timer.start(5_000)
         QTimer.singleShot(0, self._sync_mcp_access)
         if updater.can_self_update() and os.environ.get("MIREA_ASSISTANT_SMOKE_TEST") != "1":
@@ -1560,15 +1563,18 @@ class MainWindow(QMainWindow):
             self.type_manual_codes.setEnabled(False)
         self.copy_manual_codes.toggled.connect(self.type_manual_codes.setEnabled)
         sign_in.addRow("", self.type_manual_codes)
-        max_extension = QPushButton(
-            "Расширение «пропуск МАКС» для браузера…", objectName="secondary"
+        self.extension_button = QPushButton("Установить в браузер…", objectName="secondary")
+        self.extension_button.setToolTip(
+            "Когда вы входите на сайт МИРЭА в своём браузере, расширение само вводит код "
+            "из письма и нажимает «Пропустить» на «Подтверждении через МАКС». "
+            "Обновляется само вместе с приложением"
         )
-        max_extension.setToolTip(
-            "Само нажимает «Пропустить» на странице «Подтверждение через МАКС», "
-            "когда вы входите на сайт МИРЭА в своём браузере"
-        )
-        max_extension.clicked.connect(self._install_browser_extension)
-        sign_in.addRow("МАКС", max_extension)
+        self.extension_button.clicked.connect(self._install_browser_extension)
+        sign_in.addRow("Расширение", self.extension_button)
+        self.extension_status = QLabel()
+        self.extension_status.setWordWrap(True)
+        sign_in.addRow("", self.extension_status)
+        self._refresh_extension_status()
 
         appearance = self._settings_section(sections, "Внешний вид")
         self.theme_choice = QComboBox()
@@ -1924,11 +1930,47 @@ class MainWindow(QMainWindow):
         """A small lecture window must not shrink the frame the scanner sees."""
         self.browser.capture_size = (1920, 1080) if self.hd_capture.isChecked() else None
 
-    def _install_browser_extension(self):
-        """Put the МАКС-skipping extension in a folder of its own and say how to add it.
+    def _extension_seen(self) -> tuple[float, str] | None:
+        """When the extension last said hello and from which browser, kept across runs."""
+        seen = self.code_bridge.extension_seen
+        if seen is not None:
+            stored = {"at": seen, "browser": self.code_bridge.extension_browser}
+            if self.db.get_setting("extension_seen", None) != stored:
+                self.db.set_setting("extension_seen", stored)
+        stored = self.db.get_setting("extension_seen", None)
+        if not isinstance(stored, dict) or not isinstance(stored.get("at"), (int, float)):
+            return None
+        return float(stored["at"]), str(stored.get("browser") or "браузер")
 
-        A browser takes an unpacked extension only from a folder the person picks
-        on its extensions page; the program can prepare the folder, not press that.
+    def _refresh_extension_status(self):
+        seen = self._extension_seen()
+        if seen is None:
+            self.extension_status.setText(
+                "Не установлено. Без расширения код из письма вставляется вручную (Ctrl+V), "
+                "а «Подтверждение через МАКС» нужно пропускать самому."
+            )
+            self.extension_button.setText("Установить в браузер…")
+            return
+        at, browser = seen
+        if time.time() - at < EXTENSION_ONLINE_SECONDS:
+            self.extension_status.setText(f"✓ Работает в браузере {browser}")
+        else:
+            when = datetime.fromtimestamp(at).astimezone().strftime("%d.%m %H:%M")
+            self.extension_status.setText(
+                f"Установлено в браузере {browser}, сейчас не на связи (последний раз "
+                f"{when}). Так бывает, когда браузер закрыт. Если он открыт, а надпись "
+                "не меняется пару минут, значит, браузер отключил расширение (например, "
+                "выключен «Режим разработчика»). Нажмите кнопку выше и установите заново."
+            )
+        self.extension_button.setText("Установить ещё в один браузер…")
+
+    def _install_browser_extension(self):
+        """Prepare the extension and walk the person through the one step left.
+
+        A browser takes an extension from outside its store only by hand, on its
+        extensions page; everything else is done here: the right browser and
+        page are opened, the folder is shown ready to drag, and the app notices
+        by itself when the extension starts working.
         """
         from .paths import data_dir, resource_path
 
@@ -1940,22 +1982,67 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Расширение", f"Не удалось подготовить папку: {exc}")
             return
         log.info("browser_extension_prepared")
-        QDesktopServices.openUrl(QUrl.fromLocalFile(str(target)))
-        QMessageBox.information(
-            self,
-            "Расширение МИРЭА: МАКС и код",
-            "Папка с расширением открыта. Чтобы добавить его в браузер:\n\n"
-            "1. Откройте страницу расширений: chrome://extensions "
-            "(Edge — edge://extensions, Яндекс — browser://extensions).\n"
-            "2. Включите «Режим разработчика».\n"
-            "3. Нажмите «Загрузить распакованное расширение» и выберите папку:\n"
-            f"{target}\n\n"
-            "Папку не удаляйте: браузер берёт расширение из неё. Расширение работает "
-            "только на sso.mirea.ru и нажимает «Пропустить», лишь когда страница сама "
-            "это предлагает. Также вводит почтовый код в неактивной вкладке входа. "
-            "Если расширение уже установлено, нажмите его кнопку обновления "
-            "на странице расширений, чтобы загрузить новые разрешения.",
+        found = browsers.installed()
+        if not found:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(target)))
+            QMessageBox.information(
+                self,
+                "Расширение",
+                "Не нашли подходящий браузер: нужен Google Chrome, Microsoft Edge, "
+                "Яндекс Браузер, Opera, Brave или Vivaldi (Firefox не подходит).\n\n"
+                "Если браузер есть, откройте в нём страницу расширений, включите "
+                "«Режим разработчика» и перетащите туда открывшуюся папку.",
+            )
+            return
+        browser = found[0]
+        if len(found) > 1:
+            labels = [b.name + (" (по умолчанию)" if b.default else "") for b in found]
+            label, ok = QInputDialog.getItem(
+                self, "Расширение", "В какой браузер установить?", labels, 0, False
+            )
+            if not ok:
+                return
+            browser = found[labels.index(label)]
+        log.info("browser_extension_install_started browser=%s", browser.name)
+        browsers.open_page(browser, browser.extensions_page)
+        browsers.show_in_explorer(target)
+        started = time.time()
+        box = QMessageBox(self)
+        box.setWindowTitle(f"Расширение для {browser.name}")
+        box.setIcon(QMessageBox.Icon.Information)
+        box.setText(
+            f"Осталось два действия в браузере {browser.name}:\n\n"
+            "1. На открывшейся странице расширений включите «Режим разработчика» "
+            "(переключатель вверху справа; в Edge — слева).\n\n"
+            "2. Перетащите мышью папку «browser-extension» из открывшегося окна "
+            "проводника прямо на эту страницу.\n\n"
+            "Всё. Приложение само заметит расширение, и это окно сообщит об этом.\n\n"
+            f"Если страница расширений не открылась, введите в адресной строке "
+            f"{browser.extensions_page}"
         )
+        box.setStandardButtons(QMessageBox.StandardButton.Close)
+        box.setModal(False)
+        watch = QTimer(box)
+
+        def check():
+            if (self.code_bridge.extension_seen or 0) < started:
+                return
+            watch.stop()
+            name = self.code_bridge.extension_browser or browser.name
+            log.info("browser_extension_installed browser=%s", name)
+            box.setText(
+                f"Готово! Расширение работает в браузере {name}.\n\n"
+                "Обновлять его не нужно: оно обновляется само вместе с приложением. "
+                "«Режим разработчика» не выключайте: без него браузер отключит "
+                "расширение. Папку «browser-extension» тоже не трогайте, за ней "
+                "приложение следит само."
+            )
+            self._refresh_extension_status()
+
+        watch.timeout.connect(check)
+        watch.start(1000)
+        self.extension_setup_box = box
+        box.show()
 
     def _open_logs_folder(self):
         from .paths import data_dir

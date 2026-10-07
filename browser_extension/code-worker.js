@@ -46,3 +46,49 @@ chrome.runtime.onMessage.addListener((message, sender) => {
     }
   })();
 });
+
+// --- Keeping itself current, with nothing for the person to do -------------
+// The app rewrites this folder at every start and stamps the manifest's
+// version_name with a hash of the files. The loaded manifest keeps the old
+// stamp until a reload, so a difference means new code is waiting on disk.
+const RELOAD_PAUSE_MS = 10 * 60 * 1000;  // never a reload loop, whatever happens
+async function updateIfChanged() {
+  try {
+    const disk = await (await fetch(chrome.runtime.getURL('manifest.json'),
+      {cache: 'no-store'})).json();
+    const loaded = chrome.runtime.getManifest().version_name;
+    if (!disk.version_name || disk.version_name === loaded) return false;
+    // Never in the middle of someone's sign-in: the next minute will do.
+    if ((await chrome.tabs.query({url: 'https://sso.mirea.ru/*'})).length) return false;
+    const {reloadedAt = 0} = await chrome.storage.local.get('reloadedAt');
+    if (Date.now() - reloadedAt < RELOAD_PAUSE_MS) return false;
+    await chrome.storage.local.set({reloadedAt: Date.now()});
+    chrome.runtime.reload();
+    return true;
+  } catch (_) { return false; }
+}
+// Tells the app the extension is installed and working, so it can say so.
+async function hello() {
+  if (await updateIfChanged()) return;
+  try { await request('/hello', '0'.repeat(64)); } catch (_) { /* app not running */ }
+}
+// Open sign-in tabs keep the old scripts after an install or update: give them
+// the current ones, so a code arriving right now still lands in the field.
+async function refreshOpenSignInTabs() {
+  try {
+    for (const tab of await chrome.tabs.query({url: 'https://sso.mirea.ru/*'})) {
+      try {
+        await chrome.scripting.executeScript({target: {tabId: tab.id},
+          files: ['skip-max.js', 'email-code.js']});
+      } catch (_) { /* a tab that is closing or not a page */ }
+    }
+  } catch (_) {}
+}
+chrome.alarms.create('mirea-hello', {periodInMinutes: 1});
+chrome.alarms.onAlarm.addListener(alarm => { if (alarm.name === 'mirea-hello') hello(); });
+chrome.runtime.onStartup.addListener(hello);
+chrome.runtime.onInstalled.addListener(details => {
+  // Not on a browser update: the open tabs already run the current scripts.
+  if (details.reason === 'install' || details.reason === 'update') refreshOpenSignInTabs();
+  hello();
+});

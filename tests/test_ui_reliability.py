@@ -2103,3 +2103,43 @@ def test_an_empty_event_page_before_the_end_is_reopened_rarely(window, monkeypat
 
     assert reopened == [room]
     assert window.active_lecture_id == "waiting-room"
+
+
+def test_one_button_installs_into_the_chosen_browser_and_notices_it_working(
+    window, tmp_path, monkeypatch
+):
+    from mirea_lecture_assistant import browsers, paths, ui
+
+    monkeypatch.setattr(paths, "data_dir", lambda: tmp_path)
+    chrome = browsers.Browser("Google Chrome", tmp_path / "chrome.exe", "chrome://extensions/")
+    yandex = browsers.Browser(
+        "Яндекс Браузер", tmp_path / "browser.exe", "browser://extensions/", default=True
+    )
+    opened, shown = [], []
+    monkeypatch.setattr(ui.browsers, "installed", lambda: [yandex, chrome])
+    monkeypatch.setattr(ui.browsers, "open_page", lambda b, url: opened.append((b.name, url)))
+    monkeypatch.setattr(ui.browsers, "show_in_explorer", shown.append)
+    monkeypatch.setattr(
+        ui.QInputDialog, "getItem", staticmethod(lambda *args: ("Google Chrome", True))
+    )
+    assert "Не установлено" in window.extension_status.text()
+
+    window._install_browser_extension()
+
+    folder = tmp_path / "browser-extension"
+    assert opened == [("Google Chrome", "chrome://extensions/")]
+    assert shown == [folder]
+    assert "version_name" in (folder / "manifest.json").read_text(encoding="utf-8")
+    box = window.extension_setup_box
+    assert "Режим разработчика" in box.text() and "Перетащите" in box.text()
+
+    window.code_bridge.greet("Mozilla/5.0 Chrome/141.0.0.0 Safari/537.36")
+    for timer in box.findChildren(ui.QTimer):
+        timer.timeout.emit()
+
+    assert box.text().startswith("Готово!")
+    assert "Работает в браузере Google Chrome" in window.extension_status.text()
+    assert window.extension_button.text() == "Установить ещё в один браузер…"
+    # Remembered: after a restart the app still knows it is installed.
+    assert window.db.get_setting("extension_seen")["browser"] == "Google Chrome"
+    box.close()
