@@ -3,6 +3,7 @@
 Pulse, not this desktop client, redeems the authorization code. A Keycloak
 cookie alone is not a completed Pulse login.
 """
+
 from __future__ import annotations
 
 import logging
@@ -36,9 +37,13 @@ class PulseAuth:
         if not action:
             hosts.add("pulse.mirea.ru")
         if (
-            parsed.scheme != "https" or parsed.hostname not in hosts
-            or parsed.username or parsed.password or parsed.port not in (None, 443)
-            or action and "/realms/mirea/login-actions/" not in parsed.path
+            parsed.scheme != "https"
+            or parsed.hostname not in hosts
+            or parsed.username
+            or parsed.password
+            or parsed.port not in (None, 443)
+            or action
+            and "/realms/mirea/login-actions/" not in parsed.path
         ):
             raise ValueError("Unexpected sign-in destination")
         return url
@@ -70,17 +75,25 @@ class PulseAuth:
 
     async def _post(self, action, fields, referer):
         return await self.client.post(
-            self._trusted(action, action=True), data=fields,
-            headers={"Referer": referer}, follow_redirects=False,
+            self._trusted(action, action=True),
+            data=fields,
+            headers={"Referer": referer},
+            follow_redirects=False,
         )
 
     async def _settle(self, response):
         for _ in range(16):
-            log.info("pulse_auth_step host=%s path=%s status=%s",
-                     response.url.host, response.url.path, response.status_code)
-            log.info("pulse_auth_response pulse_cookie_present=%s query_keys=%s",
-                     any(item.name in PULSE_COOKIE_NAMES for item in self.client.cookies.jar),
-                     ",".join(sorted(response.url.params.keys())) or "-")
+            log.info(
+                "pulse_auth_step host=%s path=%s status=%s",
+                response.url.host,
+                response.url.path,
+                response.status_code,
+            )
+            log.info(
+                "pulse_auth_response pulse_cookie_present=%s query_keys=%s",
+                any(item.name in PULSE_COOKIE_NAMES for item in self.client.cookies.jar),
+                ",".join(sorted(response.url.params.keys())) or "-",
+            )
             if response.status_code in REDIRECTS:
                 location = response.headers.get("location")
                 if not location:
@@ -102,12 +115,16 @@ class PulseAuth:
     def _result(self, page):
         # Do not accept SSO identity cookies, HTML or a 302 as proof of login.
         cookies = {
-            c.name: c.value for c in self.client.cookies.jar
+            c.name: c.value
+            for c in self.client.cookies.jar
             if c.domain.lstrip(".") in {"pulse.mirea.ru", "mirea.ru"}
             and any(c.name == name or c.name.startswith(name + "C") for name in PULSE_COOKIE_NAMES)
         }
-        if (page.url.host == "pulse.mirea.ru" and page.status_code == 200
-                and any(cookies.get(name) for name in PULSE_COOKIE_NAMES)):
+        if (
+            page.url.host == "pulse.mirea.ru"
+            and page.status_code == 200
+            and any(cookies.get(name) for name in PULSE_COOKIE_NAMES)
+        ):
             self._challenge = None
             log.info("pulse_auth_cookie_received")
             return AuthResult(True, "Сессия Пульса получена", cookies=cookies)
@@ -125,8 +142,12 @@ class PulseAuth:
                 return AuthResult(False, error or "Введите код подтверждения", challenge=challenge)
             if error:
                 return AuthResult(False, error)
-        log.warning("pulse_auth_incomplete host=%s path=%s status=%s",
-                    page.url.host, page.url.path, page.status_code)
+        log.warning(
+            "pulse_auth_incomplete host=%s path=%s status=%s",
+            page.url.host,
+            page.url.path,
+            page.status_code,
+        )
         return AuthResult(False, "МИРЭА не завершила вход в Пульс. Начните вход заново.")
 
     @staticmethod
@@ -140,10 +161,13 @@ class PulseAuth:
     async def login(self, username: str, password: str):
         self._challenge = None
         try:
-            page = await self._settle(await self.client.get(
-                "https://pulse.mirea.ru/api/auth/login", params={"redirectUri": "/"},
-                follow_redirects=False,
-            ))
+            page = await self._settle(
+                await self.client.get(
+                    "https://pulse.mirea.ru/api/auth/login",
+                    params={"redirectUri": "/"},
+                    follow_redirects=False,
+                )
+            )
             if page.url.host == "pulse.mirea.ru":
                 return self._result(page)
             form = self._form(page)
@@ -161,9 +185,13 @@ class PulseAuth:
         try:
             fields = dict(challenge.hidden_fields)
             fields[challenge.field_name] = code
-            page = await self._settle(await self._post(
-                challenge.action_url, fields, challenge.referer or "https://sso.mirea.ru/",
-            ))
+            page = await self._settle(
+                await self._post(
+                    challenge.action_url,
+                    fields,
+                    challenge.referer or "https://sso.mirea.ru/",
+                )
+            )
             return self._result(page)
         except (httpx.HTTPError, ValueError) as exc:
             return self._failure(exc)

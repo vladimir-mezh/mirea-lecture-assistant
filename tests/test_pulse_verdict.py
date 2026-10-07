@@ -327,4 +327,60 @@ def test_renamed_pulse_cookie_uses_real_api_without_obsolete_bootstrap(pulse):
 
 def test_expired_renamed_cookie_is_not_accepted_on_presence_alone(pulse):
     pulse.handle = _refusing_pulse
-    assert asyncio.run(MireaService({"Pulse.Auth.Cookie": "synthetic"}).verify_state()) is SessionState.EXPIRED
+    assert (
+        asyncio.run(MireaService({"Pulse.Auth.Cookie": "synthetic"}).verify_state())
+        is SessionState.EXPIRED
+    )
+
+
+APPROVED = (
+    b"\x00"
+    + struct.pack(">I", 4)
+    + b"\x0a\x02\x08\x01"  # { success: { value: true } }
+    + b"\x80"
+    + struct.pack(">I", 15)
+    + b"grpc-status: 0\r\n"
+)
+
+
+def test_a_qr_is_marked_with_the_renamed_pulse_cookie(pulse):
+    """The attendance call went through pymirea's own bootstrap, which knows only
+    .AspNetCore.Cookies: with Pulse.Auth.Cookie it answered «Перелогиньтесь»."""
+
+    def current_pulse(request):
+        if request.url.path == "/api/auth/login":
+            # Pulse no longer hands out .AspNetCore.Cookies: an old bootstrap
+            # ends on the app with no such cookie.
+            return httpx.Response(302, headers={"Location": "https://pulse.mirea.ru/api/baseinfo"})
+        if request.url.path == "/api/baseinfo":
+            return httpx.Response(200, json={})
+        assert "Pulse.Auth.Cookie=synthetic" in request.headers["cookie"]
+        return httpx.Response(200, content=APPROVED)
+
+    pulse.handle = current_pulse
+    service = MireaService({"Pulse.Auth.Cookie": "synthetic"})
+    result = asyncio.run(
+        service.mark_attendance(
+            "https://pulse.mirea.ru/selfapprove?token=0f8fad5b-d9cb-469f-a165-70867728950e"
+        )
+    )
+
+    assert result.success, result.message
+    assert any("SelfApproveAttendanceThroughQRCode" in item for item in pulse.requests)
+
+
+def test_pulse_renewing_its_cookie_mid_schedule_is_no_conflict(pulse):
+    """Pulse sets a fresh Pulse.Auth.Cookie for pulse.mirea.ru next to ours for .mirea.ru."""
+    calls = []
+
+    def renewing_pulse(request):
+        assert request.url.path.startswith("/rtu_tc.")
+        calls.append(1)
+        headers = {"Set-Cookie": "Pulse.Auth.Cookie=renewed; Path=/; Secure; HttpOnly"}
+        return httpx.Response(200, content=EMPTY_DAY, headers=headers if len(calls) == 1 else {})
+
+    pulse.handle = renewing_pulse
+    service = MireaService({"Pulse.Auth.Cookie": "synthetic"})
+
+    assert asyncio.run(service.get_schedule(days=3)) == []
+    assert len(calls) >= 3  # every day was asked for, none broke on the second cookie

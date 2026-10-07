@@ -8,14 +8,15 @@ def test_encoded_urls_and_secret_aliases_are_redacted_after_formatting():
     from mirea_lecture_assistant.logging_setup import RedactingFormatter
 
     sources = [
-        'code=synthetic-secret client_secret=synthetic-secret session_state=synthetic-secret',
+        "code=synthetic-secret client_secret=synthetic-secret session_state=synthetic-secret",
         '{"code":"synthetic-secret", "client_secret":"synthetic-secret"}',
-        'https://sso.mirea.ru/callback?code=synthetic-secret&state=synthetic-secret',
+        "https://sso.mirea.ru/callback?code=synthetic-secret&state=synthetic-secret",
     ]
     for source in sources:
         for _ in range(3):
-            record = logging.LogRecord("test", logging.WARNING, __file__, 1,
-                                       "failure %r", (source,), None)
+            record = logging.LogRecord(
+                "test", logging.WARNING, __file__, 1, "failure %r", (source,), None
+            )
             assert "synthetic-secret" not in RedactingFormatter().format(record)
             source = quote(source, safe="")
     assert redact("pulse_auth_step status=401 path=/api/mireaauth") == (
@@ -29,17 +30,18 @@ def test_secret_value_delimiters_numeric_json_and_escaped_quotes():
     from mirea_lecture_assistant.logging_setup import RedactingFormatter
 
     sources = [
-        'https://sso.mirea.ru/cb?code=prefix%26synthetic-secret',
-        'https://sso.mirea.ru/cb?code=prefix%23synthetic-secret',
-        'https://sso.mirea.ru/cb?code=prefix%20synthetic-secret',
-        'password=prefix&synthetic-secret',
+        "https://sso.mirea.ru/cb?code=prefix%26synthetic-secret",
+        "https://sso.mirea.ru/cb?code=prefix%23synthetic-secret",
+        "https://sso.mirea.ru/cb?code=prefix%20synthetic-secret",
+        "password=prefix&synthetic-secret",
         '{"code":123456,"otp":123456}',
         '{"password":"prefix\\"synthetic-secret"}',
     ]
     for source in sources:
         exc = RuntimeError(source)
-        record = logging.LogRecord("test", logging.WARNING, __file__, 1, "failed", (),
-                                   (RuntimeError, exc, None))
+        record = logging.LogRecord(
+            "test", logging.WARNING, __file__, 1, "failed", (), (RuntimeError, exc, None)
+        )
         result = RedactingFormatter().format(record)
         assert "synthetic-secret" not in result
         assert "123456" not in result

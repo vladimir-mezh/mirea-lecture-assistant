@@ -43,8 +43,17 @@ def redact(text: str) -> str:
             if updated == decoded:
                 break
             decoded = updated
-        sensitive = (URL_PARAMETER, JSON_SECRET, UNQUOTED_JSON_SECRET,
-                     SECRET_FIELD, EMAIL, UUID, JWT, AUTH_HEADER, COOKIE_HEADER)
+        sensitive = (
+            URL_PARAMETER,
+            JSON_SECRET,
+            UNQUOTED_JSON_SECRET,
+            SECRET_FIELD,
+            EMAIL,
+            UUID,
+            JWT,
+            AUTH_HEADER,
+            COOKIE_HEADER,
+        )
         return "<hidden>" if any(pattern.search(decoded) for pattern in sensitive) else original
 
     text = re.sub(r"\S*%[0-9a-fA-F]{2}\S*", encoded_token, text)

@@ -230,7 +230,8 @@ class MireaService:
         if state is not SessionState.VALID and await self._break_redirect_loop():
             state = await self._pulse_verdict_once()
         saved = {
-            name: self.session.pop(name) for name in list(self.session)
+            name: self.session.pop(name)
+            for name in list(self.session)
             if state is SessionState.EXPIRED
             and any(name == base or name.startswith(base + "C") for base in PULSE_COOKIE_NAMES)
         }
@@ -393,7 +394,10 @@ class MireaService:
                 cookie = tuple(self.session.get(name) for name in PULSE_COOKIE_NAMES)
                 state = await self.pulse_verdict()
                 if state is SessionState.VALID:
-                    if tuple(self.session.get(name) for name in PULSE_COOKIE_NAMES) != cookie and not _retried:
+                    if (
+                        tuple(self.session.get(name) for name in PULSE_COOKIE_NAMES) != cookie
+                        and not _retried
+                    ):
                         # The saved cookie was stale and got replaced: the empty
                         # answer came from it, so ask with the new one.
                         return await self.get_schedule(days, _retried=True)
