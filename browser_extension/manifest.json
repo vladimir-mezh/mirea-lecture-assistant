@@ -1,7 +1,9 @@
 {
   "manifest_version": 3,
   "name": "МИРЭА: пропуск МАКС",
-  "version": "1.0.0",
+  "version": "1.1.0",
+  "background": {"service_worker": "code-worker.js"},
+  "host_permissions": ["http://127.0.0.1/*"],
   "description": "Сам нажимает «Пропустить» на странице «Подтверждение через МАКС» при входе в МИРЭА.",
   "content_scripts": [
     {
@@ -9,7 +11,7 @@
         "https://sso.mirea.ru/*"
       ],
       "js": [
-        "skip-max.js"
+        "skip-max.js", "email-code.js"
       ],
       "run_at": "document_idle"
     }

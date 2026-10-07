@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import json
 import logging
 import os
 import re
@@ -76,6 +78,37 @@ selector => {"""
 """
 )
 CHAT_TEXT = "s => {" + DEEP_ALL_JS + " return deepAll(s).map(e => e.innerText || '').join('\\n'); }"
+
+# Read decoded media pixels, not Chrome's compositor (which can stop painting a
+# minimised window). Cross-origin/tainted videos fall back to a fresh screenshot.
+VIDEO_FRAME = "() => {" + DEEP_ALL_JS + """
+  const frames = [];
+  for (const v of deepAll('video')) {
+    if (v.readyState < 2 || v.paused || !v.videoWidth || !v.videoHeight) continue;
+    const r = v.getBoundingClientRect();
+    if (r.width < 20 || r.height < 20) continue;
+    try {
+      const c = document.createElement('canvas');
+      const scale = Math.min(1, 1920 / v.videoWidth, 1080 / v.videoHeight);
+      c.width = Math.round(v.videoWidth * scale);
+      c.height = Math.round(v.videoHeight * scale);
+      c.getContext('2d').drawImage(v, 0, 0, c.width, c.height);
+      // Test origin cleanliness before adding this frame to the composite.
+      c.getContext('2d').getImageData(0, 0, 1, 1);
+      frames.push(c);
+    } catch (_) { continue; }
+    if (frames.length === 4) break;
+  }
+  if (!frames.length) return null;
+  const out = document.createElement('canvas');
+  out.width = Math.max(...frames.map(c => c.width));
+  out.height = frames.reduce((n, c) => n + c.height, 0);
+  const ctx = out.getContext('2d');
+  ctx.fillStyle = 'white'; ctx.fillRect(0, 0, out.width, out.height);
+  let y = 0;
+  for (const c of frames) { ctx.drawImage(c, 0, y); y += c.height; }
+  return out.toDataURL('image/png').split(',')[1];
+}"""
 
 
 class NotSignedInError(RuntimeError):
@@ -162,6 +195,7 @@ class BrowserService:
         # (page, size, CDP session) of the viewport override currently in force.
         self._capture_override = None
         self._capture_slow_until = 0.0
+        self._capture_backend = None
         self._media_progress = None
         self._media_progress_at = 0.0
         self._launch_blocked_until = 0.0
@@ -368,6 +402,7 @@ class BrowserService:
             if time.monotonic() < self._launch_blocked_until:
                 raise RuntimeError("Браузер приложения недавно не запустился; повторим позже")
             self.port = self._free_port()
+            self._prepare_password_preferences()
             args = [
                 executable,
                 f"--remote-debugging-port={self.port}",
@@ -597,6 +632,19 @@ class BrowserService:
             return "waiting"
         try:
             sample = await page.evaluate(MEDIA_PROGRESS, timeout=0.5)
+            if sample is None and urlparse(page.url).path.startswith("/event/"):
+                media = await page.evaluate(
+                    "() => {" + DEEP_ALL_JS + """
+                    return deepAll('video, canvas, iframe').length +
+                      deepAll('img').filter(img => {
+                        const r = img.getBoundingClientRect();
+                        return r.width > 150 && r.height > 100;
+                      }).length;
+                    }""",
+                    timeout=0.5,
+                )
+                if not media:
+                    return "inactive"  # event landing page, not a connected lecture
             if self._media_stalled(sample, time.monotonic()):
                 log.warning("lecture_media_stalled")
                 # Not a banner: the UI decides how often a reload is worth trying.
@@ -851,14 +899,28 @@ class BrowserService:
         """
         page = await self._active_page()
         await self._apply_capture_size(page)
+        png = None
+        try:
+            frame = await page.evaluate(VIDEO_FRAME, timeout=0.8)
+            if isinstance(frame, str) and frame:
+                png = base64.b64decode(frame, validate=True)
+        except Exception:  # noqa: BLE001 - unavailable media must use compositor fallback
+            log.debug("video_frame_capture_unavailable")
         # Keep rotating QR sampling responsive. Slow HD rendering switches to a
         # smaller real viewport for one minute; never reuse an old frame/token.
         try:
-            png = await page.screenshot(timeout=CAPTURE_TIMEOUT_MS)
+            if png is None:
+                png = await page.screenshot(timeout=CAPTURE_TIMEOUT_MS)
+                backend = "page"
+            else:
+                backend = "video"
         except CdpTimeout:
             self._capture_slow_until = time.monotonic() + 60
             log.warning("capture_resolution_degraded seconds=60")
             raise
+        if backend != self._capture_backend:
+            self._capture_backend = backend
+            log.info("capture_backend engine=%s", backend)
         try:
             visible_text = await page.evaluate(CHAT_TEXT, CHAT_SELECTOR, timeout=0.5)
         except Exception:  # noqa: BLE001 - text observation must not break QR capture
@@ -866,12 +928,7 @@ class BrowserService:
         return png, visible_text
 
     def close_lecture_tab(self) -> bool:
-        """Close a finished lecture without killing the browser.
-
-        The profile stays alive on a blank tab, so the СДО session it holds is
-        still there for the next lookup and no video keeps playing in the
-        background once the pair is over.
-        """
+        """Close the finished lecture; do not manufacture a leftover blank tab."""
         return run_async(self._close_lecture_tab_async())
 
     async def _close_lecture_tab_async(self) -> bool:
@@ -884,15 +941,37 @@ class BrowserService:
         page = self._pick_lecture_page(browser.pages)
         if page is None:
             return False
-        if len(browser.pages) == 1:
-            # Closing the last tab would close the browser, and the СДО session
-            # this profile holds would have to be established again.
-            await browser.new_page()
-        await page.close()
+        if all(p is page or p.url == self.BLANK_PAGE for p in browser.pages):
+            await browser.close_browser()
+            self._browser = None
+            self._capture_override = None
+            (self.profile_dir / self.PORT_FILE).unlink(missing_ok=True)
+            self.port = None
+            self.process = None
+            self.muted = None
+            log.info("lecture_browser_closed")
+        else:
+            await page.close()
         self.lecture_url = None
         self._lecture_target = None
         log.info("lecture_tab_closed")
         return True
+
+    def _prepare_password_preferences(self) -> None:
+        """Change only our stopped, dedicated profile; never the personal Chrome."""
+        path = self.profile_dir / "Default" / "Preferences"
+        try:
+            prefs = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+            prefs["credentials_enable_service"] = False
+            profile = prefs.setdefault("profile", {})
+            profile["password_manager_enabled"] = False
+            profile["password_manager_leak_detection"] = False
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = path.with_suffix(".mirea-tmp")
+            temporary.write_text(json.dumps(prefs, ensure_ascii=False), encoding="utf-8")
+            temporary.replace(path)
+        except (OSError, ValueError, TypeError, AttributeError):
+            log.warning("browser_password_preferences_failed")
 
     def send_chat_message(self, message: str) -> None:
         """Send a message through the visible MTS Link chat using accessible labels."""

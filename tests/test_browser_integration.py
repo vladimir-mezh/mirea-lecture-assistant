@@ -258,13 +258,6 @@ def test_a_page_filled_by_script_is_read_after_its_rows_appear(room):
     assert "<td>Физика</td>" in html
 
 
-def test_the_finished_lecture_tab_closes_but_the_browser_stays(room):
-    service, http_port = room
-    service.lecture_url = f"http://mts-link.ru:{http_port}/event/12345"
-    assert service.close_lecture_tab() is True
-    assert service.is_running
-
-
 def test_a_leave_confirmation_or_an_alert_never_freezes_the_lecture_tab(room):
     """An unanswered "leave the webinar?" used to time out every capture after a reload."""
     service, http_port = room
@@ -410,3 +403,46 @@ def test_an_unresponsive_browser_on_the_profile_gets_no_second_launch(room, monk
         other.ensure_running()
 
     assert launched == []
+
+
+def test_live_video_capture_reads_a_fresh_frame_without_screenshot(room, monkeypatch):
+    from mirea_lecture_assistant.cdp import Page
+
+    service, http_port = room
+    service.open(f"http://mts-link.ru:{http_port}/event/12345")
+    page = run_async(service._active_page())
+    run_async(page.evaluate("""async () => {
+      const img = document.querySelector('#qr'); await img.decode();
+      const c = document.createElement('canvas'); c.width = c.height = 360;
+      c.getContext('2d').drawImage(img, 0, 0, 360, 360);
+      const v = document.createElement('video'); v.muted = true;
+      v.style = 'width:360px;height:360px'; v.srcObject = c.captureStream(10);
+      document.body.append(v); await v.play(); window.fixtureCanvas = c;
+    }"""))
+    time.sleep(0.3)
+    async def forbidden(*_args, **_kwargs):
+        raise AssertionError("Video capture must bypass the compositor")
+    monkeypatch.setattr(Page, "screenshot", forbidden)
+    png, _ = run_async(service.capture_page_state())
+    assert service._capture_backend == "video"
+    assert ScreenScanner().decode_png(png).decoded == (QR_PAYLOAD,)
+    run_async(page.evaluate("""() => {
+      const c = window.fixtureCanvas, ctx = c.getContext('2d');
+      ctx.fillStyle = 'white'; ctx.fillRect(0, 0, c.width, c.height);
+    }"""))
+    time.sleep(0.3)
+    png, _ = run_async(service.capture_page_state())
+    assert ScreenScanner().decode_png(png).decoded == ()
+
+
+def test_the_finished_lecture_tab_closes_the_empty_browser(room):
+    # Last test: this fixture shares one isolated browser for this module.
+    service, http_port = room
+    service.open(f"http://mts-link.ru:{http_port}/event/12345")
+    browser = run_async(service._connected_browser())
+    lecture = run_async(service._active_page())
+    for page in list(browser.pages):
+        if page is not lecture:
+            run_async(page.close())
+    assert service.close_lecture_tab() is True
+    assert not service.is_running

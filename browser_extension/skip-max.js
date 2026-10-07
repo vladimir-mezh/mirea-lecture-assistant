@@ -4,29 +4,30 @@
 // with a form carrying skip=true and a «Пропустить» button — the very control a
 // person would press. Nothing is typed, read or sent anywhere else.
 (() => {
-  if (!location.pathname.endsWith("/login-actions/required-action")) return;
 
   const skipButton = () => {
+    if (!location.pathname.endsWith("/login-actions/required-action") ||
+        new URLSearchParams(location.search).get('execution') !== 'max-account-config') return null;
     for (const skip of document.querySelectorAll("form input[name='skip'][value='true']")) {
       const form = skip.form;
       if (!form || !(form.getAttribute("action") || "").includes("required-action")) continue;
       const button = [...form.querySelectorAll("button, input[type='submit']")].find(
         (control) => (control.value || control.textContent || "").trim() === "Пропустить",
       );
-      if (button) return button;
+      if (button && !button.disabled && button.getClientRects().length) return button;
     }
     return null;
   };
 
-  let pressed = false;
+  let pressed = null;
   const press = () => {
-    if (pressed) return true;
     const button = skipButton();
     if (!button) return false;
-    pressed = true;
+    if (pressed === button) return false;
+    pressed = button;
     console.info("[МИРЭА: пропуск МАКС] нажимаем «Пропустить»");
     button.click();
-    return true;
+    return false;
   };
 
   if (press()) return;
@@ -34,6 +35,7 @@
   const watcher = new MutationObserver(() => {
     if (press()) watcher.disconnect();
   });
-  watcher.observe(document.documentElement, { childList: true, subtree: true });
-  setTimeout(() => watcher.disconnect(), 15000);
+  watcher.observe(document.documentElement, { childList: true, subtree: true, attributes: true });
+  // React can change routes or draw the form long after the initial page load.
+  // The exact offered skip form is checked on every mutation; never submit OTP.
 })();

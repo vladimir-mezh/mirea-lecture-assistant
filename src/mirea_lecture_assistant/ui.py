@@ -3,7 +3,6 @@ from __future__ import annotations
 import logging
 import os
 import secrets
-import shutil
 import sys
 import threading
 import time
@@ -65,7 +64,9 @@ from PySide6.QtWidgets import (
 from . import __version__, autostart, manual_code, updater
 from .async_runtime import run_async
 from .browser_service import BrowserService, NotSignedInError
+from .browser_warning import dismiss_password_notice
 from .chat_detection import chat_baseline, classmates_report_attendance_issue
+from .code_bridge import CodeBridge
 from .database import Database
 from .domain import Lesson, PendingAttendance, RuleMode, SessionState
 from .email_otp import EMAIL_PROVIDERS, EmailAccount, ImapOtpReader
@@ -380,6 +381,7 @@ class CodeSignals(QObject):
     """Carries a code from the mailbox watcher's thread to the window's."""
 
     arrived = Signal(str)
+    entered = Signal()
 
 
 class Worker(QRunnable):
@@ -595,6 +597,8 @@ class MainWindow(QMainWindow):
 
     def _claim_own_codes(self) -> None:
         self.own_codes_until = max(self.own_codes_until, time.monotonic() + OWN_CODE_GRACE_SECONDS)
+        if getattr(self, "code_bridge", None):
+            self.code_bridge.clear()
 
     def __init__(self, database: Database):
         super().__init__()
@@ -606,6 +610,8 @@ class MainWindow(QMainWindow):
         self.used_codes: set[str] = set()
         self.code_signals = CodeSignals()
         self.code_signals.arrived.connect(self._manual_code_arrived)
+        self.code_signals.entered.connect(self._manual_code_entered)
+        self.code_bridge = CodeBridge(self.code_signals.entered.emit)
         try:
             session = self.session_store.load()
         except Exception:
@@ -735,6 +741,7 @@ class MainWindow(QMainWindow):
         self.entering_lecture_room = False
         self.lecture_recovery_failures = 0
         self.lecture_unstable_checks = 0
+        self.lecture_inactive_checks = 0
         self.soft_recovery_at: float | None = None
         if os.environ.get("MIREA_ASSISTANT_SMOKE_TEST") != "1":
             QTimer.singleShot(0, self._restore_active_lecture)
@@ -745,6 +752,7 @@ class MainWindow(QMainWindow):
         self.update_cleanup_timer.setInterval(5_000)
         self.update_cleanup_timer.timeout.connect(self._cleanup_old_version)
         QTimer.singleShot(3_000, self._restart_code_watcher)
+        QTimer.singleShot(0, self._start_code_bridge)
         if updater.can_self_update() and os.environ.get("MIREA_ASSISTANT_SMOKE_TEST") != "1":
             # An update needs a check (20 s) and a click first, so no download of
             # this copy can be running yet: leftovers of an interrupted one go too.
@@ -759,8 +767,29 @@ class MainWindow(QMainWindow):
         if self.db.recovery:
             QTimer.singleShot(0, self._report_database_recovery)
 
+    def _start_code_bridge(self):
+        from .paths import data_dir, resource_path
+
+        if os.environ.get("MIREA_ASSISTANT_SMOKE_TEST") == "1":
+            return
+        try:
+            self.code_bridge.start()
+            self.code_bridge.prepare_extension(
+                resource_path("browser_extension"), data_dir() / "browser-extension"
+            )
+        except OSError:
+            log.warning("manual_code_bridge_unavailable")
+
+    def _manual_code_entered(self):
+        log.info("manual_code_delivered copied=True typed=True via=extension")
+        self.tray.showMessage(
+            "Код МИРЭА введён", "Код введён в поле почтового подтверждения в браузере",
+            QSystemTrayIcon.MessageIcon.Information, 15000,
+        )
+
     def _restart_code_watcher(self):
         """Watch the mailbox for codes of the student's own sign-ins, if wanted."""
+        self.code_bridge.clear()
         if self.code_watcher is not None:
             self.code_watcher.stop()
             self.code_watcher = None
@@ -788,13 +817,16 @@ class MainWindow(QMainWindow):
         if not bool(self.db.get_setting("copy_manual_codes", True)):
             return
         self._copy_code(code)
+        # Best effort native Close/OK; never send Enter into an arbitrary window.
+        if os.environ.get("MIREA_ASSISTANT_SMOKE_TEST") != "1":
+            threading.Thread(target=dismiss_password_notice, daemon=True).start()
         typed = False
         window = manual_code.foreground_window()
         if window is not None and bool(self.db.get_setting("type_manual_codes", True)):
             title, window_class, pid, program = window
             ours = self.browser.process is not None and pid == self.browser.process.pid
-            if not ours and manual_code.looks_like_mirea_page(title, window_class, program):
-                typed = manual_code.type_text(code)
+            # Keyboard focus is not proof of the target field. The extension
+            # fills an exact SSO email challenge, even in an inactive tab.
             # The title tells why a code was or was not typed; the code is never logged.
             log.info(
                 "manual_code_window program=%s class=%s ours=%s title=%r",
@@ -803,6 +835,8 @@ class MainWindow(QMainWindow):
                 ours,
                 title[:80],
             )
+        if bool(self.db.get_setting("type_manual_codes", True)):
+            self.code_bridge.publish(code)
         log.info("manual_code_delivered copied=True typed=%s", typed)
         self.tray.showMessage(
             "Код МИРЭА" + (" введён" if typed else " скопирован"),
@@ -1268,8 +1302,8 @@ class MainWindow(QMainWindow):
         sign_in.addRow("Мой вход", self.copy_manual_codes)
         self.type_manual_codes = QCheckBox("и сразу вводить его на странице МИРЭА в браузере")
         self.type_manual_codes.setToolTip(
-            "Только если впереди окно браузера со страницей МИРЭА; иначе код просто "
-            "лежит в буфере обмена — вставьте его Ctrl+V"
+            "Через расширение, даже в неактивной вкладке. Без расширения код "
+            "только в буфере обмена — вставьте его Ctrl+V"
         )
         if sys.platform != "win32":
             self.type_manual_codes.setEnabled(False)
@@ -1649,7 +1683,7 @@ class MainWindow(QMainWindow):
 
         target = data_dir() / "browser-extension"
         try:
-            shutil.copytree(resource_path("browser_extension"), target, dirs_exist_ok=True)
+            self.code_bridge.prepare_extension(resource_path("browser_extension"), target)
         except OSError as exc:
             log.warning("browser_extension_copy_failed", exc_info=True)
             QMessageBox.warning(self, "Расширение", f"Не удалось подготовить папку: {exc}")
@@ -1658,7 +1692,7 @@ class MainWindow(QMainWindow):
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(target)))
         QMessageBox.information(
             self,
-            "Расширение «пропуск МАКС»",
+            "Расширение МИРЭА: МАКС и код",
             "Папка с расширением открыта. Чтобы добавить его в браузер:\n\n"
             "1. Откройте страницу расширений: chrome://extensions "
             "(Edge — edge://extensions, Яндекс — browser://extensions).\n"
@@ -1667,7 +1701,9 @@ class MainWindow(QMainWindow):
             f"{target}\n\n"
             "Папку не удаляйте: браузер берёт расширение из неё. Расширение работает "
             "только на sso.mirea.ru и нажимает «Пропустить», лишь когда страница сама "
-            "это предлагает.",
+            "это предлагает. Также вводит почтовый код в неактивной вкладке входа. "
+            "Если расширение уже установлено, нажмите его кнопку обновления "
+            "на странице расширений, чтобы загрузить новые разрешения.",
         )
 
     def _open_logs_folder(self):
@@ -3174,6 +3210,7 @@ class MainWindow(QMainWindow):
                 else None
             )
         if lesson_id != self.active_lecture_id:
+            self.lecture_inactive_checks = 0
             self.active_lecture_id = lesson_id
             sent_lessons = self.db.get_setting("chat_sent_lessons", [])
             self.unreadable_chat_sent = bool(lesson_id and lesson_id in sent_lessons)
@@ -3254,6 +3291,16 @@ class MainWindow(QMainWindow):
                 # The room changed while this check ran; it says nothing about the new one.
                 log.info("lecture_health_result_dropped state=%s", state)
                 return
+            if state == "inactive":
+                self.lecture_inactive_checks += 1
+                if self.lecture_inactive_checks < 2:
+                    return
+                if lesson and datetime.now().astimezone() >= lesson.end_at + LEAVE_AFTER_END:
+                    self._finish_active_lecture("ended_landing_page")
+                    return
+                state = "lost"
+            else:
+                self.lecture_inactive_checks = 0
             if state == "unstable":
                 # A reconnect banner is usually gone within seconds: act only if
                 # it is still there at the next check.
@@ -4038,6 +4085,7 @@ class MainWindow(QMainWindow):
     def _hand_over(self):
         """A newer version was started: quit and leave it the browser and the lecture."""
         self._persist_session()
+        self.code_bridge.stop()
         if self.code_watcher is not None:
             self.code_watcher.stop()
         self.force_exit = True
@@ -4047,6 +4095,7 @@ class MainWindow(QMainWindow):
     def _quit(self):
         log.info("quit_requested")
         self._persist_session()
+        self.code_bridge.stop()
         if self.code_watcher is not None:
             self.code_watcher.stop()
         self.force_exit = True
