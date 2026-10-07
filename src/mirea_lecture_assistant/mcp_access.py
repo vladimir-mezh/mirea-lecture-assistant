@@ -123,7 +123,7 @@ class McpAccess:
                             raise TypeError()
                         job = ApiJob(str(method), params)
                         access.dispatch(job)
-                        if not job.done.wait(8):
+                        if not job.done.wait(_answer_within(job)):
                             job.cancelled = True
                             result = {"error": "Application is busy; request cancelled"}
                         else:
@@ -170,3 +170,13 @@ class McpAccess:
             log.warning("mcp_connection_cleanup_failed")
         with self.lock:
             self.clients.clear()
+
+
+def _answer_within(job: ApiJob) -> float:
+    """Seconds to wait for the window: a waited check takes as long as it asks for."""
+    if job.method == "wait_and_check":
+        seconds = job.params.get("seconds", 60)
+        return 20 + (seconds if type(seconds) is int and 0 <= seconds <= 120 else 0)
+    if job.method == "check_health":
+        return 20  # with a network check of a few seconds
+    return 8
