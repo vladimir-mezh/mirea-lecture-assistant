@@ -570,6 +570,10 @@ class MainWindow(QMainWindow):
     # Until then a MIREA code letter belongs to the app's own sign-in (monotonic time).
     own_codes_until = 0.0
     _login_in_progress = False
+    # The app's Pulse sign-in has asked for a code and not received it yet. Only
+    # then is a new code letter its own: a sign-in retried for many minutes (Pulse
+    # refusing the session) used to swallow the codes of the student's own logins.
+    awaiting_own_code = False
 
     @property
     def login_in_progress(self) -> bool:
@@ -577,10 +581,17 @@ class MainWindow(QMainWindow):
 
     @login_in_progress.setter
     def login_in_progress(self, running: bool) -> None:
-        if self._login_in_progress and not running:
-            # The letter of a sign-in that just ended may still be on its way.
+        if self._login_in_progress and not running and self.awaiting_own_code:
+            # Ended without its code: that letter may still be on its way.
             self._claim_own_codes()
+        if not running:
+            self.awaiting_own_code = False
         self._login_in_progress = running
+
+    def _own_code_taken(self, code: str) -> None:
+        """The app has the code it asked for; later letters are the student's."""
+        self.awaiting_own_code = False
+        self.used_codes.add(code)
 
     def _claim_own_codes(self) -> None:
         self.own_codes_until = max(self.own_codes_until, time.monotonic() + OWN_CODE_GRACE_SECONDS)
@@ -591,6 +602,8 @@ class MainWindow(QMainWindow):
         self.session_store = SessionStore()
         self.otp_reader = ImapOtpReader()
         self.code_watcher: manual_code.CodeWatcher | None = None
+        # Codes the app received for its own sign-ins: never copied or typed.
+        self.used_codes: set[str] = set()
         self.code_signals = CodeSignals()
         self.code_signals.arrived.connect(self._manual_code_arrived)
         try:
@@ -766,8 +779,9 @@ class MainWindow(QMainWindow):
         self.code_watcher.start()
 
     def _manual_code_arrived(self, code: str):
-        if manual_code.own_code_window_is_open(
-            self.own_codes_until, self.login_in_progress or self.sdo_sign_in_lock.locked()
+        if code in self.used_codes or manual_code.own_code_window_is_open(
+            self.own_codes_until,
+            (self.login_in_progress and self.awaiting_own_code) or self.sdo_sign_in_lock.locked(),
         ):
             log.info("manual_code_ignored reason=app_sign_in")
             return
@@ -995,6 +1009,15 @@ class MainWindow(QMainWindow):
         self.auth_status = QLabel()
         self.auth_status.setWordWrap(True)
         side.addWidget(self.auth_status)
+        self.retry_login_button = QPushButton("Повторить вход", objectName="secondary")
+        self.retry_login_button.setToolTip(
+            "Войти сейчас с сохранёнными логином и паролем; код приложение возьмёт из почты само"
+        )
+        self.retry_login_button.clicked.connect(self._retry_login_now)
+        retry_row = QHBoxLayout()
+        retry_row.setContentsMargins(12, 0, 12, 8)
+        retry_row.addWidget(self.retry_login_button)
+        side.addLayout(retry_row)
         self._set_auth_state("signed_out")
         root.addWidget(sidebar)
 
@@ -1803,6 +1826,7 @@ class MainWindow(QMainWindow):
         if self.login_in_progress:
             return
         self.login_in_progress = True
+        self.awaiting_own_code = True
         self.pending_pulse_login = None
         self.session_recheck_scheduled = False
         if self.sdo_sign_in_lock.locked():
@@ -1930,7 +1954,10 @@ class MainWindow(QMainWindow):
                         self.login_started_at,
                         after_uid=self.email_uid_before_login,
                     ),
-                    lambda code: self._complete_2fa(result.challenge, code),
+                    lambda code: (
+                        self._own_code_taken(code),
+                        self._complete_2fa(result.challenge, code),
+                    ),
                     "Ждём код из почты…",
                     lambda message: self._otp_wait_failed(result.challenge, message),
                 )
@@ -2191,10 +2218,31 @@ class MainWindow(QMainWindow):
             return
         self._verify_stored_session("Повторно проверяем MIREA…")
 
-    def _auto_login(self):
+    def _retry_login_now(self):
+        """Sign in again at once, the way automatic sign-in does: no dialog, no code to type."""
+        if self.login_in_progress:
+            self.statusBar().showMessage("Вход уже выполняется — дождитесь его окончания", 6000)
+            return
+        try:
+            credentials = self.session_store.load_credentials()
+        except Exception:  # noqa: BLE001 - keyring backends fail in many ways
+            credentials = None
+        if not credentials:
+            # Nothing saved to sign in with: the usual dialog asks once and saves.
+            self.login()
+            return
+        log.info("login_retry_requested_by_user")
+        # A retry scheduled for later is replaced by this one.
+        self.login_retry_generation += 1
+        self.login_retry_scheduled = False
+        self.login_retry_attempt = 0
+        self._set_auth_state("checking")
+        self._auto_login(requested=True)
+
+    def _auto_login(self, requested: bool = False):
         if self.login_in_progress:
             return
-        if not bool(self.db.get_setting("auto_login", True)):
+        if not requested and not bool(self.db.get_setting("auto_login", True)):
             self.statusBar().clearMessage()
             return
         try:
@@ -2212,6 +2260,8 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(
                 "Автовход ограничен: не более 5 попыток за 30 минут. Войдите вручную.", 15000
             )
+            if requested:
+                self._set_auth_state("signed_out")
             self._retry_automatic_login_later("Лимит попыток входа; ждём снятия ограничения")
             return
         self.pending_login_credentials = credentials
@@ -2665,13 +2715,14 @@ class MainWindow(QMainWindow):
         def request_code() -> str:
             if not email_credentials:
                 raise SignInFailed("Для входа в СДО нужен код, а почта не настроена")
-            return self.otp_reader.wait_for_code(
+            code = self.otp_reader.wait_for_code(
                 email_credentials, requested_at, after_uid=latest_uid
             )
+            self.used_codes.add(code)
+            return code
 
         username, password = credentials
         log.info("sdo_sign_in_started")
-        self._claim_own_codes()
         try:
             self.browser.run_on_new_page(
                 lambda page: sign_in(
@@ -2682,8 +2733,10 @@ class MainWindow(QMainWindow):
                     reserve_attempt=reserve_attempt,
                 )
             )
-        finally:
+        except Exception:
+            # Its letter may still arrive after a failed sign-in.
             self._claim_own_codes()
+            raise
         return True
 
     def _resolve_from_sources(self, lesson):
