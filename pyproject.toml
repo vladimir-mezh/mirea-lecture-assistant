@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mirea-lecture-assistant"
-version = "0.2.22"
+version = "0.2.23"
 description = "Desktop assistant for MIREA online lectures and attendance QR codes"
 readme = "README.md"
 requires-python = ">=3.11"

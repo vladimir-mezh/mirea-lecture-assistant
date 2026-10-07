@@ -1906,12 +1906,57 @@ def test_a_code_of_the_apps_own_sign_in_is_left_alone(window, monkeypatch):
         ("Вход в МИРЭА - Google Chrome", "Chrome_WidgetWin_1", 4242, "chrome.exe"),
     )
     window.login_in_progress = True
+    window.awaiting_own_code = True  # its code is on the way
     window._manual_code_arrived("111111")
-    window.login_in_progress = False  # its letter may still arrive a little later
+    window.login_in_progress = False  # gave up without it: the letter may still come
     window._manual_code_arrived("222222")
 
     assert QApplication.clipboard().text() == ""
     assert typed == [] and messages == []
+
+
+def test_my_code_is_delivered_while_the_app_keeps_retrying_its_sign_in(window, monkeypatch):
+    """Pulse refused the app's session for many minutes; my own codes were swallowed."""
+    typed, _messages = _code_window(
+        window,
+        monkeypatch,
+        ("Вход в МИРЭА - Google Chrome", "Chrome_WidgetWin_1", 4242, "chrome.exe"),
+    )
+    window.login_in_progress = True
+    window.awaiting_own_code = True
+    window._own_code_taken("111111")  # the app has its code; its sign-in goes on
+
+    window._manual_code_arrived("111111")  # the app's own letter, seen late
+    assert typed == []
+    window._manual_code_arrived("482915")  # mine
+    assert typed == ["482915"]
+    window.login_in_progress = False
+
+
+def test_retry_login_signs_in_with_saved_credentials_and_no_dialog(window, monkeypatch):
+    from mirea_lecture_assistant.security import SessionStore
+
+    monkeypatch.setattr(SessionStore, "load_credentials", lambda _self: ("user", "secret"))
+    started, dialogs = [], []
+    monkeypatch.setattr(window, "_auto_login", lambda requested=False: started.append(requested))
+    monkeypatch.setattr(window, "login", lambda: dialogs.append(True))
+    window.db.set_setting("auto_login", False)  # a click is a request, whatever the setting
+    generation = window.login_retry_generation
+
+    window.retry_login_button.click()
+
+    assert started == [True] and dialogs == []
+    assert window.login_retry_generation == generation + 1  # a pending retry is replaced
+
+
+def test_retry_login_without_saved_credentials_asks_once(window, monkeypatch):
+    started, dialogs = [], []
+    monkeypatch.setattr(window, "_auto_login", lambda requested=False: started.append(requested))
+    monkeypatch.setattr(window, "login", lambda: dialogs.append(True))
+
+    window._retry_login_now()
+
+    assert started == [] and dialogs == [True]
 
 
 def test_a_code_is_only_copied_when_no_mirea_page_is_in_front(window, monkeypatch):
