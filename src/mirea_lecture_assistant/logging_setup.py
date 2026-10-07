@@ -9,6 +9,7 @@ import threading
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
+from urllib.parse import unquote
 
 from . import __version__
 
@@ -17,21 +18,38 @@ EMAIL = re.compile(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}")
 UUID = re.compile(r"(?i)\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b")
 JWT = re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]*\b")
 JSON_SECRET = re.compile(
-    r"""(?i)(["'](?:access_token|refresh_token|password|otp|emailCode)["']\s*:\s*["'])([^"']+)"""
+    r"""(?i)(["'](?:access_token|refresh_token|id_token|client_secret|session_state|code|password|otp|emailCode)["']\s*:\s*)(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^,}\s]+)"""
 )
 SECRET_FIELD = re.compile(
-    r"(?i)(password|пароль|token|токен|otp|emailcode|код подтверждения|код)(\s*[:=]\s*)(\S+)"
+    r"(?i)(?<!\w)(access_token|refresh_token|id_token|password|пароль|token|токен|otp|emailcode|client_secret|session_state|code|код подтверждения|код)(\s*[:=]\s*)(\S+)"
 )
 UNQUOTED_JSON_SECRET = re.compile(
-    r"(?i)(\b(?:access_token|refresh_token|password|otp|emailCode)\s*:\s*)([^,}\s]+)"
+    r"(?i)(\b(?:access_token|refresh_token|id_token|client_secret|session_state|code|password|otp|emailCode)\s*:\s*)([^,}\s]+)"
 )
 AUTH_HEADER = re.compile(r"(?i)(authorization\s*[:=]\s*)(?:bearer\s+|basic\s+)?\S+")
 COOKIE_HEADER = re.compile(r"(?i)((?:set-)?cookie\s*[:=]\s*)[^\n]+")
 URL_PARAMETER = re.compile(r"([?&#][^=\s&#]+)=([^&\s#]+)")
+OIDC_COOKIE_NAME = re.compile(r"(\.AspNetCore\.(?:Correlation|OpenIdConnect\.Nonce)\.)[\w-]+")
 
 
 def redact(text: str) -> str:
+    # Encoded delimiters can belong to a secret value rather than URL syntax.
+    # Inspect decoded copies but mask the whole original encoded token, so no
+    # suffix can escape when %26, %23 or %20 changes the apparent structure.
+    def encoded_token(match):
+        original = decoded = match.group()
+        while re.search(r"%[0-9a-fA-F]{2}", decoded):
+            updated = unquote(decoded)
+            if updated == decoded:
+                break
+            decoded = updated
+        sensitive = (URL_PARAMETER, JSON_SECRET, UNQUOTED_JSON_SECRET,
+                     SECRET_FIELD, EMAIL, UUID, JWT, AUTH_HEADER, COOKIE_HEADER)
+        return "<hidden>" if any(pattern.search(decoded) for pattern in sensitive) else original
+
+    text = re.sub(r"\S*%[0-9a-fA-F]{2}\S*", encoded_token, text)
     text = EMAIL.sub("<email>", text)
+    text = OIDC_COOKIE_NAME.sub(r"\1<hidden>", text)
     text = UUID.sub("<uuid>", text)
     text = JWT.sub("<jwt>", text)
     text = AUTH_HEADER.sub(r"\1<hidden>", text)

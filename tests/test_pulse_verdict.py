@@ -311,3 +311,20 @@ def test_logout_ends_the_sso_session_on_the_server(pulse):
     assert seen and seen[0][0] == "POST"
     assert seen[0][1].endswith("/protocol/openid-connect/logout")
     assert "refresh_token=r1" in seen[0][2]
+
+
+def test_renamed_pulse_cookie_uses_real_api_without_obsolete_bootstrap(pulse):
+    def current_pulse(request):
+        assert request.url.path.startswith("/rtu_tc.")
+        assert "Pulse.Auth.Cookie=synthetic" in request.headers["cookie"]
+        return httpx.Response(200, content=EMPTY_DAY)
+
+    pulse.handle = current_pulse
+    service = MireaService({"Pulse.Auth.Cookie": "synthetic"})
+    assert asyncio.run(service.verify_state()) is SessionState.VALID
+    assert asyncio.run(service.get_schedule(days=1)) == []
+
+
+def test_expired_renamed_cookie_is_not_accepted_on_presence_alone(pulse):
+    pulse.handle = _refusing_pulse
+    assert asyncio.run(MireaService({"Pulse.Auth.Cookie": "synthetic"}).verify_state()) is SessionState.EXPIRED

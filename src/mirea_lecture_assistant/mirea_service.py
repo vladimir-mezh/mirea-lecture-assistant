@@ -8,12 +8,11 @@ from datetime import datetime
 from urllib.parse import urlparse
 
 from .domain import Lesson, SessionState
+from .pulse_api import PULSE_COOKIE_NAMES
 
 log = logging.getLogger(__name__)
-# How pymirea says that Pulse refused the session itself. "Не удалось получить
-# cookie … Перелогиньтесь" is deliberately not here: Pulse answering without a
-# cookie is what its firewall does to a VPN address, and a new login (with a new
-# emailed code) cannot fix that.
+# An explicit API refusal expires the session. A missing cookie by itself is
+# inconclusive: auth flow changes, maintenance and network filters can cause it.
 SESSION_EXPIRED_MESSAGE = re.compile(
     r"сессия[^.]*истекла|unauthenticated|unauthori[sz]ed|\b401\b", re.IGNORECASE
 )
@@ -21,11 +20,11 @@ NO_LESSONS_MESSAGE = "Нет пар в ближайшие дни"
 PULSE_COOKIE = ".AspNetCore.Cookies"
 TOKEN_KEYS = frozenset({"access_token", "refresh_token", "token_type", "expires_in"})
 REDIRECTS = (301, 302, 303, 307, 308)
-# pymirea's wording where it misleads: this one advises a new login that cannot help.
+# Keep the error actionable without attributing an auth failure to a VPN.
 PLAIN_MESSAGES = {
     "Не удалось получить cookie (.AspNetCore.Cookies). Перелогиньтесь.": (
-        "«Пульс» ответил, но не открыл сессию: он не пускает с этого адреса (VPN?) "
-        "или на нём идут работы."
+        "«Пульс» ответил, но не открыл сессию. Вход не завершён; "
+        "повторите вход. Если ошибка повторяется, проверьте журнал."
     ),
 }
 UNREACHABLE_MESSAGE = re.compile(r"не\s+отвечает|временно\s+недоступна|не\s+вернул", re.IGNORECASE)
@@ -131,7 +130,7 @@ class MireaService:
         capture_upstream_failures()
 
     async def login(self, username: str, password: str):
-        from pymirea import MireaAuth
+        from .pulse_auth import PulseAuth
 
         if self._auth is not None:
             # A retry starts a new SSO flow; release the previous client's sockets.
@@ -139,7 +138,7 @@ class MireaService:
                 await self._auth.close()
             except Exception:  # closing a stale client must not block a retry
                 log.debug("previous_auth_close_failed", exc_info=True)
-        self._auth = MireaAuth()
+        self._auth = PulseAuth()
         result = await self._auth.login(username, password)
         if result.success:
             self.session = result.tokens or {}
@@ -230,8 +229,12 @@ class MireaService:
         # tokens that is the whole fix, with none left the loop means expired.
         if state is not SessionState.VALID and await self._break_redirect_loop():
             state = await self._pulse_verdict_once()
-        saved = self.session.pop(PULSE_COOKIE, None) if state is SessionState.EXPIRED else None
-        if saved is not None:
+        saved = {
+            name: self.session.pop(name) for name in list(self.session)
+            if state is SessionState.EXPIRED
+            and any(name == base or name.startswith(base + "C") for base in PULSE_COOKIE_NAMES)
+        }
+        if saved:
             # pymirea sends a saved cookie as is and never replaces it, and with one
             # any HTML answer (a firewall or maintenance page) reads as a refusal.
             # Only a fresh bootstrap through the SSO can tell.
@@ -240,11 +243,12 @@ class MireaService:
             if state is not SessionState.VALID:
                 # No new cookie came of it: keep the one that may well still work,
                 # rather than save a session without it after a maintenance page.
-                self.session.setdefault(PULSE_COOKIE, saved)
+                for name, value in saved.items():
+                    self.session.setdefault(name, value)
         return state
 
     async def _pulse_verdict_once(self) -> SessionState:
-        from pymirea.grades import MireaGrades
+        from .pulse_api import MireaGrades
 
         _upstream_failure.set(None)
         api = MireaGrades(session_cookies=self.session)
@@ -260,6 +264,7 @@ class MireaService:
                 today = datetime.now().astimezone()
                 raw, message = await unary(lessons_url, encode(today.year, today.month, today.day))
                 if raw is not None:
+                    self.session.update(getattr(api, "session_cookies", {}))
                     return SessionState.VALID
         except Exception as exc:  # noqa: BLE001 - trouble reaching Pulse is not a verdict
             if _is_sso_redirect_loop(exc):
@@ -299,8 +304,9 @@ class MireaService:
     async def _trace_bootstrap(self) -> None:
         """Where the bootstrap goes round, for the journal: hosts, paths, cookie names."""
         import httpx
-        from pymirea.grades import MireaGrades
         from pymirea.tokens import get_authorization_header
+
+        from .pulse_api import MireaGrades
 
         jar = httpx.Cookies()
         for name, value in self.session.items():
@@ -361,7 +367,7 @@ class MireaService:
         return SessionState.UNKNOWN
 
     async def get_schedule(self, days: int = 14, *, _retried: bool = False) -> list[Lesson]:
-        from pymirea.grades import MireaGrades
+        from .pulse_api import MireaGrades
 
         _upstream_failure.set(None)
         api = MireaGrades(session_cookies=self.session)
@@ -384,10 +390,10 @@ class MireaService:
             if message == NO_LESSONS_MESSAGE:
                 # pymirea says this both for free days and when every request
                 # failed. Ask once more: an accepted session means truly no pairs.
-                cookie = self.session.get(PULSE_COOKIE)
+                cookie = tuple(self.session.get(name) for name in PULSE_COOKIE_NAMES)
                 state = await self.pulse_verdict()
                 if state is SessionState.VALID:
-                    if self.session.get(PULSE_COOKIE) != cookie and not _retried:
+                    if tuple(self.session.get(name) for name in PULSE_COOKIE_NAMES) != cookie and not _retried:
                         # The saved cookie was stale and got replaced: the empty
                         # answer came from it, so ask with the new one.
                         return await self.get_schedule(days, _retried=True)

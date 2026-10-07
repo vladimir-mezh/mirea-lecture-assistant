@@ -1,6 +1,62 @@
 from mirea_lecture_assistant.logging_setup import redact
 
 
+def test_encoded_urls_and_secret_aliases_are_redacted_after_formatting():
+    import logging
+    from urllib.parse import quote
+
+    from mirea_lecture_assistant.logging_setup import RedactingFormatter
+
+    sources = [
+        'code=synthetic-secret client_secret=synthetic-secret session_state=synthetic-secret',
+        '{"code":"synthetic-secret", "client_secret":"synthetic-secret"}',
+        'https://sso.mirea.ru/callback?code=synthetic-secret&state=synthetic-secret',
+    ]
+    for source in sources:
+        for _ in range(3):
+            record = logging.LogRecord("test", logging.WARNING, __file__, 1,
+                                       "failure %r", (source,), None)
+            assert "synthetic-secret" not in RedactingFormatter().format(record)
+            source = quote(source, safe="")
+    assert redact("pulse_auth_step status=401 path=/api/mireaauth") == (
+        "pulse_auth_step status=401 path=/api/mireaauth"
+    )
+
+
+def test_secret_value_delimiters_numeric_json_and_escaped_quotes():
+    import logging
+
+    from mirea_lecture_assistant.logging_setup import RedactingFormatter
+
+    sources = [
+        'https://sso.mirea.ru/cb?code=prefix%26synthetic-secret',
+        'https://sso.mirea.ru/cb?code=prefix%23synthetic-secret',
+        'https://sso.mirea.ru/cb?code=prefix%20synthetic-secret',
+        'password=prefix&synthetic-secret',
+        '{"code":123456,"otp":123456}',
+        '{"password":"prefix\\"synthetic-secret"}',
+    ]
+    for source in sources:
+        exc = RuntimeError(source)
+        record = logging.LogRecord("test", logging.WARNING, __file__, 1, "failed", (),
+                                   (RuntimeError, exc, None))
+        result = RedactingFormatter().format(record)
+        assert "synthetic-secret" not in result
+        assert "123456" not in result
+    assert redact("status_code=401 error_code=invalid_grant") == (
+        "status_code=401 error_code=invalid_grant"
+    )
+
+
+def test_oidc_cookie_names_hide_nonce_and_correlation_suffixes():
+    result = redact(
+        ".AspNetCore.Correlation.synthetic-secret "
+        ".AspNetCore.OpenIdConnect.Nonce.synthetic-secret Pulse.Auth.Cookie"
+    )
+    assert "synthetic-secret" not in result
+    assert "Pulse.Auth.Cookie" in result
+
+
 def test_redacts_email_uuid_and_secret_fields():
     source = (
         "user student@gmail.com token=12345678 "

@@ -96,10 +96,13 @@ class FakeGrades:
 def pulse(monkeypatch):
     import pymirea.grades
 
+    import mirea_lecture_assistant.pulse_api
+
     class Grades(FakeGrades):
         pass
 
     monkeypatch.setattr(pymirea.grades, "MireaGrades", Grades)
+    monkeypatch.setattr(mirea_lecture_assistant.pulse_api, "MireaGrades", Grades)
     return Grades
 
 
