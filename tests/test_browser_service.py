@@ -608,6 +608,12 @@ class FakeContext:
     def __init__(self, pages):
         self.pages = pages
         self.opened = 0
+        self.closed = False
+
+    async def close_browser(self):
+        self.closed = True
+        for page in self.pages:
+            await page.close()
 
     async def new_page(self):
         self.opened += 1
@@ -630,8 +636,8 @@ def test_the_finished_lecture_tab_is_closed(service):
     assert service.lecture_url is None
 
 
-def test_closing_the_only_tab_keeps_the_browser_alive(service):
-    """Closing the last tab would close the browser and its СДО session with it."""
+def test_closing_the_only_tab_closes_the_dedicated_browser(service):
+    """No blank window is left; cookies remain in the persistent profile."""
     import asyncio
 
     service.lecture_url = LECTURE
@@ -639,7 +645,8 @@ def test_closing_the_only_tab_keeps_the_browser_alive(service):
     context = FakeContext([lecture])
 
     assert asyncio.run(service._close_lecture_page(context)) is True
-    assert context.opened == 1
+    assert context.opened == 0
+    assert context.closed
     assert lecture.closed
 
 

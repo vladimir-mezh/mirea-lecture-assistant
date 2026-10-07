@@ -49,9 +49,7 @@ a = Analysis(
     datas=[
         ("assets/app_icon.png", "assets"),
         ("assets/app_icon.ico", "assets"),
-        ("browser_extension/manifest.json", "browser_extension"),
-        ("browser_extension/skip-max.js", "browser_extension"),
-        ("browser_extension/README.txt", "browser_extension"),
+        ("browser_extension", "browser_extension"),
     ],
     hiddenimports=["keyring.backends.Windows", "zxingcpp", "mss"],
     hookspath=[],

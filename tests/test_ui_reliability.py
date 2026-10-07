@@ -1885,7 +1885,7 @@ def _code_window(window, monkeypatch, foreground):
     return typed, messages
 
 
-def test_a_code_for_my_own_browser_sign_in_is_copied_and_typed(window, monkeypatch):
+def test_my_browser_code_uses_extension_not_blind_keyboard_input(window, monkeypatch):
     typed, messages = _code_window(
         window,
         monkeypatch,
@@ -1895,8 +1895,9 @@ def test_a_code_for_my_own_browser_sign_in_is_copied_and_typed(window, monkeypat
     window._manual_code_arrived("482915")
 
     assert QApplication.clipboard().text() == "482915"
-    assert typed == ["482915"]
-    assert "введён" in messages[0][0]
+    assert typed == []
+    assert window.code_bridge.pending[0] == "482915"
+    assert "скопирован" in messages[0][0]
 
 
 def test_a_code_of_the_apps_own_sign_in_is_left_alone(window, monkeypatch):
@@ -1929,7 +1930,8 @@ def test_my_code_is_delivered_while_the_app_keeps_retrying_its_sign_in(window, m
     window._manual_code_arrived("111111")  # the app's own letter, seen late
     assert typed == []
     window._manual_code_arrived("482915")  # mine
-    assert typed == ["482915"]
+    assert typed == []
+    assert window.code_bridge.pending[0] == "482915"
     window.login_in_progress = False
 
 
@@ -2032,6 +2034,9 @@ def test_the_max_extension_is_put_in_a_folder_to_add_to_the_browser(window, tmp_
     folder = tmp_path / "browser-extension"
     assert sorted(path.name for path in folder.iterdir()) == [
         "README.txt",
+        "bridge-config.json",
+        "code-worker.js",
+        "email-code.js",
         "manifest.json",
         "skip-max.js",
     ]
@@ -2070,3 +2075,31 @@ def test_a_room_typed_in_by_hand_opens_even_for_a_classroom_pair(window, monkeyp
         window, monkeypatch, "А-101", manual="https://my.mts-link.ru/j/1/2"
     )
     assert opened and opened[0][0] == "https://my.mts-link.ru/j/1/2"
+
+
+def test_an_empty_event_page_before_the_end_is_reopened_rarely(window, monkeypatch):
+    """A room that has not started yet has no video: no reload at every check."""
+    lesson = _running_lesson("waiting-room")
+    since = datetime.now().astimezone() - timedelta(days=1)
+    window.db.sync_lessons([lesson], since)
+    room = "https://my.mts-link.ru/j/1/2"
+    window.active_lecture_id = lesson.external_id
+    window.active_lecture_url = room
+    reopened = []
+    monkeypatch.setattr(
+        window, "_open_lecture", lambda url, lesson_id, force=False: reopened.append(url)
+    )
+    monkeypatch.setattr(
+        window,
+        "_run",
+        lambda function, done, *_args, **_kwargs: (
+            done("inactive") if function == window.browser.lecture_state else None
+        ),
+    )
+    monkeypatch.setattr(type(window.browser), "probably_running", property(lambda _self: True))
+
+    for _ in range(6):
+        window._lecture_watch_tick()
+
+    assert reopened == [room]
+    assert window.active_lecture_id == "waiting-room"

@@ -27,3 +27,5 @@ jobs:
           ruff format --check .
       - name: Tests
         run: pytest -q
+      - name: Browser extension tests
+        run: node --test tests/browser_extension.test.cjs

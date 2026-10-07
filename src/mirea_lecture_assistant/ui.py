@@ -3,7 +3,6 @@ from __future__ import annotations
 import logging
 import os
 import secrets
-import shutil
 import sys
 import threading
 import time
@@ -62,13 +61,17 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from . import __version__, autostart, manual_code, updater
+from . import __version__, autostart, manual_code, mcp_install, updater
 from .async_runtime import run_async
 from .browser_service import BrowserService, NotSignedInError
+from .browser_warning import dismiss_password_notice
 from .chat_detection import chat_baseline, classmates_report_attendance_issue
+from .code_bridge import CodeBridge
 from .database import Database
 from .domain import Lesson, PendingAttendance, RuleMode, SessionState
 from .email_otp import EMAIL_PROVIDERS, EmailAccount, ImapOtpReader
+from .mcp_access import SETTINGS as MCP_SETTINGS
+from .mcp_access import McpAccess, validate_settings
 from .mirea_service import MireaService
 from .moodle import discover_course_urls, is_group_code, resolve_lecture_url
 from .moodle_login import SignInFailed, sign_in
@@ -380,6 +383,11 @@ class CodeSignals(QObject):
     """Carries a code from the mailbox watcher's thread to the window's."""
 
     arrived = Signal(str)
+    entered = Signal()
+
+
+class McpSignals(QObject):
+    requested = Signal(object)
 
 
 class Worker(QRunnable):
@@ -595,6 +603,8 @@ class MainWindow(QMainWindow):
 
     def _claim_own_codes(self) -> None:
         self.own_codes_until = max(self.own_codes_until, time.monotonic() + OWN_CODE_GRACE_SECONDS)
+        if getattr(self, "code_bridge", None):
+            self.code_bridge.clear()
 
     def __init__(self, database: Database):
         super().__init__()
@@ -606,6 +616,16 @@ class MainWindow(QMainWindow):
         self.used_codes: set[str] = set()
         self.code_signals = CodeSignals()
         self.code_signals.arrived.connect(self._manual_code_arrived)
+        self.code_signals.entered.connect(self._manual_code_entered)
+        self.code_bridge = CodeBridge(self.code_signals.entered.emit)
+        from .paths import data_dir
+
+        self.mcp_signals = McpSignals()
+        self.mcp_signals.requested.connect(self._mcp_rpc)
+        self.mcp_access = McpAccess(data_dir(), self.mcp_signals.requested.emit)
+        self.mcp_busy = False
+        # Old MCP versions go once no AI client runs them, as the app's own .old does.
+        self.mcp_leftovers = True
         try:
             session = self.session_store.load()
         except Exception:
@@ -735,6 +755,7 @@ class MainWindow(QMainWindow):
         self.entering_lecture_room = False
         self.lecture_recovery_failures = 0
         self.lecture_unstable_checks = 0
+        self.lecture_inactive_checks = 0
         self.soft_recovery_at: float | None = None
         if os.environ.get("MIREA_ASSISTANT_SMOKE_TEST") != "1":
             QTimer.singleShot(0, self._restore_active_lecture)
@@ -745,6 +766,11 @@ class MainWindow(QMainWindow):
         self.update_cleanup_timer.setInterval(5_000)
         self.update_cleanup_timer.timeout.connect(self._cleanup_old_version)
         QTimer.singleShot(3_000, self._restart_code_watcher)
+        QTimer.singleShot(0, self._start_code_bridge)
+        self.mcp_timer = QTimer(self)
+        self.mcp_timer.timeout.connect(self._refresh_mcp_status)
+        self.mcp_timer.start(5_000)
+        QTimer.singleShot(0, self._sync_mcp_access)
         if updater.can_self_update() and os.environ.get("MIREA_ASSISTANT_SMOKE_TEST") != "1":
             # An update needs a check (20 s) and a click first, so no download of
             # this copy can be running yet: leftovers of an interrupted one go too.
@@ -759,8 +785,31 @@ class MainWindow(QMainWindow):
         if self.db.recovery:
             QTimer.singleShot(0, self._report_database_recovery)
 
+    def _start_code_bridge(self):
+        from .paths import data_dir, resource_path
+
+        if os.environ.get("MIREA_ASSISTANT_SMOKE_TEST") == "1":
+            return
+        try:
+            self.code_bridge.start()
+            self.code_bridge.prepare_extension(
+                resource_path("browser_extension"), data_dir() / "browser-extension"
+            )
+        except OSError:
+            log.warning("manual_code_bridge_unavailable")
+
+    def _manual_code_entered(self):
+        log.info("manual_code_delivered copied=True typed=True via=extension")
+        self.tray.showMessage(
+            "Код МИРЭА введён",
+            "Код введён в поле почтового подтверждения в браузере",
+            QSystemTrayIcon.MessageIcon.Information,
+            15000,
+        )
+
     def _restart_code_watcher(self):
         """Watch the mailbox for codes of the student's own sign-ins, if wanted."""
+        self.code_bridge.clear()
         if self.code_watcher is not None:
             self.code_watcher.stop()
             self.code_watcher = None
@@ -788,13 +837,16 @@ class MainWindow(QMainWindow):
         if not bool(self.db.get_setting("copy_manual_codes", True)):
             return
         self._copy_code(code)
+        # Best effort native Close/OK; never send Enter into an arbitrary window.
+        if os.environ.get("MIREA_ASSISTANT_SMOKE_TEST") != "1":
+            threading.Thread(target=dismiss_password_notice, daemon=True).start()
         typed = False
         window = manual_code.foreground_window()
         if window is not None and bool(self.db.get_setting("type_manual_codes", True)):
             title, window_class, pid, program = window
             ours = self.browser.process is not None and pid == self.browser.process.pid
-            if not ours and manual_code.looks_like_mirea_page(title, window_class, program):
-                typed = manual_code.type_text(code)
+            # Keyboard focus is not proof of the target field. The extension
+            # fills an exact SSO email challenge, even in an inactive tab.
             # The title tells why a code was or was not typed; the code is never logged.
             log.info(
                 "manual_code_window program=%s class=%s ours=%s title=%r",
@@ -803,6 +855,8 @@ class MainWindow(QMainWindow):
                 ours,
                 title[:80],
             )
+        if bool(self.db.get_setting("type_manual_codes", True)):
+            self.code_bridge.publish(code)
         log.info("manual_code_delivered copied=True typed=%s", typed)
         self.tray.showMessage(
             "Код МИРЭА" + (" введён" if typed else " скопирован"),
@@ -989,7 +1043,7 @@ class MainWindow(QMainWindow):
         brand.setWordWrap(True)
         side.addWidget(brand)
         self.nav_buttons = []
-        for index, text in enumerate(("Расписание", "QR-сканер", "История", "Настройки")):
+        for index, text in enumerate(("Расписание", "QR-сканер", "История", "Настройки", "MCP")):
             button = QPushButton(text, objectName="nav")
             button.setToolTip(f"Ctrl+{index + 1}")
             button.setCheckable(True)
@@ -1026,6 +1080,7 @@ class MainWindow(QMainWindow):
         self.pages.addWidget(self._scanner_page())
         self.pages.addWidget(self._history_page())
         self.pages.addWidget(self._settings_page())
+        self.pages.addWidget(self._mcp_page())
         root.addWidget(self.pages, 1)
         self.setCentralWidget(central)
         self.wheel_guard = WheelGuard(self)
@@ -1033,7 +1088,7 @@ class MainWindow(QMainWindow):
         self._show_page(0)
         self.activity_label = QLabel("", objectName="activity")
         self.statusBar().addPermanentWidget(self.activity_label)
-        for index in range(4):
+        for index in range(len(self.nav_buttons)):
             QShortcut(QKeySequence(f"Ctrl+{index + 1}"), self, partial(self._show_page, index))
         QShortcut(QKeySequence("F5"), self, self.refresh_schedule)
 
@@ -1048,6 +1103,223 @@ class MainWindow(QMainWindow):
         layout.addWidget(hint)
         layout.addSpacing(12)
         return page, layout
+
+    def _mcp_page(self):
+        page, layout = self._page_shell(
+            "MCP", "Отдельное подключение вашего ИИ-клиента. Собственных моделей и чата здесь нет."
+        )
+        self.mcp_status = QLabel()
+        self.mcp_status.setWordWrap(True)
+        self.mcp_status.setTextFormat(Qt.TextFormat.PlainText)
+        layout.addWidget(self.mcp_status)
+        self.mcp_install_button = QPushButton("Скачать и установить MCP")
+        self.mcp_install_button.clicked.connect(self._install_mcp)
+        layout.addWidget(self.mcp_install_button)
+        self.mcp_enabled = QCheckBox("Разрешить локальное MCP-подключение")
+        self.mcp_enabled.setChecked(bool(self.db.get_setting("mcp_enabled", False)))
+        self.mcp_enabled.toggled.connect(self._mcp_access_changed)
+        layout.addWidget(self.mcp_enabled)
+        self.mcp_allow_changes = QCheckBox("Разрешить ИИ менять настройки и правила предметов")
+        self.mcp_allow_changes.setChecked(bool(self.db.get_setting("mcp_allow_changes", False)))
+        self.mcp_allow_changes.toggled.connect(
+            lambda enabled: self.db.set_setting("mcp_allow_changes", enabled)
+        )
+        layout.addWidget(self.mcp_allow_changes)
+        self.mcp_config_button = QPushButton("Скопировать конфигурацию подключения")
+        self.mcp_config_button.clicked.connect(self._copy_mcp_config)
+        layout.addWidget(self.mcp_config_button)
+        hint = QLabel(
+            "Установите MCP, разрешите подключение и добавьте конфигурацию в ИИ-клиент "
+            "с поддержкой локального MCP (stdio). Клиент сам запускает MCP.\n\n"
+            "Без разрешения изменений доступны только диагностика и чтение настроек. "
+            "Пароли, коды входа, QR и сообщения лекций недоступны. При обновлении MCP "
+            "переподключите его в ИИ-клиенте; Lecture Assistant обновлять не нужно."
+        )
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+        repository = QPushButton("Репозиторий и релизы MCP", objectName="secondary")
+        repository.clicked.connect(
+            lambda: QDesktopServices.openUrl(QUrl(f"https://github.com/{mcp_install.REPOSITORY}"))
+        )
+        layout.addWidget(repository)
+        layout.addStretch()
+        return page
+
+    def _mcp_root(self):
+        return self.mcp_access.root / "mcp"
+
+    def _refresh_mcp_status(self):
+        if self.mcp_leftovers and not self.mcp_busy:
+            # Never during an install: its staging folder is not a leftover yet.
+            self.mcp_leftovers = not mcp_install.clean_leftovers(self._mcp_root())
+        release = mcp_install.installed(self._mcp_root())
+        installed = release is not None
+        self.mcp_enabled.setEnabled(installed)
+        self.mcp_allow_changes.setEnabled(installed and self.mcp_enabled.isChecked())
+        self.mcp_config_button.setEnabled(installed)
+        self.mcp_install_button.setEnabled(not self.mcp_busy)
+        self.mcp_install_button.setText(
+            "Устанавливаем…"
+            if self.mcp_busy
+            else "Проверить обновление MCP"
+            if installed
+            else "Скачать и установить MCP"
+        )
+        lines = [f"Установлен MCP {release['version']}" if installed else "MCP не установлен"]
+        if not self.mcp_access.server:
+            lines.append("Подключение к приложению выключено")
+        else:
+            clients = self.mcp_access.connected_clients()
+            if not clients:
+                lines.append("Ожидает подключения ИИ-клиента")
+            for client in clients:
+                state = (
+                    "подключён" if client["state"] == "connected" else "ожидает первого запроса ИИ"
+                )
+                lines.append(f"{client['name']} · MCP {client['version']} · {state}")
+        self.mcp_status.setText("\n".join(lines))
+
+    def _mcp_access_changed(self, enabled):
+        self.db.set_setting("mcp_enabled", enabled)
+        self._sync_mcp_access()
+
+    def _sync_mcp_access(self):
+        try:
+            if self.mcp_enabled.isChecked() and mcp_install.installed(self._mcp_root()):
+                self.mcp_access.start()
+            else:
+                self.mcp_access.stop()
+        except OSError:
+            log.warning("mcp_access_unavailable")
+            self.statusBar().showMessage("Не удалось включить MCP-подключение", 5000)
+        self._refresh_mcp_status()
+
+    def _install_mcp(self):
+        if self.mcp_busy:
+            return
+        self.mcp_busy = True
+        self._refresh_mcp_status()
+
+        def install():
+            release = mcp_install.latest()
+            current = mcp_install.installed(self._mcp_root())
+            if current and not updater.is_newer(release["version"], current["version"]):
+                return current
+            return mcp_install.install(self._mcp_root(), release)
+
+        def done(release):
+            self.mcp_busy = False
+            self.mcp_leftovers = True
+            self._sync_mcp_access()
+            self.statusBar().showMessage(f"MCP {release['version']} установлен", 5000)
+
+        def failed(_message):
+            self.mcp_busy = False
+            self._refresh_mcp_status()
+            QMessageBox.warning(
+                self,
+                "MCP",
+                "Не удалось установить MCP. "
+                "Проверьте интернет и доступность релиза; текущая версия сохранена.",
+            )
+
+        self._run(install, done, "Скачиваем отдельный MCP…", failed=failed)
+
+    def _copy_mcp_config(self):
+        import json
+
+        config = mcp_install.client_config(self._mcp_root(), self.mcp_access.root)
+        QGuiApplication.clipboard().setText(json.dumps(config, ensure_ascii=False, indent=2))
+        self.statusBar().showMessage("Конфигурация MCP скопирована; добавьте её в ИИ-клиент", 5000)
+
+    def _mcp_rpc(self, job):
+        if job.cancelled:
+            return
+        try:
+            if not self.mcp_enabled.isChecked() or not self.mcp_access.server:
+                raise ValueError("MCP access is disabled")
+            method, params = job.method, job.params
+            write = method in {"update_settings", "set_subject_rule"}
+            if write and not self.mcp_allow_changes.isChecked():
+                raise ValueError("Changes are disabled in the MCP tab")
+            if write and self._settings_dirty():
+                raise ValueError("Save or discard unsaved settings before using MCP")
+            if method == "status":
+                result = {
+                    "app_version": __version__,
+                    "protocol": 1,
+                    "session_present": bool(self.mirea.session),
+                    "scanner_running": self.scan_timer.isActive(),
+                    "last_capture_age_seconds": round(time.monotonic() - self.last_capture_at, 1)
+                    if self.last_capture_at
+                    else None,
+                    "active_lesson_id": self.active_lecture_id,
+                    "changes_allowed": self.mcp_allow_changes.isChecked(),
+                }
+            elif method == "get_settings":
+                result = {
+                    key: self.db.get_setting(key, default)
+                    for key, (_, default, _) in MCP_SETTINGS.items()
+                }
+                result["schema"] = {
+                    key: {"type": kind.__name__, "default": default, "range": bounds}
+                    for key, (kind, default, bounds) in MCP_SETTINGS.items()
+                }
+            elif method == "update_settings":
+                values = validate_settings(params.get("settings"))
+                # One transaction, so a rejected/partial update cannot leak through.
+                import json
+
+                with self.db.connection() as conn:
+                    for key, value in values.items():
+                        conn.execute(
+                            "INSERT INTO settings(key,value) VALUES(?,?) "
+                            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                            (key, json.dumps(value, ensure_ascii=False)),
+                        )
+                self._load_settings()
+                self.scan_timer.setInterval(self.scan_interval.value() * 1000)
+                if {"copy_manual_codes", "type_manual_codes"} & values.keys():
+                    self._restart_code_watcher()
+                self._update_now_card()
+                result = {"updated": sorted(values)}
+                log.info("mcp_settings_updated keys=%s", ",".join(sorted(values)))
+            elif method == "get_schedule":
+                result = {
+                    "lessons": [
+                        {
+                            "id": lesson.external_id,
+                            "subject": lesson.subject_name,
+                            "type": lesson.lesson_type,
+                            "start": lesson.start_at.isoformat(),
+                            "end": lesson.end_at.isoformat(),
+                        }
+                        for lesson in self.db.list_lessons()[:200]
+                    ]
+                }
+            elif method in {"get_subject_rules", "set_subject_rule"}:
+                subjects = sorted({lesson.subject_name for lesson in self.db.list_lessons()})
+                if method == "set_subject_rule":
+                    subject, mode = params.get("subject"), params.get("mode")
+                    if subject not in subjects or mode not in {"AUTO", "ASK", "IGNORE"}:
+                        raise ValueError("Choose an existing subject and AUTO/ASK/IGNORE")
+                    self.db.set_rule(subject, RuleMode(mode))
+                    self._fill_schedule()
+                    self._update_now_card()
+                    log.info("mcp_subject_rule_updated")
+                result = {
+                    "rules": {subject: self.db.get_rule(subject).value for subject in subjects}
+                }
+            else:
+                raise ValueError("Unsupported MCP method")
+            job.result = {"result": result}
+        except ValueError as exc:
+            job.result = {"error": str(exc)}
+        except Exception:  # noqa: BLE001 - never send exception contents/secrets to the client
+            log.warning("mcp_request_failed")
+            job.result = {"error": "Application could not complete the request"}
+        finally:
+            job.done.set()
 
     def _schedule_page(self):
         page, layout = self._page_shell(
@@ -1268,8 +1540,8 @@ class MainWindow(QMainWindow):
         sign_in.addRow("Мой вход", self.copy_manual_codes)
         self.type_manual_codes = QCheckBox("и сразу вводить его на странице МИРЭА в браузере")
         self.type_manual_codes.setToolTip(
-            "Только если впереди окно браузера со страницей МИРЭА; иначе код просто "
-            "лежит в буфере обмена — вставьте его Ctrl+V"
+            "Через расширение, даже в неактивной вкладке. Без расширения код "
+            "только в буфере обмена — вставьте его Ctrl+V"
         )
         if sys.platform != "win32":
             self.type_manual_codes.setEnabled(False)
@@ -1649,7 +1921,7 @@ class MainWindow(QMainWindow):
 
         target = data_dir() / "browser-extension"
         try:
-            shutil.copytree(resource_path("browser_extension"), target, dirs_exist_ok=True)
+            self.code_bridge.prepare_extension(resource_path("browser_extension"), target)
         except OSError as exc:
             log.warning("browser_extension_copy_failed", exc_info=True)
             QMessageBox.warning(self, "Расширение", f"Не удалось подготовить папку: {exc}")
@@ -1658,7 +1930,7 @@ class MainWindow(QMainWindow):
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(target)))
         QMessageBox.information(
             self,
-            "Расширение «пропуск МАКС»",
+            "Расширение МИРЭА: МАКС и код",
             "Папка с расширением открыта. Чтобы добавить его в браузер:\n\n"
             "1. Откройте страницу расширений: chrome://extensions "
             "(Edge — edge://extensions, Яндекс — browser://extensions).\n"
@@ -1667,7 +1939,9 @@ class MainWindow(QMainWindow):
             f"{target}\n\n"
             "Папку не удаляйте: браузер берёт расширение из неё. Расширение работает "
             "только на sso.mirea.ru и нажимает «Пропустить», лишь когда страница сама "
-            "это предлагает.",
+            "это предлагает. Также вводит почтовый код в неактивной вкладке входа. "
+            "Если расширение уже установлено, нажмите его кнопку обновления "
+            "на странице расширений, чтобы загрузить новые разрешения.",
         )
 
     def _open_logs_folder(self):
@@ -3174,6 +3448,7 @@ class MainWindow(QMainWindow):
                 else None
             )
         if lesson_id != self.active_lecture_id:
+            self.lecture_inactive_checks = 0
             self.active_lecture_id = lesson_id
             sent_lessons = self.db.get_setting("chat_sent_lessons", [])
             self.unreadable_chat_sent = bool(lesson_id and lesson_id in sent_lessons)
@@ -3254,6 +3529,18 @@ class MainWindow(QMainWindow):
                 # The room changed while this check ran; it says nothing about the new one.
                 log.info("lecture_health_result_dropped state=%s", state)
                 return
+            if state == "inactive":
+                self.lecture_inactive_checks += 1
+                if self.lecture_inactive_checks < 2:
+                    return
+                if lesson and datetime.now().astimezone() >= lesson.end_at + LEAVE_AFTER_END:
+                    self._finish_active_lecture("ended_landing_page")
+                    return
+                # Before the end it may be a room that has not started yet: reopen
+                # it as rarely as a stalled stream, not at every check.
+                state = "stalled"
+            else:
+                self.lecture_inactive_checks = 0
             if state == "unstable":
                 # A reconnect banner is usually gone within seconds: act only if
                 # it is still there at the next check.
@@ -4038,6 +4325,8 @@ class MainWindow(QMainWindow):
     def _hand_over(self):
         """A newer version was started: quit and leave it the browser and the lecture."""
         self._persist_session()
+        self.code_bridge.stop()
+        self.mcp_access.stop()
         if self.code_watcher is not None:
             self.code_watcher.stop()
         self.force_exit = True
@@ -4047,6 +4336,8 @@ class MainWindow(QMainWindow):
     def _quit(self):
         log.info("quit_requested")
         self._persist_session()
+        self.code_bridge.stop()
+        self.mcp_access.stop()
         if self.code_watcher is not None:
             self.code_watcher.stop()
         self.force_exit = True
