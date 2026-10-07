@@ -2021,6 +2021,8 @@ def test_the_max_extension_is_put_in_a_folder_to_add_to_the_browser(window, tmp_
     from mirea_lecture_assistant import paths
 
     monkeypatch.setattr(paths, "data_dir", lambda: tmp_path)
+    # No browser found (and never the real ones of the PC running the tests).
+    monkeypatch.setattr("mirea_lecture_assistant.ui.browsers.installed", list)
     opened, told = [], []
     monkeypatch.setattr(
         "mirea_lecture_assistant.ui.QDesktopServices.openUrl", lambda url: opened.append(url)

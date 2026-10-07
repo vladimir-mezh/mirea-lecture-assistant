@@ -41,7 +41,7 @@ class Browser:
 def program_from_command(command: str) -> Path | None:
     """``"C:\\…\\chrome.exe" --single-argument %1`` -> the program's path."""
     command = command.strip()
-    match = re.match(r'"([^"]+)"', command) or re.match(r"(\S+\.exe)", command, re.I)
+    match = re.match(r'"([^"]+)"', command) or re.match(r"(\S+\.exe)", command, re.IGNORECASE)
     return Path(match.group(1)) if match else None
 
 
