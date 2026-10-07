@@ -82,7 +82,7 @@ from .chat_detection import chat_baseline, classmates_report_attendance_issue
 from .code_bridge import CodeBridge
 from .database import Database
 from .domain import Lesson, PendingAttendance, RuleMode, SessionState
-from .email_otp import EMAIL_PROVIDERS, EmailAccount, ImapOtpReader
+from .email_otp import EMAIL_PROVIDERS, EmailAccount, ImapOtpReader, tags_agree
 from .mcp_access import SETTINGS as MCP_SETTINGS
 from .mcp_access import McpAccess, validate_settings
 from .mirea_service import MireaService
@@ -421,8 +421,9 @@ class WorkerSignals(QObject):
 class CodeSignals(QObject):
     """Carries a code from the mailbox watcher's thread to the window's."""
 
-    arrived = Signal(str)
+    arrived = Signal(object)  # a Code: a str that may carry the mark of its sign-in
     entered = Signal()
+    signed_in = Signal()
 
 
 class McpSignals(QObject):
@@ -664,7 +665,12 @@ class MainWindow(QMainWindow):
         self.code_signals = CodeSignals()
         self.code_signals.arrived.connect(self._manual_code_arrived)
         self.code_signals.entered.connect(self._manual_code_entered)
-        self.code_bridge = CodeBridge(self.code_signals.entered.emit)
+        self.code_signals.signed_in.connect(self._manual_sign_in_done)
+        self.code_bridge = CodeBridge(
+            self.code_signals.entered.emit, self.code_signals.signed_in.emit
+        )
+        self.extension_code = None
+        self.extension_signed_in = True
         from .paths import data_dir
 
         self.mcp_signals = McpSignals()
@@ -869,13 +875,25 @@ class MainWindow(QMainWindow):
             log.warning("manual_code_bridge_unavailable")
 
     def _manual_code_entered(self):
-        log.info("manual_code_delivered copied=True typed=True via=extension")
-        self.tray.showMessage(
-            "Код МИРЭА введён",
-            "Код введён в поле почтового подтверждения в браузере",
-            QSystemTrayIcon.MessageIcon.Information,
-            15000,
-        )
+        """The extension filled the field: no clipboard, no Ctrl+V; wait for the sign-in."""
+        log.info("manual_code_delivered copied=False via=extension")
+        self.extension_code = None
+        self.extension_signed_in = False
+        QTimer.singleShot(30_000, self._sign_in_not_confirmed)
+
+    def _manual_sign_in_done(self):
+        log.info("manual_sign_in_completed via=extension")
+        self.extension_signed_in = True
+        self._code_notice("Вход в МИРЭА выполнен", "Код из письма введён в браузере сам.")
+
+    def _sign_in_not_confirmed(self):
+        if not self.extension_signed_in:
+            self._code_notice(
+                "Код введён в браузере",
+                "Код из письма введён на странице входа. Если вход не завершился, "
+                "загляните в браузер.",
+            )
+        self.extension_signed_in = True  # one notice per code
 
     def _restart_code_watcher(self):
         """Watch the mailbox for codes of the student's own sign-ins, if wanted."""
@@ -906,33 +924,55 @@ class MainWindow(QMainWindow):
             return
         if not bool(self.db.get_setting("copy_manual_codes", True)):
             return
-        self._copy_code(code)
-        # Best effort native Close/OK; never send Enter into an arbitrary window.
         if os.environ.get("MIREA_ASSISTANT_SMOKE_TEST") != "1":
+            # Best effort native Close/OK; never send Enter into an arbitrary window.
             threading.Thread(target=dismiss_password_notice, daemon=True).start()
-        typed = False
-        window = manual_code.foreground_window()
-        if window is not None and bool(self.db.get_setting("type_manual_codes", True)):
-            title, window_class, pid, program = window
-            ours = self.browser.process is not None and pid == self.browser.process.pid
-            # Keyboard focus is not proof of the target field. The extension
-            # fills an exact SSO email challenge, even in an inactive tab.
-            # The title tells why a code was or was not typed; the code is never logged.
-            log.info(
-                "manual_code_window program=%s class=%s ours=%s title=%r",
-                program,
-                window_class,
-                ours,
-                title[:80],
-            )
-        if bool(self.db.get_setting("type_manual_codes", True)):
+        tag = getattr(code, "tag", None)
+        through_extension = bool(self.db.get_setting("type_manual_codes", True))
+        watching, page_tag = self.code_bridge.watching() if through_extension else (False, None)
+        if watching:
+            if not tags_agree(page_tag, code):
+                # The letter of an earlier attempt: neither the page nor Ctrl+V gets it.
+                log.info("manual_code_ignored reason=other_attempt")
+                self._code_notice(
+                    "Пришёл код от другой попытки входа",
+                    f"Страница ждёт код #{page_tag}, а в письме — #{tag}. Дождитесь письма "
+                    f"с #{page_tag} или запросите код заново.",
+                )
+                return
+            # The extension fills the field in the right tab; the clipboard stays
+            # untouched unless it does not take the code within a few seconds.
             self.code_bridge.publish(code)
-        log.info("manual_code_delivered copied=True typed=%s", typed)
-        self.tray.showMessage(
-            "Код МИРЭА" + (" введён" if typed else " скопирован"),
-            f"{code} — " + ("введён на странице входа" if typed else "вставьте его: Ctrl+V"),
-            QSystemTrayIcon.MessageIcon.Information,
-            15000,
+            self.extension_code = code
+            QTimer.singleShot(8_000, partial(self._code_not_taken, code))
+            log.info("manual_code_offered via=extension")
+            return
+        if through_extension:
+            self.code_bridge.publish(code)  # a sign-in page opened a moment later
+        self._copy_code(code)
+        log.info("manual_code_delivered copied=True via=clipboard")
+        self._code_notice(
+            "Код МИРЭА скопирован",
+            f"{code}{f' (#{tag})' if tag else ''} — вставьте его: Ctrl+V"
+            + (". Сверьте номер с тем, что на странице." if tag else ""),
+        )
+
+    def _code_notice(self, title: str, text: str):
+        """Notifications about codes and sign-ins, unless switched off in the settings."""
+        if bool(self.db.get_setting("notify_codes", True)):
+            self.tray.showMessage(title, text, QSystemTrayIcon.MessageIcon.Information, 15000)
+
+    def _code_not_taken(self, code):
+        if self.extension_code is not code:
+            return  # taken by the extension, or replaced by a newer code
+        self.extension_code = None
+        self._copy_code(code)
+        log.info("manual_code_delivered copied=True via=clipboard_fallback")
+        tag = getattr(code, "tag", None)
+        self._code_notice(
+            "Код МИРЭА скопирован",
+            f"{code}{f' (#{tag})' if tag else ''} — расширение не смогло ввести его, "
+            "вставьте сами: Ctrl+V",
         )
 
     def _copy_code(self, code: str):
@@ -2304,6 +2344,12 @@ class MainWindow(QMainWindow):
             self.type_manual_codes.setEnabled(False)
         self.copy_manual_codes.toggled.connect(self.type_manual_codes.setEnabled)
         sign_in.addRow("", self.type_manual_codes)
+        self.notify_codes = QCheckBox("Уведомлять о кодах из почты и о входе")
+        self.notify_codes.setChecked(bool(self.db.get_setting("notify_codes", True)))
+        self.notify_codes.toggled.connect(
+            lambda enabled: self.db.set_setting("notify_codes", bool(enabled))
+        )
+        sign_in.addRow("", self.notify_codes)
         self.extension_button = QPushButton("Установить в браузер…", objectName="secondary")
         self.extension_button.setToolTip(
             "Когда вы входите на сайт МИРЭА в своём браузере, расширение само вводит код "
@@ -3082,6 +3128,7 @@ class MainWindow(QMainWindow):
                         email_credentials,
                         self.login_started_at,
                         after_uid=self.email_uid_before_login,
+                        tag=getattr(result.challenge, "code_tag", None),
                     ),
                     lambda code: (
                         self._own_code_taken(code),
@@ -3843,11 +3890,11 @@ class MainWindow(QMainWindow):
             except Exception as exc:  # noqa: BLE001 - a snapshot is an optimisation
                 log.warning("sdo_sign_in_uid_snapshot_failed error=%s", exc)
 
-        def request_code() -> str:
+        def request_code(tag: str | None = None) -> str:
             if not email_credentials:
                 raise SignInFailed("Для входа в СДО нужен код, а почта не настроена")
             code = self.otp_reader.wait_for_code(
-                email_credentials, requested_at, after_uid=latest_uid
+                email_credentials, requested_at, after_uid=latest_uid, tag=tag
             )
             self.used_codes.add(code)
             return code

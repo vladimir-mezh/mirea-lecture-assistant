@@ -13,6 +13,7 @@ import httpx
 from bs4 import BeautifulSoup
 from pymirea.auth import AuthResult, MireaAuth
 
+from .email_otp import code_tag
 from .pulse_api import PULSE_COOKIE_NAMES
 
 log = logging.getLogger(__name__)
@@ -138,6 +139,8 @@ class PulseAuth:
             if challenge:
                 self._trusted(challenge.action_url, action=True)
                 challenge.referer = str(page.url)
+                # «Введите код (#1F)»: only the letter with the same mark is this code.
+                challenge.code_tag = code_tag(page.text)
                 self._challenge = challenge
                 return AuthResult(False, error or "Введите код подтверждения", challenge=challenge)
             if error:

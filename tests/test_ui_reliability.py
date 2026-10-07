@@ -2039,6 +2039,7 @@ def test_the_max_extension_is_put_in_a_folder_to_add_to_the_browser(window, tmp_
         "bridge-config.json",
         "code-worker.js",
         "email-code.js",
+        "icons",
         "manifest.json",
         "skip-max.js",
     ]
@@ -2145,3 +2146,53 @@ def test_one_button_installs_into_the_chosen_browser_and_notices_it_working(
     # Remembered: after a restart the app still knows it is installed.
     assert window.db.get_setting("extension_seen")["browser"] == "Google Chrome"
     box.close()
+
+
+def _code(code, tag):
+    from mirea_lecture_assistant.email_otp import Code
+
+    result = Code(code)
+    result.tag = tag
+    return result
+
+
+def test_extension_enters_the_code_and_only_sign_in_is_announced(window, monkeypatch):
+    _typed, messages = _code_window(window, monkeypatch, None)
+    monkeypatch.setattr(window.code_bridge, "watching", lambda: (True, "A2"))
+
+    window._manual_code_arrived(_code("147789", "A2"))
+
+    assert QApplication.clipboard().text() == ""  # nothing to paste: the page gets it
+    assert window.code_bridge.pending[0] == "147789"
+    assert messages == []
+    window._manual_code_entered()
+    window._code_not_taken(window.code_bridge.pending[0])  # the fallback stays quiet
+    window._manual_sign_in_done()
+    assert [m[0] for m in messages] == ["Вход в МИРЭА выполнен"]
+    assert QApplication.clipboard().text() == ""
+
+
+def test_a_code_of_another_attempt_is_neither_entered_nor_copied(window, monkeypatch):
+    _typed, messages = _code_window(window, monkeypatch, None)
+    monkeypatch.setattr(window.code_bridge, "watching", lambda: (True, "1F"))
+
+    window._manual_code_arrived(_code("147789", "A2"))
+
+    assert window.code_bridge.pending is None
+    assert QApplication.clipboard().text() == ""
+    assert "другой попытки" in messages[0][0] and "#1F" in messages[0][1]
+
+
+def test_without_the_extension_the_code_is_copied_with_its_mark(window, monkeypatch):
+    _typed, messages = _code_window(window, monkeypatch, None)
+    window._manual_code_arrived(_code("147789", "A2"))
+    assert QApplication.clipboard().text() == "147789"
+    assert "(#A2)" in messages[0][1]
+
+
+def test_code_notifications_can_be_switched_off(window, monkeypatch):
+    _typed, messages = _code_window(window, monkeypatch, None)
+    window.notify_codes.setChecked(False)
+    window._manual_code_arrived(_code("147789", "A2"))
+    window._manual_sign_in_done()
+    assert QApplication.clipboard().text() == "147789" and messages == []

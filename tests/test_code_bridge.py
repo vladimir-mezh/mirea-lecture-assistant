@@ -188,3 +188,37 @@ def test_the_folder_stamp_changes_with_the_code_not_with_the_pairing_key(tmp_pat
     assert extension_stamp(source) == before
     (source / "email-code.js").write_text("// newer code")
     assert extension_stamp(source) != before
+
+
+def _tagged(code, tag):
+    from mirea_lecture_assistant.email_otp import Code
+
+    result = Code(code)
+    result.tag = tag
+    return result
+
+
+def test_a_code_goes_only_to_the_page_with_its_mark(monkeypatch):
+    bridge = CodeBridge()
+    bridge.publish(_tagged("147789", "A2"))
+    now = time.monotonic()
+    ticks = iter([now, now, now + 21])
+    monkeypatch.setattr(time, "monotonic", lambda: next(ticks))
+    monkeypatch.setattr(bridge.condition, "wait", lambda *_: None)
+    assert bridge.request("/poll", WATCH, origin=ORIGIN, tag="1F") == {}
+    monkeypatch.undo()
+    assert bridge.watching() == (True, "1F")
+    assert bridge.request("/poll", WATCH, origin=ORIGIN, tag="A2")["code"] == "147789"
+
+
+def test_signed_in_is_believed_only_after_a_code_was_entered():
+    signed = []
+    bridge = CodeBridge(signed_in=lambda: signed.append(True))
+    assert bridge.request("/signed-in", WATCH, origin=ORIGIN) == {} and not signed
+    bridge.publish("147789")
+    receipt = bridge.request("/poll", WATCH, origin=ORIGIN)["receipt"]
+    bridge.request("/ack", WATCH, receipt, ORIGIN)
+    bridge.request("/signed-in", WATCH, origin=ORIGIN)
+    assert signed == [True]
+    bridge.request("/signed-in", WATCH, origin=ORIGIN)
+    assert signed == [True]  # once per entered code

@@ -17,12 +17,18 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from .email_otp import tags_agree
+
 log = logging.getLogger(__name__)
 
 
 class CodeBridge:
-    def __init__(self, delivered=lambda: None):
+    def __init__(self, delivered=lambda: None, signed_in=lambda: None):
         self.delivered = delivered
+        self.signed_in = signed_in
+        # The code mark («#1F») each sign-in page asks for, and pages given a code.
+        self.watcher_tags: dict[str, str | None] = {}
+        self.filled: dict[str, float] = {}
         self.token = secrets.token_urlsafe(32)
         self.condition = threading.Condition()
         self.watchers: dict[str, float] = {}
@@ -68,7 +74,12 @@ class CodeBridge:
                         bridge.greet(self.headers.get("User-Agent", ""))
                         result = {}
                     else:
-                        result = bridge.request(self.path, key, data.get("receipt"), origin)
+                        tag = data.get("tag")
+                        if not isinstance(tag, str) or not re.fullmatch(r"[0-9A-Z]{1,6}", tag):
+                            tag = None
+                        result = bridge.request(
+                            self.path, key, data.get("receipt"), origin, tag=tag
+                        )
                     body = json.dumps(result).encode("utf-8")
                     self.send_response(200)
                     self.send_header("Content-Type", "application/json")
@@ -148,7 +159,16 @@ class CodeBridge:
             self.expiry_timer.start()
             self.condition.notify_all()
 
-    def request(self, path: str, key: str, receipt=None, origin=""):
+    def watching(self) -> tuple[bool, str | None]:
+        """Whether a sign-in page with the extension waits for a code, and its mark."""
+        with self.condition:
+            now = time.monotonic()
+            live = [w for w, seen in self.watchers.items() if seen > now - 45]
+            if len(live) != 1:
+                return bool(live), None
+            return True, self.watcher_tags.get(live[0])
+
+    def request(self, path: str, key: str, receipt=None, origin="", *, tag=None):
         watcher = origin + ":" + key
         with self.condition:
             if path == "/ack":
@@ -160,7 +180,13 @@ class CodeBridge:
                 ):
                     self.pending = None
                     self.watchers.pop(watcher, None)
+                    self.filled[watcher] = time.monotonic()
                     self.delivered()
+                return {}
+            if path == "/signed-in":
+                # Only a page that was given a code moments ago may say so.
+                if time.monotonic() - self.filled.pop(watcher, -1e9) < 120:
+                    self.signed_in()
                 return {}
             if path == "/cancel":
                 self.watchers.pop(watcher, None)
@@ -176,11 +202,16 @@ class CodeBridge:
                 now = time.monotonic()
                 self.watchers = {k: t for k, t in self.watchers.items() if t > now - 45}
                 self.watchers[watcher] = now
+                self.watcher_tags[watcher] = tag
+                self.watcher_tags = {
+                    k: v for k, v in self.watcher_tags.items() if k in self.watchers
+                }
                 if self.pending and self.pending[2] <= now:
                     self.pending = None
                 if self.pending and len(self.watchers) == 1:
                     code, receipt, expires, owner = self.pending
-                    if owner is None or owner == watcher:
+                    # A code goes only to the page whose mark («#1F») it carries.
+                    if (owner is None or owner == watcher) and tags_agree(tag, code):
                         self.pending = (code, receipt, expires, watcher)
                         return {"code": code, "receipt": receipt}
                 if now >= deadline:

@@ -11,6 +11,8 @@ import asyncio
 import logging
 from urllib.parse import parse_qs, urlparse
 
+from .email_otp import code_tag
+
 SSO_ENTRY = "https://online-edu.mirea.ru/auth/oidc/"
 SIGNED_IN_URL = "https://online-edu.mirea.ru/my/"
 USERNAME_FIELD = "input[name='username'], input#username"
@@ -105,7 +107,12 @@ async def sign_in(
         log.info("sdo_sign_in_code_requested")
         # IMAP polling is synchronous. Keep it off the app-wide asyncio loop so
         # QR capture and browser health checks continue while the email arrives.
-        code = await asyncio.to_thread(request_code)
+        try:
+            # «Введите код (#1F)»: only the letter marked #1F carries this code.
+            tag = code_tag(await page.evaluate("() => document.body.innerText"))
+        except Exception:  # noqa: BLE001 - no mark read: any fresh code will do
+            tag = None
+        code = await asyncio.to_thread(_ask_for_code, request_code, tag)
         await page.fill(CODE_FIELD, code)
         # The current Keycloak SPA submits a complete six-digit code itself.
         # It has only resend/cancel controls: clicking SUBMIT fails before the
@@ -130,3 +137,14 @@ async def sign_in(
         raise SignInFailed("СДО снова показала форму входа")
     log.info("sdo_sign_in_succeeded")
     return "signed-in"
+
+
+def _ask_for_code(request_code, tag):
+    """Pass the page's code mark on to a callback that takes it."""
+    import inspect
+
+    try:
+        takes_tag = bool(inspect.signature(request_code).parameters)
+    except (TypeError, ValueError):
+        takes_tag = False
+    return request_code(tag) if takes_tag else request_code()
