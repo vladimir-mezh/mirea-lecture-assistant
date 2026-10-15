@@ -10,11 +10,14 @@ and the running copy hands over to it (see ``app.ask_running_copy_to_show``).
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import os
 import re
+import secrets
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -143,10 +146,21 @@ def download(release: Release, folder: Path, timeout: float = 60.0) -> Path:
 def install(new_exe: Path, current: Path) -> Path:
     """Put the new file in place of the running one; returns the path to start."""
     previous = current.with_name(current.name + ".old")
+    pending = pending_path(current)
+    if pending.exists():
+        raise OSError("Previous update has not been verified yet")
+    metadata = {
+        "nonce": secrets.token_hex(24),
+        "new_hash": _digest(new_exe),
+        "old_hash": _digest(current),
+    }
     previous.unlink(missing_ok=True)
     os.replace(current, previous)
     try:
         os.replace(new_exe, current)
+        temporary = pending.with_suffix(".tmp")
+        temporary.write_text(json.dumps(metadata), encoding="utf-8")
+        os.replace(temporary, pending)
     except OSError:
         os.replace(previous, current)
         raise
@@ -160,13 +174,45 @@ def start(executable: Path) -> None:
         flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
     from .supervisor import child_environment
 
+    command = [str(executable)]
+    streams = {}
+    if sys.platform == "win32" and pending_path(executable).exists():
+        from .paths import resource_path
+
+        # Independent of both PyInstaller archives: even an unpacking failure can roll back.
+        with tempfile.NamedTemporaryFile(suffix="-mirea-update.ps1", delete=False) as helper:
+            helper.write(resource_path("assets/update_guard.ps1").read_bytes())
+        powershell = (
+            Path(os.environ.get("SystemRoot", "C:/Windows"))
+            / "System32/WindowsPowerShell/v1.0/powershell.exe"
+        )
+        command = [
+            str(powershell),
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            helper.name,
+            "-Executable",
+            str(executable),
+        ]
+        # PowerShell needs valid standard handles even when started by a windowless
+        # PyInstaller app. DETACHED_PROCESS can make it exit before loading the script.
+        flags = subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
+        streams = {
+            "stdin": subprocess.DEVNULL,
+            "stdout": subprocess.DEVNULL,
+            "stderr": subprocess.DEVNULL,
+        }
     subprocess.Popen(
-        [str(executable)],
+        command,
         close_fds=True,
         creationflags=flags,
         cwd=str(executable.parent),
         # A separate copy with its own watchdog, not a child of this one's.
         env=child_environment(),
+        **streams,
     )
 
 
@@ -177,6 +223,8 @@ def clean_leftovers(current: Path, *, partial: bool = False) -> bool:
     interrupted by a crash or power loss, ~50 MB each). Only at startup, before an
     update of this copy can have started: never while a download may be running.
     """
+    if pending_path(current).exists():
+        return False  # The guard owns rollback until the new UI confirms startup.
     if partial:
         for suffix in (".download", ".new"):
             try:
@@ -192,3 +240,34 @@ def clean_leftovers(current: Path, *, partial: bool = False) -> bool:
         return True
     except OSError:
         return False  # bootloader/antivirus may still hold it; a timer retries
+
+
+def pending_path(current: Path) -> Path:
+    return current.with_name(current.name + ".update-pending.json")
+
+
+def _digest(path: Path) -> str:
+    with path.open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def confirm_ready() -> None:
+    """Only the new UI's event loop may acknowledge a guarded update."""
+    nonce = os.environ.get("MIREA_UPDATE_NONCE")
+    if not can_self_update():
+        return
+    current = current_executable()
+    if not pending_path(current).exists():
+        return
+    try:
+        metadata = json.loads(pending_path(current).read_text(encoding="utf-8"))
+        if (nonce and metadata["nonce"] != nonce) or metadata["new_hash"] != _digest(current):
+            return
+        if nonce:
+            current.with_name(current.name + ".update-ready").write_text(nonce, encoding="ascii")
+        else:
+            # The guard may have observed an intentional early exit on the first run.
+            pending_path(current).unlink()
+        log.info("update_startup_verified")
+    except (OSError, ValueError, KeyError):
+        log.warning("update_startup_confirmation_failed")

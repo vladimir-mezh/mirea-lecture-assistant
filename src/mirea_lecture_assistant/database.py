@@ -34,11 +34,13 @@ RECOVERED_TABLES = (
     "resolved_links",
     "lessons",
     "qr_events",
+    "lesson_activity",
 )
 DATE_COLUMNS = {
     "lessons": ("start_at", "end_at"),
     "qr_events": ("detected_at",),
     "resolved_links": ("resolved_at",),
+    "lesson_activity": ("start_at", "end_at"),
 }
 # Errors of a busy or unreachable file: nothing in it is damaged.
 NOT_DAMAGE = ("locked", "busy", "unable to open", "readonly", "disk i/o", "full")
@@ -316,6 +318,79 @@ class Database:
                     PRAGMA user_version = 3;
                     """
                 )
+
+            if version < 4:
+                conn.executescript("""
+                    CREATE TABLE lesson_activity (
+                        lesson_id TEXT PRIMARY KEY,
+                        subject_name TEXT NOT NULL,
+                        lesson_type TEXT NOT NULL,
+                        start_at TEXT NOT NULL,
+                        end_at TEXT NOT NULL,
+                        opened_at TEXT,
+                        joined_at TEXT,
+                        video_at TEXT,
+                        last_video_at TEXT
+                    );
+                    PRAGMA user_version = 4;
+                """)
+
+    def record_lesson_activity(self, lesson: Lesson, event: str, at=None) -> None:
+        if event not in {"opened", "joined", "video"}:
+            raise ValueError("Unknown lesson activity")
+        stamp = (at or datetime.now().astimezone()).isoformat()
+        column = event + "_at"
+        with self.connection() as conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO lesson_activity"
+                "(lesson_id,subject_name,lesson_type,start_at,end_at) VALUES(?,?,?,?,?)",
+                (
+                    lesson.external_id,
+                    lesson.subject_name,
+                    lesson.lesson_type,
+                    lesson.start_at.isoformat(),
+                    lesson.end_at.isoformat(),
+                ),
+            )
+            conn.execute(
+                f"UPDATE lesson_activity SET {column}=COALESCE({column},?) WHERE lesson_id=?",
+                (stamp, lesson.external_id),
+            )
+            if event == "video":
+                conn.execute(
+                    "UPDATE lesson_activity SET last_video_at=? WHERE lesson_id=?",
+                    (stamp, lesson.external_id),
+                )
+
+    def daily_summary(self, day):
+        with self.connection() as conn:
+            activity = [dict(row) for row in conn.execute("SELECT * FROM lesson_activity")]
+            marked_events = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT DISTINCT lesson_id FROM qr_events WHERE status='submitted' AND lesson_id IS NOT NULL"
+                )
+            }
+        rows = {
+            row["lesson_id"]: row
+            for row in activity
+            if datetime.fromisoformat(row["start_at"]).astimezone().date() == day
+        }
+        for lesson in self.list_lessons():
+            if lesson.start_at.astimezone().date() != day or lesson.lesson_type != "ЛК":
+                continue
+            rows.setdefault(
+                lesson.external_id,
+                {
+                    "lesson_id": lesson.external_id,
+                    "subject_name": lesson.subject_name,
+                    "start_at": lesson.start_at.isoformat(),
+                },
+            )
+        marked = set(self.get_setting("marked_lessons", [])) | marked_events
+        for row in rows.values():
+            row["marked"] = row["lesson_id"] in marked
+        return sorted(rows.values(), key=lambda row: row["start_at"])
 
     def get_setting(self, key: str, default=None):
         with self.connection() as conn:
