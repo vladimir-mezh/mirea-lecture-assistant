@@ -1150,11 +1150,16 @@ class MainWindow(QMainWindow):
         def done(success):
             self.plan_b_running = False
             if success:
+                self.plan_b_failures = 0
                 self.db.set_setting("plan_b_signature", signature)
                 self._sync_plan_b()  # Settings may have changed during the operation.
             else:
-                log.warning("plan_b_sync_failed retry_seconds=30")
-                QTimer.singleShot(30_000, self._sync_plan_b)
+                # Soon once, then rarely: a Task Scheduler that refuses (a policy, a
+                # broken service) must not mean an attempt every 30 seconds all day.
+                self.plan_b_failures = getattr(self, "plan_b_failures", 0) + 1
+                delay = 30 if self.plan_b_failures == 1 else 600
+                log.warning("plan_b_sync_failed retry_seconds=%s", delay)
+                QTimer.singleShot(delay * 1000, self._sync_plan_b)
 
         self._run(work, done, "Настраиваем резервный запуск…", failed=lambda _error: done(False))
 

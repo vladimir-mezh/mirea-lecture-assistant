@@ -231,6 +231,13 @@ def clean_leftovers(current: Path, *, partial: bool = False) -> bool:
                 current.with_name(current.name + suffix).unlink(missing_ok=True)
             except OSError:
                 pass
+    # Builds the guard rolled back from (~50 MB each): kept only until things work again.
+    for failed in current.parent.glob(current.name + ".failed-*"):
+        try:
+            failed.unlink()
+            log.info("update_failed_build_removed")
+        except OSError:
+            pass
     previous = current.with_name(current.name + ".old")
     try:
         existed = previous.exists()
@@ -261,12 +268,14 @@ def confirm_ready() -> None:
         return
     try:
         metadata = json.loads(pending_path(current).read_text(encoding="utf-8"))
-        if (nonce and metadata["nonce"] != nonce) or metadata["new_hash"] != _digest(current):
+        if nonce and (metadata["nonce"] != nonce or metadata["new_hash"] != _digest(current)):
             return
         if nonce:
             current.with_name(current.name + ".update-ready").write_text(nonce, encoding="ascii")
         else:
-            # The guard may have observed an intentional early exit on the first run.
+            # An ordinary launch that got this far works, whatever the guard saw: an
+            # intentional early exit on the first run, or a build replaced by hand
+            # (another hash). A stale record must not block updates and cleanup forever.
             pending_path(current).unlink()
         log.info("update_startup_verified")
     except (OSError, ValueError, KeyError):

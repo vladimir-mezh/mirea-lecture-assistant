@@ -20,6 +20,9 @@ try {
     Remove-Item Env:MIREA_ASSISTANT_CHILD -ErrorAction SilentlyContinue
     try {
         $process = Start-Process -FilePath $Executable -WorkingDirectory (Split-Path -LiteralPath $Executable) -WindowStyle Hidden -PassThru
+        # Without the handle taken now, Windows PowerShell reports no ExitCode once the
+        # process has exited, and a deliberate exit 0 would be taken for a crash.
+        $null = $process.Handle
     } catch { Record 'update_launch_failed' }
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
     while ($null -ne $process -and [DateTime]::UtcNow -lt $deadline) {

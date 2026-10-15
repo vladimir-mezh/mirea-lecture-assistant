@@ -215,3 +215,44 @@ def test_real_windows_update_guard_commit_and_rollback(tmp_path, healthy):
     if not healthy:
         assert updater._digest(old) == old_hash
         assert list(tmp_path.glob("app.exe.failed-*"))
+
+
+def test_an_ordinary_launch_clears_a_stale_update_record(tmp_path, monkeypatch):
+    current, new = tmp_path / "app.exe", tmp_path / "new.exe"
+    current.write_bytes(b"old")
+    new.write_bytes(b"new")
+    updater.install(new, current)
+    current.write_bytes(b"replaced by hand")  # not the build the record expects
+    monkeypatch.setattr(updater, "can_self_update", lambda: True)
+    monkeypatch.setattr(updater, "current_executable", lambda: current)
+    monkeypatch.delenv("MIREA_UPDATE_NONCE", raising=False)
+    updater.confirm_ready()
+    assert not updater.pending_path(current).exists()
+    assert updater.clean_leftovers(current)  # updates and cleanup are free again
+    assert not (tmp_path / "app.exe.old").exists()
+
+
+def test_a_rolled_back_build_does_not_stay_on_disk(tmp_path):
+    current = tmp_path / "app.exe"
+    current.write_bytes(b"old")
+    (tmp_path / "app.exe.failed-abc").write_bytes(b"broken")
+    assert updater.clean_leftovers(current)
+    assert not list(tmp_path.glob("app.exe.failed-*"))
+
+
+def test_plan_b_retries_soon_once_then_rarely(window, monkeypatch):
+    from mirea_lecture_assistant import plan_b, ui
+
+    monkeypatch.delenv("MIREA_ASSISTANT_SMOKE_TEST", raising=False)
+    monkeypatch.setattr(plan_b, "available", lambda: True)
+    monkeypatch.setattr(window, "_plan_b_times", list)
+    monkeypatch.setattr(ui.updater, "current_executable", lambda: Path("C:/app.exe"))
+    window.db.set_setting("plan_b", True)
+    window.db.set_setting("plan_b_signature", ["old"])
+    delays = []
+    monkeypatch.setattr(ui.QTimer, "singleShot", lambda ms, _f: delays.append(ms))
+    monkeypatch.setattr(window, "_run", lambda _work, done, *_a, **_k: done(False))
+    window._sync_plan_b()
+    window._sync_plan_b()
+    window._sync_plan_b()
+    assert delays == [30_000, 600_000, 600_000]
