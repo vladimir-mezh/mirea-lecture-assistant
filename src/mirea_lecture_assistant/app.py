@@ -291,6 +291,11 @@ def main() -> int:
 
     heartbeat_timer.timeout.connect(heartbeat)
     heartbeat_timer.start(1_000)
+    # Readiness means a constructed window, open database and a responsive event loop.
+    # It deliberately does not require internet, MIREA availability or a fresh login.
+    from .updater import confirm_ready
+
+    QTimer.singleShot(10_000, confirm_ready)
     smoke_test = os.environ.get("MIREA_ASSISTANT_SMOKE_TEST") == "1"
     if smoke_test:
         window.force_exit = True

@@ -11,6 +11,7 @@ from functools import partial
 from string import Template
 
 from PySide6.QtCore import (
+    QDate,
     QEvent,
     QObject,
     QRunnable,
@@ -37,6 +38,7 @@ from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QDateEdit,
     QDialog,
     QDialogButtonBox,
     QFormLayout,
@@ -747,6 +749,7 @@ class MainWindow(QMainWindow):
         self.scan_started_at = 0.0
         self.last_capture_heartbeat = 0.0
         self.last_capture_at = 0.0
+        self.capture_grace_at = time.monotonic()
         self.force_exit = False
         self.pending_login_credentials: tuple[str, str] | None = None
         self.pending_email_credentials: EmailAccount | None = None
@@ -1134,14 +1137,31 @@ class MainWindow(QMainWindow):
             signature = [str(executable), [t.isoformat() for t in times[: plan_b.MAX_TRIGGERS]]]
             if self.db.get_setting("plan_b_signature", None) == signature:
                 return
-            self.db.set_setting("plan_b_signature", signature)
             work = partial(plan_b.install, executable, times)
         else:
             if self.db.get_setting("plan_b_signature", None) is None:
                 return
-            self.db.set_setting("plan_b_signature", None)
+            signature = None
             work = plan_b.remove
-        threading.Thread(target=work, name="plan-b", daemon=True).start()
+        if getattr(self, "plan_b_running", False):
+            return
+        self.plan_b_running = True
+
+        def done(success):
+            self.plan_b_running = False
+            if success:
+                self.plan_b_failures = 0
+                self.db.set_setting("plan_b_signature", signature)
+                self._sync_plan_b()  # Settings may have changed during the operation.
+            else:
+                # Soon once, then rarely: a Task Scheduler that refuses (a policy, a
+                # broken service) must not mean an attempt every 30 seconds all day.
+                self.plan_b_failures = getattr(self, "plan_b_failures", 0) + 1
+                delay = 30 if self.plan_b_failures == 1 else 600
+                log.warning("plan_b_sync_failed retry_seconds=%s", delay)
+                QTimer.singleShot(delay * 1000, self._sync_plan_b)
+
+        self._run(work, done, "Настраиваем резервный запуск…", failed=lambda _error: done(False))
 
     def _plan_b_toggled(self, checked: bool):
         self.db.set_setting("plan_b", bool(checked))
@@ -1602,7 +1622,7 @@ class MainWindow(QMainWindow):
                     )
                 elif not self.scan_timer.isActive():
                     problem("scanner_stopped", "QR-сканирование выключено", ["start_scanner"])
-                elif self.last_capture_at and time.monotonic() - self.last_capture_at > 60:
+                elif time.monotonic() - max(self.last_capture_at, self.capture_grace_at) > 60:
                     problem(
                         "capture_stale",
                         "Кадры лекции не обновляются больше минуты",
@@ -2056,6 +2076,7 @@ class MainWindow(QMainWindow):
                 marked = set(self.db.get_setting("marked_lessons", []))
                 result = {
                     "qr_events": events,
+                    "daily_summary": self.db.daily_summary(datetime.now().astimezone().date()),
                     "marked_lessons": [
                         {"subject": lesson.subject_name, "start": lesson.start_at.isoformat()}
                         for lesson in self.db.list_lessons()
@@ -2228,6 +2249,31 @@ class MainWindow(QMainWindow):
     def _history_page(self):
         page, layout = self._page_shell(
             "История QR", "Содержимое токенов не хранится — только безопасный отпечаток"
+        )
+        self.summary_date = QDateEdit(QDate.currentDate())
+        self.summary_date.setCalendarPopup(True)
+        self.summary_date.setDisplayFormat("dd.MM.yyyy")
+        self.summary_date.dateChanged.connect(lambda _date: self._fill_daily_summary())
+        layout.addWidget(
+            QLabel("Итог дня: открытие, подключение, видео и отметка — разные события")
+        )
+        layout.addWidget(self.summary_date)
+        self.daily_summary = QTableWidget(0, 6)
+        self.daily_summary.setHorizontalHeaderLabels(
+            ("Пара", "Предмет", "Открыта", "В комнате", "Видео", "Отметка")
+        )
+        self.daily_summary.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.daily_summary.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.ResizeToContents
+        )
+        self.daily_summary.horizontalHeader().setSectionResizeMode(
+            1, QHeaderView.ResizeMode.Stretch
+        )
+        layout.addWidget(self.daily_summary, 1)
+        layout.addWidget(
+            QLabel(
+                "Нет данных — не означает отсутствие. Учёт подключения и видео ведётся с этой версии."
+            )
         )
         self.history_table = QTableWidget(0, 4)
         self.history_table.setHorizontalHeaderLabels(("Когда", "Статус", "Предмет", "Результат"))
@@ -4362,6 +4408,8 @@ class MainWindow(QMainWindow):
             self.chat_baseline = None
             self.lecture_started_at = time.monotonic()
             self.last_capture_at = 0.0
+            self.capture_grace_at = time.monotonic()
+            self.summary_video_seen = False
         if lesson_id and self.active_lecture_url:
             checkpoint = {"lesson_id": lesson_id, "url": self.active_lecture_url}
             if self.active_lesson is not None:
@@ -4393,6 +4441,8 @@ class MainWindow(QMainWindow):
         self.active_lecture_url = self.browser.lecture_url
         log.info("lecture_opened lesson_id=%s browser=%s", lesson_id, browser_name)
         self._make_active(lesson_id)
+        if lesson is not None and lesson_id:
+            self.db.record_lesson_activity(lesson, "opened")
         self.statusBar().showMessage(
             f"Страница лекции загружена в {browser_name}; подключаемся…", 4000
         )
@@ -4456,7 +4506,7 @@ class MainWindow(QMainWindow):
                 self.lecture_unstable_checks = 0
             if state == "live" and (
                 self.scan_timer.isActive()
-                and time.monotonic() - (self.last_capture_at or self.lecture_started_at) > 30
+                and time.monotonic() - max(self.last_capture_at, self.capture_grace_at) > 30
             ):
                 log.warning("lecture_capture_stale")
                 state = "stalled"
@@ -4465,6 +4515,8 @@ class MainWindow(QMainWindow):
                     return
                 state = "lost"
             if state == "live":
+                if lesson is not None:
+                    self.db.record_lesson_activity(lesson, "joined")
                 self.lecture_recovery_failures = 0
                 return
             if state == "ended":
@@ -4506,7 +4558,7 @@ class MainWindow(QMainWindow):
         self.soft_recovery_at = now
         # The reloaded room gets the same 30 seconds as a new one before its
         # captures count as stale again.
-        self.last_capture_at = now
+        self.capture_grace_at = now
         return True
 
     def _enter_lecture_room(self):
@@ -4661,7 +4713,33 @@ class MainWindow(QMainWindow):
             6000,
         )
 
+    def _fill_daily_summary(self):
+        day = self.summary_date.date().toPython()
+        rows = self.db.daily_summary(day)
+        self.daily_summary.setRowCount(len(rows))
+        for index, row in enumerate(rows):
+
+            def stamp(key, row=row):
+                value = row.get(key)
+                return (
+                    datetime.fromisoformat(value).astimezone().strftime("%H:%M")
+                    if value
+                    else "Нет данных"
+                )
+
+            values = [
+                datetime.fromisoformat(row["start_at"]).astimezone().strftime("%H:%M"),
+                row["subject_name"],
+                stamp("opened_at"),
+                stamp("joined_at"),
+                stamp("video_at"),
+                "Отмечено" if row["marked"] else "Не подтверждено",
+            ]
+            for column, value in enumerate(values):
+                self.daily_summary.setItem(index, column, QTableWidgetItem(value))
+
     def _fill_history(self):
+        self._fill_daily_summary()
         events = self.db.recent_qr_events()
         self.history_table.setRowCount(len(events))
         subjects = {lesson.external_id: lesson.subject_name for lesson in self.db.list_lessons()}
@@ -4763,7 +4841,7 @@ class MainWindow(QMainWindow):
             log.info("scanner_stopped")
             self._update_now_card()
         else:
-            self.last_capture_at = time.monotonic()
+            self.capture_grace_at = time.monotonic()
             self.scan_timer.start(self.scan_interval.value() * 1000)
             self.scan_button.setText("Остановить сканирование")
             self.scan_state.setText("● Сканирует")
@@ -4784,7 +4862,13 @@ class MainWindow(QMainWindow):
             "scan_frame",
             log_success=False,
         )
-        self._start_worker(worker, self._scan_results, self._scan_failed, pool=self.scan_pool)
+        context = (self.active_lecture_id, self.active_lecture_url)
+        self._start_worker(
+            worker,
+            lambda observation: self._scan_results(observation, context),
+            self._scan_failed,
+            pool=self.scan_pool,
+        )
 
     def _scan_source(self, direct_capture: bool):
         if direct_capture:
@@ -4793,11 +4877,26 @@ class MainWindow(QMainWindow):
             return self.scanner.decode_png(png), page_text
         return self.scanner.scan_once(), ""
 
-    def _scan_results(self, observation):
+    def _scan_results(self, observation, context=None):
         self.scan_running = False
+        if context is not None and context != (self.active_lecture_id, self.active_lecture_url):
+            self._continue_scan_without_gap()
+            return  # A frame from the previous room proves nothing about the current one.
         batch, page_text = observation
         now = time.monotonic()
         self.last_capture_at = now
+        if (
+            self.active_lesson is not None
+            and self.active_lecture_id == self.active_lesson.external_id
+        ):
+            # Persist at most once per log heartbeat, plus the first real video frame.
+            video = self.direct_capture.isChecked() and self.browser._capture_backend == "video"
+            if video and (
+                now - self.last_capture_heartbeat >= 30
+                or not getattr(self, "summary_video_seen", False)
+            ):
+                self.db.record_lesson_activity(self.active_lesson, "video")
+                self.summary_video_seen = True
         if now - self.last_capture_heartbeat >= 30:
             self.last_capture_heartbeat = now
             log.info(
