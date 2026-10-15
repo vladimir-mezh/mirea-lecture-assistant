@@ -166,6 +166,7 @@ def test_resume_uses_saved_timetable_during_a_schedule_outage(window, monkeypatc
 
 
 def test_a_live_tab_without_fresh_capture_is_reloaded(window, monkeypatch):
+    window.capture_grace_at = 0.0
     window.active_lecture_id = "test"
     window.active_lecture_url = "https://mts-link.ru/j/1"
     window.lecture_started_at = time.monotonic() - 60
@@ -1771,6 +1772,7 @@ def test_a_frozen_stream_reloads_the_room_once_not_every_ten_seconds(window, mon
 
 
 def test_failing_captures_reload_the_room_at_most_every_ten_minutes(window, monkeypatch):
+    window.capture_grace_at = 0.0
     """A computer too slow to capture is not fixed by reloading the lecture."""
     reopened, clock = _watched_running_room(window, monkeypatch, "live")
     monkeypatch.setattr(window.scan_timer, "isActive", lambda: True)

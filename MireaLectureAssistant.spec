@@ -47,6 +47,7 @@ a = Analysis(
     pathex=["src"],
     binaries=[],
     datas=[
+        ("assets/update_guard.ps1", "assets"),
         ("assets/app_icon.png", "assets"),
         ("assets/app_icon.ico", "assets"),
         ("browser_extension", "browser_extension"),

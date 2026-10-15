@@ -94,6 +94,7 @@ def replace_stage() -> None:
         updater.start(installed)
         os._exit(0)
     # Build B, started by A: it removes A's file once A's processes are gone.
+    updater.confirm_ready()
     deadline = time.monotonic() + 60
     removed = updater.clean_leftovers(current)
     while not removed and time.monotonic() < deadline:
@@ -222,6 +223,7 @@ def build(work: Path, build_id: str, padding: int) -> Path:
             "--paths", str(Path("src").resolve()), "--paths", str(generated), "--name", name,
             "--distpath", str(work / "dist"), "--workpath", str(work / f"work-{build_id}"),
             "--specpath", str(work), str(Path(__file__).resolve()),
+            "--add-data", str(Path("assets/update_guard.ps1").resolve()) + ";assets",
         ],
         check=True,
     )  # fmt: skip
