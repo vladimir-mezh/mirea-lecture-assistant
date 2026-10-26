@@ -947,7 +947,7 @@ class MainWindow(QMainWindow):
             # untouched unless it does not take the code within a few seconds.
             self.code_bridge.publish(code)
             self.extension_code = code
-            QTimer.singleShot(8_000, partial(self._code_not_taken, code))
+            QTimer.singleShot(3_000, partial(self._code_not_taken, code))
             log.info("manual_code_offered via=extension")
             return
         if through_extension:

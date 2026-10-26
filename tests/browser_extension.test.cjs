@@ -14,6 +14,7 @@ function lifecycle() {
 
 function page(origin = 'https://sso.mirea.ru', fieldName = 'emailCode') {
   let listener, watch;
+  const listeners = new Set();
   const sent = [];
   class Input {
     constructor() { this.name = fieldName; this._value = ''; this.events = []; }
@@ -26,17 +27,19 @@ function page(origin = 'https://sso.mirea.ru', fieldName = 'emailCode') {
   const context = {
     location: {origin, pathname: '/realms/mirea/login-actions/authenticate'},
     crypto: webcrypto, HTMLInputElement: Input, Event,
-    Date, setInterval: () => {},
-    MutationObserver: class {constructor(callback) {watch = callback;} observe() {}},
+    Date, setInterval: () => {}, clearInterval() {}, queueMicrotask,
+    MutationObserver: class {constructor(callback) {watch = callback;} observe() {} disconnect() {}},
     document: {documentElement: {}, querySelector: () => input},
     chrome: {runtime: {
       sendMessage: message => {sent.push(message); return Promise.resolve();},
-      onMessage: {addListener: callback => {listener = callback;}},
+      onMessage: {addListener: callback => {listener = callback; listeners.add(callback);},
+        removeListener: callback => listeners.delete(callback)},
     }},
   };
   vm.runInNewContext(source('email-code.js'), context);
   const message = value => {let response; listener(value, {}, r => {response = r;}); return response;};
-  return {input, sent, message, watch};
+  return {input, sent, message, watch, context, listeners,
+    rerun: () => vm.runInNewContext(source('email-code.js'), context)};
 }
 
 test('inactive browser tab receives code only in the explicit email field', () => {
@@ -59,12 +62,31 @@ test('stale challenge and nonempty input are never overwritten', () => {
   assert.equal(p.message({type: 'mirea-fill', nonce, code: '123456'}).filled, false);
   assert.equal(p.input.value, 'user-entered');
 });
+
+test('reinjection replaces the old listener and explicitly cancels its waiter', () => {
+  const p = page();
+  const old = p.sent[0].nonce;
+  p.rerun();
+  assert.equal(p.listeners.size, 1);
+  assert(p.sent.some(message => message.type === 'mirea-unwatch' && message.nonce === old));
+  assert.equal(p.message({type: 'mirea-probe', nonce: old}).ready, false);
+});
+
+test('a challenge changed before the mutation callback cannot receive the old code', () => {
+  const p = page();
+  const nonce = p.sent[0].nonce;
+  p.context.document.body = {innerText: 'Введите код (#A2)'};
+  assert.equal(p.message({type: 'mirea-fill', nonce, code: '123456'}).filled, false);
+  p.watch();
+  assert(p.sent.some(message => message.type === 'mirea-unwatch' && message.nonce === nonce));
+  assert.equal(p.sent.at(-1).tag, 'A2');
+});
 test('worker delivers to the original tab, not the currently active one', async () => {
   let listener;
   const destinations = [], requests = [];
   let filled = false;
   const context = {
-    crypto: webcrypto, TextEncoder, Uint8Array, URL, Date, AbortSignal,
+    crypto: webcrypto, TextEncoder, Uint8Array, URL, Date, AbortSignal, AbortController, setTimeout,
     fetch: async (url, options) => {
       if (url === 'extension:config') return {json: async () => ({port: 1, token: 'fixture'})};
       requests.push([url, options]);
@@ -100,7 +122,7 @@ function worker({disk, loaded, signInTabs = [], reloadedAt = 0, appUp = true}) {
   const calls = {reloads: 0, hellos: 0, injected: [], stored: []};
   const handlers = {};
   const context = {
-    crypto: webcrypto, TextEncoder, Uint8Array, URL, Date, AbortSignal,
+    crypto: webcrypto, TextEncoder, Uint8Array, URL, Date, AbortSignal, AbortController, setTimeout,
     fetch: async (url) => {
       if (url === 'extension:manifest.json') return {json: async () => disk};
       if (url === 'extension:bridge-config.json') return {json: async () => ({port: 1, token: 't'})};
@@ -174,7 +196,7 @@ test('the page mark goes with the request, and a left code form means signed in'
   let listener;
   const bodies = [];
   const context = {
-    crypto: webcrypto, TextEncoder, Uint8Array, URL, Date, AbortSignal,
+    crypto: webcrypto, TextEncoder, Uint8Array, URL, Date, AbortSignal, AbortController,
     setTimeout: (f) => setTimeout(f, 1),
     fetch: async (url, options) => {
       if (url === 'extension:config') return {json: async () => ({port: 1, token: 'fixture'})};

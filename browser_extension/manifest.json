@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "МИРЭА: помощник входа",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "background": {
     "service_worker": "code-worker.js"
   },
@@ -19,7 +19,7 @@
         "skip-max.js",
         "email-code.js"
       ],
-      "run_at": "document_idle"
+      "run_at": "document_start"
     }
   ],
   "permissions": [
