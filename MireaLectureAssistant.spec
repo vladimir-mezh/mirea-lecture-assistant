@@ -71,6 +71,12 @@ a = Analysis(
 a.binaries = [entry for entry in a.binaries if needed(entry)]
 a.datas = [entry for entry in a.datas if needed(entry)]
 
+# Some bundled Python runtimes load an additional CA policy from ssl.py.
+# Keep that policy beside the frozen module so HTTPS contexts can initialize.
+ssl_policy = Path(sys.base_prefix) / "Lib" / "codex-rejected-cas.pem"
+if ssl_policy.is_file():
+    a.datas.append((ssl_policy.name, str(ssl_policy), "DATA"))
+
 if sys.platform == "win32":
     qt_runtime_dir = Path(SPECPATH) / ".venv" / "Lib" / "site-packages" / "PySide6"
     qt_runtime_names = {
