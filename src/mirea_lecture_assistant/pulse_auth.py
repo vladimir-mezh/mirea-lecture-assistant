@@ -53,7 +53,7 @@ class PulseAuth:
         soup = BeautifulSoup(page.text, "html.parser")
         for form in soup.find_all("form"):
             if skip:
-                if not form.find("input", attrs={"name": "skip", "value": "true"}):
+                if not form.find(["input", "button"], attrs={"name": "skip", "value": "true"}):
                     continue
             elif not form.find("input", attrs={"name": "password"}):
                 continue
@@ -65,6 +65,10 @@ class PulseAuth:
                 for item in form.find_all("input", attrs={"type": "hidden"})
                 if item.get("name")
             }
+            if skip:
+                # A clicked submit control is sent by a browser along with hidden
+                # fields. Omitting it repeats the required-action page.
+                fields["skip"] = "true"
             return self._trusted(urljoin(str(page.url), action), action=True), fields
         action = self._parser._extract_login_action(page.text)
         # React themes expose loginAction rather than a server-rendered form.
@@ -81,6 +85,51 @@ class PulseAuth:
             headers={"Referer": referer},
             follow_redirects=False,
         )
+
+    def _callback_form(self, page):
+        # OIDC response_mode=form_post returns a page that a browser submits to
+        # Pulse. Only accept authorization responses to the known callback routes.
+        if page.url.host not in {"sso.mirea.ru", "login.mirea.ru"}:
+            return None
+        soup = BeautifulSoup(page.text, "html.parser")
+        for form in soup.find_all("form"):
+            if str(form.get("method", "get")).strip().lower() != "post":
+                continue
+            action = urljoin(str(page.url), form.get("action", ""))
+            parsed = urlsplit(self._trusted(action))
+            if parsed.hostname != "pulse.mirea.ru" or parsed.path.rstrip("/") not in {
+                "/signin-oidc",
+                "/api/mireaauth",
+                "/api/auth/callback",
+                "/api/auth/callback/keycloak",
+                "/api/auth/callback/mirea",
+                "/api/auth/callback/oidc",
+            }:
+                continue
+            fields = {
+                item["name"]: item.get("value", "")
+                for item in form.find_all("input")
+                if item.get("name") and str(item.get("type", "hidden")).lower() == "hidden"
+            }
+            if (
+                fields.get("code")
+                and fields.get("state")
+                and fields.keys()
+                <= {
+                    "code",
+                    "state",
+                    "session_state",
+                    "iss",
+                    "id_token",
+                    "access_token",
+                    "token_type",
+                    "expires_in",
+                    "scope",
+                    "client_id",
+                }
+            ):
+                return action, fields
+        return None
 
     async def _settle(self, response):
         for _ in range(16):
@@ -104,6 +153,16 @@ class PulseAuth:
                 continue
             if response.status_code != 200:
                 return response
+            callback = self._callback_form(response)
+            if callback:
+                action, fields = callback
+                response = await self.client.post(
+                    action,
+                    data=fields,
+                    headers={"Referer": str(response.url)},
+                    follow_redirects=False,
+                )
+                continue
             execution = parse_qs(response.url.query.decode()).get("execution", [])
             if execution == ["max-account-config"]:
                 form = self._form(response, skip=True)
@@ -151,6 +210,42 @@ class PulseAuth:
             page.url.path,
             page.status_code,
         )
+        soup = BeautifulSoup(page.text, "html.parser")
+        # Shape only: never log HTML, field values, cookies or OAuth parameters.
+        log.warning(
+            "pulse_auth_page_shape forms=%s has_callback_fields=%s has_skip_control=%s",
+            len(soup.find_all("form")),
+            bool(
+                soup.find("input", attrs={"name": "code"})
+                and soup.find("input", attrs={"name": "state"})
+            ),
+            bool(soup.find(["input", "button"], attrs={"name": "skip", "value": "true"})),
+        )
+        for form in soup.find_all("form"):
+            target = urlsplit(urljoin(str(page.url), form.get("action", "")))
+            names = {str(i.get("name", "")) for i in form.find_all("input")}
+            known = {
+                "code",
+                "state",
+                "session_state",
+                "iss",
+                "id_token",
+                "access_token",
+                "token_type",
+                "expires_in",
+                "scope",
+                "client_id",
+                "skip",
+            }
+            log.warning(
+                "pulse_auth_form_shape method=%s pulse_destination=%s auth_route=%s "
+                "known_fields=%s unknown_field_count=%s",
+                "post" if str(form.get("method", "get")).strip().lower() == "post" else "other",
+                target.hostname == "pulse.mirea.ru",
+                target.path.startswith(("/api/auth/", "/api/mireaauth", "/signin-oidc")),
+                ",".join(sorted(names & known)),
+                len(names - known - {""}),
+            )
         return AuthResult(False, "МИРЭА не завершила вход в Пульс. Начните вход заново.")
 
     @staticmethod

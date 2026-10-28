@@ -22,9 +22,32 @@ def run(coro):
 
 
 @pytest.mark.parametrize("max_page", [False, True])
+@pytest.mark.parametrize("form_post", [False, True])
 @pytest.mark.parametrize("cookie_name", [".AspNetCore.Cookies", "Pulse.Auth.Cookie"])
-def test_native_flow_preserves_correlation_and_redeems_only_at_pulse(max_page, cookie_name):
+@pytest.mark.parametrize(
+    "skip_control",
+    [
+        '<input type="hidden" name="skip" value="true">',
+        '<input type="submit" name="skip" value="true">',
+        '<button type="submit" name="skip" value="true">Skip</button>',
+    ],
+)
+def test_native_flow_preserves_correlation_and_redeems_only_at_pulse(
+    max_page, cookie_name, skip_control, form_post
+):
     calls = []
+
+    def completed_sso():
+        if form_post:
+            return httpx.Response(
+                200,
+                text=(
+                    '<form method="post" action="https://pulse.mirea.ru/api/mireaauth">'
+                    '<input type="hidden" name="code" value="synthetic">'
+                    '<input type="hidden" name="state" value="matching"></form>'
+                ),
+            )
+        return httpx.Response(302, headers={"location": CALLBACK})
 
     def dispatch(req):
         calls.append((req.method, req.url.path))
@@ -52,17 +75,25 @@ def test_native_flow_preserves_correlation_and_redeems_only_at_pulse(max_page, c
                 return httpx.Response(200, text=f'"email-code-form" "loginAction": "{ACTION}"')
             if fields.get("emailCode"):
                 assert fields["emailCode"] == ["123456"]
-                target = ACTION + "?execution=max-account-config" if max_page else CALLBACK
-                return httpx.Response(302, headers={"location": target})
+                if max_page:
+                    return httpx.Response(
+                        302, headers={"location": ACTION + "?execution=max-account-config"}
+                    )
+                return completed_sso()
             if req.method == "GET":
                 return httpx.Response(
                     200,
-                    text=f'<form action="{ACTION}"><input type="hidden" name="skip" value="true"></form>',
+                    text=f'<form action="{ACTION}">{skip_control}</form>',
                 )
             assert fields == {"skip": ["true"]}
-            return httpx.Response(302, headers={"location": CALLBACK})
+            return completed_sso()
         if req.url.path == "/api/mireaauth":
             assert "correlation=synthetic" in req.headers["cookie"]
+            fields = (
+                parse_qs(req.content.decode()) if req.method == "POST" else dict(req.url.params)
+            )
+            assert fields["code"] in ("synthetic", ["synthetic"])
+            assert fields["state"] in ("matching", ["matching"])
             return httpx.Response(
                 302,
                 headers={
@@ -150,3 +181,85 @@ def test_network_failure_remains_retryable_but_bad_destination_does_not():
 
     assert transient_login_failure(PulseAuth._failure(httpx.ConnectTimeout("synthetic")).message)
     assert not transient_login_failure(PulseAuth._failure(ValueError("synthetic")).message)
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        "https://evil.example/api/mireaauth",
+        "http://pulse.mirea.ru/api/mireaauth",
+        "https://pulse.mirea.ru:444/api/mireaauth",
+        "https://pulse.mirea.ru/unrelated",
+    ],
+)
+def test_callback_form_cannot_post_to_other_destinations(target):
+    auth = object.__new__(PulseAuth)
+    page = httpx.Response(
+        200,
+        request=httpx.Request("GET", ACTION),
+        text=(
+            f'<form method="post" action="{target}">'
+            '<input type="hidden" name="code" value="synthetic">'
+            '<input type="hidden" name="state" value="matching"></form>'
+        ),
+    )
+    try:
+        assert auth._callback_form(page) is None
+    except ValueError:
+        pass  # Invalid origins are rejected before any request can be sent.
+
+
+def test_callback_form_requires_code_state_and_rejects_extra_fields():
+    auth = object.__new__(PulseAuth)
+    for fields in (
+        '<input type="hidden" name="code" value="synthetic">',
+        '<input type="hidden" name="state" value="matching">',
+        (
+            '<input type="hidden" name="code" value="synthetic">'
+            '<input type="hidden" name="state" value="matching">'
+            '<input type="hidden" name="password" value="synthetic">'
+        ),
+    ):
+        page = httpx.Response(
+            200,
+            request=httpx.Request("GET", ACTION),
+            text=(
+                f'<form method="post" action="https://pulse.mirea.ru/api/mireaauth">{fields}</form>'
+            ),
+        )
+        assert auth._callback_form(page) is None
+
+
+@pytest.mark.parametrize(
+    "route",
+    [
+        "/signin-oidc",
+        "/api/mireaauth/",
+        "/api/auth/callback",
+        "/api/auth/callback/keycloak",
+        "/api/auth/callback/mirea",
+        "/api/auth/callback/oidc",
+    ],
+)
+def test_callback_form_accepts_standard_oidc_response_fields(route):
+    auth = object.__new__(PulseAuth)
+    target = "https://pulse.mirea.ru" + route
+    page = httpx.Response(
+        200,
+        request=httpx.Request("GET", ACTION),
+        text=(
+            f'<form method="POST " action="{target}">'
+            '<input name="code" value="synthetic">'
+            '<input name="state" value="matching">'
+            '<input type="hidden" name="id_token" value="synthetic-id-token">'
+            '<input type="hidden" name="scope" value="openid"></form>'
+        ),
+    )
+    action, fields = auth._callback_form(page)
+    assert action == target
+    assert fields == {
+        "code": "synthetic",
+        "state": "matching",
+        "id_token": "synthetic-id-token",
+        "scope": "openid",
+    }
