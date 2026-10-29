@@ -208,7 +208,9 @@ def test_real_windows_update_guard_commit_and_rollback(tmp_path, healthy):
         timeout=35,
         check=False,
     )
-    assert result.returncode == 0, result.stderr.decode(errors="replace")
+    guard_log = tmp_path / "app.exe.update.log"
+    events = guard_log.read_text(encoding="utf-8-sig") if guard_log.exists() else "guard_log_missing"
+    assert result.returncode == 0, events
     assert not updater.pending_path(old).exists()
     log = (tmp_path / "app.exe.update.log").read_text(encoding="utf-8-sig")
     assert ("update_committed" if healthy else "update_rolled_back") in log
