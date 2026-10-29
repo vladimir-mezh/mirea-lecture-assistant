@@ -135,6 +135,7 @@ def test_mcp_activation_retries_a_transient_windows_lock(tmp_path, monkeypatch):
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows process flags")
 def test_guard_has_valid_handles_from_a_windowless_application(tmp_path, monkeypatch):
+    monkeypatch.setenv("PSModulePath", "C:/foreign/pwsh7/Modules")
     current, new = tmp_path / "app.exe", tmp_path / "new.exe"
     current.write_bytes(b"old")
     new.write_bytes(b"new")
@@ -153,11 +154,18 @@ def test_guard_has_valid_handles_from_a_windowless_application(tmp_path, monkeyp
     assert options["creationflags"] & subprocess.CREATE_NO_WINDOW
     assert not options["creationflags"] & subprocess.DETACHED_PROCESS
     assert all(options[stream] == subprocess.DEVNULL for stream in ("stdin", "stdout", "stderr"))
+    assert not any(key.upper() == "PSMODULEPATH" for key in options["env"])
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows guard integration")
 @pytest.mark.parametrize("healthy", [True, False])
-def test_real_windows_update_guard_commit_and_rollback(tmp_path, healthy):
+@pytest.mark.parametrize("foreign_modules", [False, True])
+def test_real_windows_update_guard_commit_and_rollback(
+    tmp_path, healthy, foreign_modules, monkeypatch
+):
+    if foreign_modules:
+        # Reproduce an indirect pwsh -> Python -> Windows PowerShell launch.
+        monkeypatch.setenv("PSModulePath", str(tmp_path / "foreign-pwsh-modules"))
     csc = (
         Path(os.environ.get("SystemRoot", "C:/Windows"))
         / "Microsoft.NET/Framework64/v4.0.30319/csc.exe"
@@ -209,7 +217,9 @@ def test_real_windows_update_guard_commit_and_rollback(tmp_path, healthy):
         check=False,
     )
     guard_log = tmp_path / "app.exe.update.log"
-    events = guard_log.read_text(encoding="utf-8-sig") if guard_log.exists() else "guard_log_missing"
+    events = (
+        guard_log.read_text(encoding="utf-8-sig") if guard_log.exists() else "guard_log_missing"
+    )
     assert result.returncode == 0, events
     assert not updater.pending_path(old).exists()
     log = (tmp_path / "app.exe.update.log").read_text(encoding="utf-8-sig")

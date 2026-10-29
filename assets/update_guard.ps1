@@ -1,4 +1,8 @@
 param([Parameter(Mandatory=$true)][string]$Executable, [int]$TimeoutSeconds = 240)
+# A pwsh -> Python -> powershell.exe launch otherwise inherits incompatible PS7
+# modules. This helper uses only the modules bundled with its own interpreter.
+# Process-local: the user's module paths and parent environment are unchanged.
+$env:PSModulePath = [IO.Path]::Combine($PSHOME, 'Modules')
 $ErrorActionPreference = 'Stop'
 $pending = $Executable + '.update-pending.json'
 $previous = $Executable + '.old'

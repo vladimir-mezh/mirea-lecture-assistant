@@ -79,7 +79,7 @@ The app recorded `pulse_auth_contract_detected`,
 chat-fallback sends during the check. After user exit, ordinary startup again
 recorded `stored_session_verified state=valid` and loaded 37 lessons.
 
-649 Python tests, 17 extension tests, Ruff, packaged startup and HTTPS checks in
+651 Python tests, 17 extension tests, Ruff, packaged startup and HTTPS checks in
 both normal and verification modes passed. The initial packaging regression on
 PyInstaller 6.22.2 rejected an intentionally legacy nested launch before Python
 started. This is addressed upstream in 6.22.3 (nested onefile parent validation),
@@ -89,3 +89,12 @@ dependencies and certificate verification are unchanged.
 See [PyInstaller 6.22.3 changes](https://pyinstaller.org/en/v6.22.3/CHANGES.html)
 for the upstream packaging fix; do not suppress its security checks or remove
 the legacy regression test to hide this failure.
+
+Windows CI additionally exposed an inherited-PowerShell-module-path failure in
+the existing update guard: `stage=validate_files type=CommandNotFoundException`.
+The chain pwsh -> Python -> powershell.exe passed PS7 module paths to Windows
+PowerShell 5.1. The launcher now removes PSModulePath from that child's environment;
+the standalone helper also restricts its process-local search path to its own
+bundled modules. No user/machine environment or execution policy is modified.
+Both commit and rollback are tested with ordinary and foreign module paths.
+See [Microsoft's PSModulePath explanation](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.core/about/about_psmodulepath#starting-windows-powershell-from-powershell-7).

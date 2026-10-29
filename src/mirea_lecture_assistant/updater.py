@@ -176,6 +176,7 @@ def start(executable: Path) -> None:
 
     command = [str(executable)]
     streams = {}
+    environment = child_environment()
     if sys.platform == "win32" and pending_path(executable).exists():
         from .paths import resource_path
 
@@ -205,13 +206,16 @@ def start(executable: Path) -> None:
             "stdout": subprocess.DEVNULL,
             "stderr": subprocess.DEVNULL,
         }
+        # Windows PowerShell launched indirectly from pwsh does not get pwsh's
+        # automatic module-path correction. Let 5.1 build its own search path.
+        environment = {k: v for k, v in environment.items() if k.upper() != "PSMODULEPATH"}
     subprocess.Popen(
         command,
         close_fds=True,
         creationflags=flags,
         cwd=str(executable.parent),
         # A separate copy with its own watchdog, not a child of this one's.
-        env=child_environment(),
+        env=environment,
         **streams,
     )
 
