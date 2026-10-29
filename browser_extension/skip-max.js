@@ -40,7 +40,7 @@
   const watcher = new MutationObserver(() => {
     if (press()) watcher.disconnect();
   });
-  watcher.observe(document.documentElement, { childList: true, subtree: true, attributes: true });
+  watcher.observe(document.documentElement || document, { childList: true, subtree: true, attributes: true });
   // React can change routes or draw the form long after the initial page load.
   // The exact offered skip form is checked on every mutation; never submit OTP.
 })();

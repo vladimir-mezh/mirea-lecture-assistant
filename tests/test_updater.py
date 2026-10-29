@@ -83,6 +83,8 @@ def test_the_new_file_takes_the_place_of_the_running_one(tmp_path):
     assert current.read_bytes() == NEW_EXE
     assert (tmp_path / (updater.EXE_NAME + ".old")).read_bytes() == b"old build"
 
+    assert not updater.clean_leftovers(current)
+    updater.pending_path(current).unlink()  # Only the startup guard commits an update.
     updater.clean_leftovers(current)
     assert sorted(path.name for path in tmp_path.iterdir()) == [updater.EXE_NAME]
 

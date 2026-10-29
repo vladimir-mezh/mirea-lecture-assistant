@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
+import ntpath
 import os
 import re
 import shutil
@@ -152,12 +153,23 @@ def _read_json(path: Path) -> dict:
     if not path.exists():
         return {}
     try:
-        data = json.loads(path.read_text(encoding="utf-8-sig") or "{}")
+        data = json.loads(
+            path.read_text(encoding="utf-8-sig") or "{}", object_pairs_hook=_unique_pairs
+        )
     except (OSError, ValueError) as exc:
         # Comments, a typo: rewriting it would lose what the person wrote.
         raise NotSafe(path.name) from exc
     if not isinstance(data, dict):
         raise NotSafe(path.name)
+    return data
+
+
+def _unique_pairs(pairs):
+    data = {}
+    for key, value in pairs:
+        if key in data:
+            raise ValueError("duplicate_json_key")
+        data[key] = value
     return data
 
 
@@ -214,9 +226,10 @@ def _configured(client: Client, path: Path) -> dict | None:
 
         try:
             data = tomllib.loads(path.read_text(encoding="utf-8"))
-        except (OSError, tomllib.TOMLDecodeError):
+        except (OSError, UnicodeError, tomllib.TOMLDecodeError):
             return None
-        return data.get("mcp_servers", {}).get(NAME)
+        servers = data.get("mcp_servers", {})
+        return servers.get(NAME) if isinstance(servers, dict) else None
     try:
         entry = _read_json(path).get(_section(client), {})
     except NotSafe:
@@ -225,17 +238,195 @@ def _configured(client: Client, path: Path) -> dict | None:
 
 
 def status(client: Client, launcher: Path, profile: Path) -> str:
-    """``connected``, ``outdated`` (another path) or ``absent``."""
-    entries = [_configured(client, path) for path in client.files]
-    if not any(entries):
+    """Describe existing registrations, ignoring a second, unconfigured install."""
+    entries = [e for path in client.files if (e := _configured(client, path)) is not None]
+    if not entries:
         return "absent"
-    wanted = _entry(client, launcher, profile)
+    if all(isinstance(e, dict) and _disabled(e) for e in entries):
+        return "disabled"
     if all(
-        e and e.get("command") == wanted["command"] and e.get("args") == wanted["args"]
-        for e in entries
+        isinstance(e, dict) and (_disabled(e) or _current(e, launcher, profile)) for e in entries
     ):
         return "connected"
     return "outdated"
+
+
+def _disabled(entry: dict) -> bool:
+    return entry.get("disabled") is True or entry.get("enabled") is False
+
+
+def _path_key(value) -> str | None:
+    """Compare local Windows aliases without accessing arbitrary UNC servers."""
+    if not isinstance(value, str) or not value:
+        return None
+    value = value.replace("/", "\\")
+    local_share = re.match(
+        r"^\\\\(?:localhost|127\.0\.0\.1)\\([a-z])\$(?=\\|$)", value, re.IGNORECASE
+    )
+    if local_share:
+        value = local_share[1] + ":" + value[local_share.end() :]
+    return ntpath.normcase(ntpath.normpath(value))
+
+
+def _profile_arg(entry: dict) -> tuple[list[str], int] | None:
+    args = entry.get("args", [])
+    if not isinstance(args, list) or not all(isinstance(a, str) for a in args):
+        return None
+    positions = [i for i, a in enumerate(args) if a == "--profile" or a.startswith("--profile=")]
+    if len(positions) != 1:
+        return None
+    index = positions[0]
+    if args[index] == "--profile" and (index + 1 == len(args) or args[index + 1].startswith("--")):
+        return None
+    return args, index
+
+
+def _current(entry: dict, launcher: Path, profile: Path) -> bool:
+    if entry.get("type", "stdio") != "stdio" or "url" in entry:
+        return False
+    arg = _profile_arg(entry)
+    if arg is None or _path_key(entry.get("command")) != _path_key(str(launcher)):
+        return False
+    args, index = arg
+    value = args[index].partition("=")[2] if "=" in args[index] else args[index + 1]
+    return _path_key(value) == _path_key(str(profile))
+
+
+def _repaired_entry(entry, launcher: Path, profile: Path) -> dict:
+    if not isinstance(entry, dict):
+        raise NotSafe("unsupported_registration")
+    if _disabled(entry) or _current(entry, launcher, profile):
+        return entry
+    if entry.get("type", "stdio") != "stdio" or "url" in entry:
+        raise NotSafe("unsupported_registration")
+    arg = _profile_arg(entry)
+    # Only a registration generated for our local launcher is maintained. Do
+    # not replace a user's custom wrapper or an unrelated server with our name.
+    command = _path_key(entry.get("command"))
+    if arg is None or not command or ntpath.basename(command) != "mcplauncher.exe":
+        raise NotSafe("custom_registration")
+    args, index = arg
+    args = args.copy()
+    if "=" in args[index]:
+        args[index] = "--profile=" + str(profile)
+    else:
+        args[index + 1] = str(profile)
+    return {**entry, "command": str(launcher), "args": args}
+
+
+def _repair_toml(text: str, old: dict, new: dict) -> str:
+    """Replace only command/args, preserving other keys and nested tables."""
+    import tomllib
+
+    data = tomllib.loads(text)
+    lines = text.splitlines(keepends=True)
+    own_names = {f"mcp_servers.{NAME}", f'mcp_servers."{NAME}"', f"mcp_servers.'{NAME}'"}
+    in_ours, changed, i = False, set(), 0
+    output = []
+    while i < len(lines):
+        line = lines[i]
+        table = TOML_TABLE.match(line)
+        if table:
+            in_ours = table[1].replace(" ", "") in own_names
+        key = re.match(r"^\s*(command|args|\"command\"|\"args\"|'command'|'args')\s*=", line)
+        if in_ours and key:
+            name = key[1].strip("\"'")
+            end = i + 1
+            while end <= len(lines):
+                try:
+                    parsed = tomllib.loads("".join(lines[i:end]))
+                except tomllib.TOMLDecodeError:
+                    end += 1
+                    continue
+                if parsed != {name: old[name]}:
+                    raise NotSafe("complex_toml_registration")
+                break
+            else:
+                raise NotSafe("complex_toml_registration")
+            output.append(f"{name} = {_toml_value(new[name])}\n")
+            changed.add(name)
+            i = end
+        else:
+            output.append(line)
+            i += 1
+    candidate = "".join(output)
+    data["mcp_servers"][NAME] = new
+    if changed != {"command", "args"} or tomllib.loads(candidate) != data:
+        raise NotSafe("complex_toml_registration")
+    return candidate
+
+
+def repair_links(client: Client, launcher: Path, profile: Path) -> bool:
+    """Maintain existing enabled registrations; never create a connection."""
+    import tomllib
+
+    plans = []
+    for path in client.files:
+        if not path.is_file():
+            continue
+        before = path.read_text(encoding="utf-8-sig")
+        try:
+            data = tomllib.loads(before) if client.kind == "toml" else _read_json(path)
+        except (ValueError, NotSafe) as exc:
+            raise NotSafe("invalid_configuration") from exc
+        servers = data.get("mcp_servers" if client.kind == "toml" else _section(client), {})
+        if not isinstance(servers, dict):
+            raise NotSafe("invalid_configuration")
+        if NAME not in servers:
+            continue
+        entry = servers[NAME]
+        repaired = _repaired_entry(entry, launcher, profile)
+        if repaired == entry:
+            continue
+        if client.kind == "toml":
+            after = _repair_toml(before, entry, repaired)
+        else:
+            servers[NAME] = repaired
+            after = json.dumps(data, ensure_ascii=False, indent=2) + "\n"
+        plans.append((path, before, after, entry, repaired))
+    for path, before, after, entry, repaired in plans:
+        # A running client or the person may have changed/disconnected it since
+        # the scan. Retry from a new snapshot, never restore the stale snapshot.
+        if path.read_text(encoding="utf-8-sig") != before:
+            raise NotSafe("configuration_changed")
+        if client.cli:
+            shutil.copy2(path, path.with_name(path.name + ".mirea-backup"))
+            if not _run_cli(client, ["mcp", "remove", "--scope", "user", NAME]):
+                raise NotSafe("cli_remove_failed")
+            if not _run_cli(
+                client, ["mcp", "add-json", "--scope", "user", NAME, json.dumps(repaired)]
+            ):
+                # Preserve the original registration even if the CLI's new
+                # schema rejects it. Never print the configuration or stderr.
+                if not _run_cli(
+                    client, ["mcp", "add-json", "--scope", "user", NAME, json.dumps(entry)]
+                ):
+                    current = _read_json(path)
+                    section = current.setdefault(_section(client), {})
+                    if not isinstance(section, dict) or NAME in section:
+                        raise NotSafe("cli_restore_conflict")
+                    section[NAME] = entry
+                    _write(path, json.dumps(current, ensure_ascii=False, indent=2) + "\n")
+                raise NotSafe("cli_update_failed")
+            if _configured(client, path) != repaired:
+                raise NotSafe("cli_update_unconfirmed")
+        else:
+            _write(path, after)
+    if plans:
+        log.info("ai_client_links_updated client=%s", client.key)
+    return bool(plans)
+
+
+def sync_links(launcher: Path, profile: Path) -> dict:
+    updated, errors = [], []
+    for client in detect():
+        try:
+            if repair_links(client, launcher, profile):
+                updated.append(client.key)
+        except (NotSafe, OSError, ValueError):
+            errors.append(client.key)
+            log.warning("ai_client_links_pending client=%s", client.key)
+    return {"updated": updated, "errors": errors}
 
 
 def _run_cli(client: Client, args: list[str]) -> bool:

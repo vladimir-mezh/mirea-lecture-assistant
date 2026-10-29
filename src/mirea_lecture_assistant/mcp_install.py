@@ -9,6 +9,7 @@ import re
 import secrets
 import shutil
 import tempfile
+import time
 import zipfile
 from pathlib import Path
 
@@ -123,13 +124,26 @@ def install_archive(root: Path, archive: bytes, expected_version: str):
         )
         for name in ["MireaAssistantMcp.exe", "manifest.json", "README.md", "LICENSE"]:
             (staging / name).write_bytes(files[name])
-        staging.replace(destination)
+        _activate_directory(staging, destination)
     _place_launcher(root, files["McpLauncher.exe"])
     temporary = root / "current.tmp"
     temporary.write_text(json.dumps(manifest), encoding="utf-8")
     temporary.replace(root / "current.json")
     clean_leftovers(root)
     return manifest
+
+
+def _activate_directory(staging: Path, destination: Path) -> None:
+    # Windows scanners may briefly hold freshly unpacked executable files.
+    # Keep the old current manifest until the whole version is in place.
+    for attempt in range(11):
+        try:
+            staging.replace(destination)
+            return
+        except PermissionError:
+            if attempt == 10:
+                raise
+            time.sleep(0.2)
 
 
 def _place_launcher(root: Path, data: bytes) -> None:

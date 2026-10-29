@@ -220,3 +220,62 @@ def test_one_click_connects_a_found_ai_client(window, tmp_path, monkeypatch):
     window._refresh_ai_clients()
     labels = [label.text() for label in window.ai_clients_box.findChildren(ui.QLabel)]
     assert labels == ["Cursor — ✓ подключён"]
+
+
+def test_links_are_maintained_automatically_without_update_button(window, tmp_path, monkeypatch):
+    from mirea_lecture_assistant import ai_clients, ui
+
+    install_archive(window._mcp_root(), archive(), "0.1.0")
+    path = tmp_path / "cursor-mcp.json"
+    path.write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    ai_clients.NAME: {
+                        "command": "C:/old/McpLauncher.exe",
+                        "args": ["--profile", "C:/old"],
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    client = ai_clients.Client("cursor", "Cursor", [path])
+    absent = ai_clients.Client("absent", "Absent", [tmp_path / "absent.json"])
+    monkeypatch.setattr(ui.ai_clients, "supported", lambda: True)
+    monkeypatch.setattr(ui.ai_clients, "detect", lambda: [client, absent])
+    monkeypatch.setattr(window, "_run", lambda function, done, *_a, **_k: done(function()))
+    window._show_page(ui.MCP_PAGE)
+    assert "Обновить" not in [b.text() for b in window.ai_clients_box.findChildren(ui.QPushButton)]
+    assert (
+        ai_clients.status(client, window._mcp_root() / "McpLauncher.exe", window.mcp_access.root)
+        == "outdated"
+    )
+    # The isolated smoke mode intentionally never edits real client settings.
+    monkeypatch.delenv("MIREA_ASSISTANT_SMOKE_TEST")
+    window._sync_ai_client_links()
+    assert (
+        ai_clients.status(client, window._mcp_root() / "McpLauncher.exe", window.mcp_access.root)
+        == "connected"
+    )
+    assert not absent.files[0].exists()
+    assert not window.ai_links_busy and window.ai_links_errors == set()
+    monkeypatch.setattr(window, "_run", lambda function, done, *_a, **_k: done(function()))
+    window._disconnect_ai_client(client)
+    window._sync_ai_client_links()
+    assert (
+        ai_clients.status(client, window._mcp_root() / "McpLauncher.exe", window.mcp_access.root)
+        == "absent"
+    )
+
+
+def test_manual_connection_changes_cannot_race_background_maintenance(window, monkeypatch):
+    from mirea_lecture_assistant import ai_clients
+
+    window.ai_links_busy = True
+    monkeypatch.setattr(window, "_run", lambda *_a, **_k: pytest.fail("overlapping config edits"))
+    client = ai_clients.Client("fixture", "Fixture", [])
+    window._connect_ai_client(client)
+    window._disconnect_ai_client(client)
+    window._install_mcp()
+    window._sync_ai_client_links()

@@ -11,6 +11,7 @@ from functools import partial
 from string import Template
 
 from PySide6.QtCore import (
+    QDate,
     QEvent,
     QObject,
     QRunnable,
@@ -37,6 +38,7 @@ from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QDateEdit,
     QDialog,
     QDialogButtonBox,
     QFormLayout,
@@ -677,6 +679,8 @@ class MainWindow(QMainWindow):
         self.mcp_signals.requested.connect(self._mcp_rpc)
         self.mcp_access = McpAccess(data_dir(), self.mcp_signals.requested.emit)
         self.mcp_busy = False
+        self.ai_links_busy = False
+        self.ai_links_errors: set[str] = set()
         self.auth_state = "unknown"
         self.duty_signals = DutySignals()
         self.duty_signals.finished.connect(self._duty_finished)
@@ -747,6 +751,7 @@ class MainWindow(QMainWindow):
         self.scan_started_at = 0.0
         self.last_capture_heartbeat = 0.0
         self.last_capture_at = 0.0
+        self.capture_grace_at = time.monotonic()
         self.force_exit = False
         self.pending_login_credentials: tuple[str, str] | None = None
         self.pending_email_credentials: EmailAccount | None = None
@@ -788,6 +793,12 @@ class MainWindow(QMainWindow):
             hints.colorSchemeChanged.connect(self._color_scheme_changed)
         self.refresh_views()
         log.info("main_window_ready")
+        if self._auth_check_only():
+            self.setWindowTitle(self.windowTitle() + " — Проверка входа")
+            self.statusBar().addPermanentWidget(
+                QLabel("Проверка входа: вебинары, QR и сообщения отключены")
+            )
+            log.info("auth_check_mode_enabled")
 
         self.clock = QTimer(self)
         self.clock.timeout.connect(self._refresh_relative_times)
@@ -842,6 +853,12 @@ class MainWindow(QMainWindow):
         self.mcp_timer.timeout.connect(self._refresh_extension_status)
         self.mcp_timer.start(5_000)
         QTimer.singleShot(0, self._sync_mcp_access)
+        self.ai_links_timer = QTimer(self)
+        self.ai_links_timer.setInterval(30_000)
+        self.ai_links_timer.timeout.connect(self._sync_ai_client_links)
+        if os.environ.get("MIREA_ASSISTANT_SMOKE_TEST") != "1":
+            self.ai_links_timer.start()
+            QTimer.singleShot(5_000, self._sync_ai_client_links)
         if updater.can_self_update() and os.environ.get("MIREA_ASSISTANT_SMOKE_TEST") != "1":
             # An update needs a check (20 s) and a click first, so no download of
             # this copy can be running yet: leftovers of an interrupted one go too.
@@ -944,7 +961,7 @@ class MainWindow(QMainWindow):
             # untouched unless it does not take the code within a few seconds.
             self.code_bridge.publish(code)
             self.extension_code = code
-            QTimer.singleShot(8_000, partial(self._code_not_taken, code))
+            QTimer.singleShot(3_000, partial(self._code_not_taken, code))
             log.info("manual_code_offered via=extension")
             return
         if through_extension:
@@ -1134,14 +1151,26 @@ class MainWindow(QMainWindow):
             signature = [str(executable), [t.isoformat() for t in times[: plan_b.MAX_TRIGGERS]]]
             if self.db.get_setting("plan_b_signature", None) == signature:
                 return
-            self.db.set_setting("plan_b_signature", signature)
             work = partial(plan_b.install, executable, times)
         else:
             if self.db.get_setting("plan_b_signature", None) is None:
                 return
-            self.db.set_setting("plan_b_signature", None)
+            signature = None
             work = plan_b.remove
-        threading.Thread(target=work, name="plan-b", daemon=True).start()
+        if getattr(self, "plan_b_running", False):
+            return
+        self.plan_b_running = True
+
+        def done(success):
+            self.plan_b_running = False
+            if success:
+                self.db.set_setting("plan_b_signature", signature)
+                self._sync_plan_b()  # Settings may have changed during the operation.
+            else:
+                log.warning("plan_b_sync_failed retry_seconds=30")
+                QTimer.singleShot(30_000, self._sync_plan_b)
+
+        self._run(work, done, "Настраиваем резервный запуск…", failed=lambda _error: done(False))
 
     def _plan_b_toggled(self, checked: bool):
         self.db.set_setting("plan_b", bool(checked))
@@ -1345,8 +1374,9 @@ class MainWindow(QMainWindow):
             "включит подключение и пропишет его в настройках клиента. Чужие настройки "
             "клиента не меняются. Клиент сам запускает MCP.\n\n"
             "Без разрешения изменений доступны только диагностика и чтение настроек. "
-            "Пароли, коды входа, QR и сообщения лекций недоступны. При обновлении MCP "
-            "переподключите его в ИИ-клиенте; Lecture Assistant обновлять не нужно."
+            "Пароли, коды входа, QR и сообщения лекций недоступны. Пути уже подключённых "
+            "клиентов обновляются автоматически. Если клиент не подхватил изменение, "
+            "начните в нём новый сеанс; Lecture Assistant обновлять не нужно."
         )
         hint.setWordWrap(True)
         layout.addWidget(hint)
@@ -1407,6 +1437,34 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Не удалось включить MCP-подключение", 5000)
         self._refresh_mcp_status()
 
+    def _sync_ai_client_links(self):
+        if (
+            self.ai_links_busy
+            or self.mcp_busy
+            or not ai_clients.supported()
+            or os.environ.get("MIREA_ASSISTANT_SMOKE_TEST") == "1"
+            or mcp_install.installed(self._mcp_root()) is None
+        ):
+            return
+        self.ai_links_busy = True
+        if self.pages.currentIndex() == MCP_PAGE:
+            self._refresh_ai_clients()
+        launcher, profile = self._mcp_root() / "McpLauncher.exe", self.mcp_access.root
+
+        def done(result):
+            self.ai_links_busy = False
+            self.ai_links_errors = set(result["errors"])
+            if self.pages.currentIndex() == MCP_PAGE:
+                self._refresh_ai_clients()
+
+        def failed(_message):
+            self.ai_links_busy = False
+            log.warning("ai_client_links_check_failed")
+            if self.pages.currentIndex() == MCP_PAGE:
+                self._refresh_ai_clients()
+
+        self._run(lambda: ai_clients.sync_links(launcher, profile), done, "", failed=failed)
+
     def _refresh_ai_clients(self):
         """One row per AI client found here: its state and the one button it needs."""
         while self.ai_clients_layout.count():
@@ -1435,17 +1493,22 @@ class MainWindow(QMainWindow):
                 client.name
                 + {
                     "connected": " — ✓ подключён",
-                    "outdated": " — подключён по старому пути",
+                    "outdated": (
+                        " — не удалось обновить путь, повторим автоматически"
+                        if client.key in self.ai_links_errors
+                        else " — путь обновляется автоматически"
+                    ),
+                    "disabled": " — выключен в ИИ-клиенте",
                     "absent": "",
                 }[state]
             )
             line.addWidget(label, 1)
             button = QPushButton(
-                {"connected": "Отключить", "outdated": "Обновить", "absent": "Подключить"}[state],
-                objectName="secondary" if state == "connected" else "",
+                "Подключить" if state == "absent" else "Отключить",
+                objectName="" if state == "absent" else "secondary",
             )
-            button.setEnabled(not self.mcp_busy)
-            if state == "connected":
+            button.setEnabled(not self.mcp_busy and not self.ai_links_busy)
+            if state != "absent":
                 button.clicked.connect(partial(self._disconnect_ai_client, client))
             else:
                 button.clicked.connect(partial(self._connect_ai_client, client))
@@ -1454,7 +1517,7 @@ class MainWindow(QMainWindow):
 
     def _connect_ai_client(self, client):
         """Everything one click needs: MCP installed, access on, the client's settings."""
-        if self.mcp_busy:
+        if self.mcp_busy or self.ai_links_busy:
             return
         if mcp_install.installed(self._mcp_root()) is None:
             self._install_mcp(then=lambda: self._connect_ai_client(client))
@@ -1462,6 +1525,8 @@ class MainWindow(QMainWindow):
         if not self.mcp_enabled.isChecked():
             self.mcp_enabled.setChecked(True)  # saves the setting and opens access
         launcher, profile = self._mcp_root() / "McpLauncher.exe", self.mcp_access.root
+        self.ai_links_busy = True
+        self._refresh_ai_clients()
 
         def connect():
             try:
@@ -1471,6 +1536,7 @@ class MainWindow(QMainWindow):
             return True
 
         def done(connected):
+            self.ai_links_busy = False
             self._refresh_ai_clients()
             if not connected:
                 QMessageBox.warning(
@@ -1491,6 +1557,7 @@ class MainWindow(QMainWindow):
             )
 
         def failed(message):
+            self.ai_links_busy = False
             self._refresh_ai_clients()
             QMessageBox.warning(self, "MCP", f"Не удалось подключить {client.name}: {message}")
 
@@ -1502,11 +1569,18 @@ class MainWindow(QMainWindow):
         )
 
     def _disconnect_ai_client(self, client):
+        if self.mcp_busy or self.ai_links_busy:
+            return
+        self.ai_links_busy = True
+        self._refresh_ai_clients()
+
         def done(_result):
+            self.ai_links_busy = False
             self._refresh_ai_clients()
             self.statusBar().showMessage(f"MCP отключён от {client.name}", 5000)
 
         def failed(message):
+            self.ai_links_busy = False
             self._refresh_ai_clients()
             QMessageBox.warning(self, "MCP", f"Не удалось отключить {client.name}: {message}")
 
@@ -1525,6 +1599,8 @@ class MainWindow(QMainWindow):
             action()
 
     def _current_online_lesson(self, now=None):
+        if self._auth_check_only():
+            return None
         """The online pair on right now that the app should be in, if any."""
         now = now or datetime.now().astimezone()
         lessons = [
@@ -1602,7 +1678,7 @@ class MainWindow(QMainWindow):
                     )
                 elif not self.scan_timer.isActive():
                     problem("scanner_stopped", "QR-сканирование выключено", ["start_scanner"])
-                elif self.last_capture_at and time.monotonic() - self.last_capture_at > 60:
+                elif time.monotonic() - max(self.last_capture_at, self.capture_grace_at) > 60:
                     problem(
                         "capture_stale",
                         "Кадры лекции не обновляются больше минуты",
@@ -1901,7 +1977,7 @@ class MainWindow(QMainWindow):
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))
 
     def _install_mcp(self, then=None):
-        if self.mcp_busy:
+        if self.mcp_busy or self.ai_links_busy:
             return
         self.mcp_busy = True
         self._refresh_mcp_status()
@@ -1920,6 +1996,8 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"MCP {release['version']} установлен", 5000)
             if then is not None:
                 then()
+            else:
+                self._sync_ai_client_links()
 
         def failed(_message):
             self.mcp_busy = False
@@ -2056,6 +2134,7 @@ class MainWindow(QMainWindow):
                 marked = set(self.db.get_setting("marked_lessons", []))
                 result = {
                     "qr_events": events,
+                    "daily_summary": self.db.daily_summary(datetime.now().astimezone().date()),
                     "marked_lessons": [
                         {"subject": lesson.subject_name, "start": lesson.start_at.isoformat()}
                         for lesson in self.db.list_lessons()
@@ -2228,6 +2307,31 @@ class MainWindow(QMainWindow):
     def _history_page(self):
         page, layout = self._page_shell(
             "История QR", "Содержимое токенов не хранится — только безопасный отпечаток"
+        )
+        self.summary_date = QDateEdit(QDate.currentDate())
+        self.summary_date.setCalendarPopup(True)
+        self.summary_date.setDisplayFormat("dd.MM.yyyy")
+        self.summary_date.dateChanged.connect(lambda _date: self._fill_daily_summary())
+        layout.addWidget(
+            QLabel("Итог дня: открытие, подключение, видео и отметка — разные события")
+        )
+        layout.addWidget(self.summary_date)
+        self.daily_summary = QTableWidget(0, 6)
+        self.daily_summary.setHorizontalHeaderLabels(
+            ("Пара", "Предмет", "Открыта", "В комнате", "Видео", "Отметка")
+        )
+        self.daily_summary.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.daily_summary.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.ResizeToContents
+        )
+        self.daily_summary.horizontalHeader().setSectionResizeMode(
+            1, QHeaderView.ResizeMode.Stretch
+        )
+        layout.addWidget(self.daily_summary, 1)
+        layout.addWidget(
+            QLabel(
+                "Нет данных — не означает отсутствие. Учёт подключения и видео ведётся с этой версии."
+            )
         )
         self.history_table = QTableWidget(0, 4)
         self.history_table.setHorizontalHeaderLabels(("Когда", "Статус", "Предмет", "Результат"))
@@ -2566,6 +2670,7 @@ class MainWindow(QMainWindow):
         if index == MCP_PAGE:
             self._refresh_ai_clients()
             self._refresh_duty_agents()
+            self._sync_ai_client_links()
         for i, button in enumerate(self.nav_buttons):
             button.setChecked(i == index)
 
@@ -3325,7 +3430,13 @@ class MainWindow(QMainWindow):
         log.info("first_run_setup_done group_valid=%s", is_group_code(group))
         self.login()
 
+    def _auth_check_only(self):
+        return "--check-login" in sys.argv
+
     def _startup_auth(self):
+        if self._auth_check_only():
+            log.info("startup_auth_waiting_for_user")
+            return
         if os.environ.get("MIREA_ASSISTANT_SMOKE_TEST") == "1":
             # A build smoke test must never reach MIREA and trigger a real 2FA email.
             log.info("startup_auth_skipped reason=smoke_test")
@@ -3646,11 +3757,15 @@ class MainWindow(QMainWindow):
         )
 
     def _evaluate_cached_lessons(self):
+        if self._auth_check_only():
+            return
         self._evaluate_current_lessons(self.db.list_lessons())
         self._duty_tick()
 
     def _restore_active_lecture(self):
         """Resume only a room actually monitored before a crash/update, not old links."""
+        if self._auth_check_only():
+            return
         saved = self.db.get_setting("active_lecture", {})
         if not saved or self.active_lecture_id or self.opening_lecture_id:
             return
@@ -3719,6 +3834,8 @@ class MainWindow(QMainWindow):
         return "" if url in self._rejected_rooms(lesson_id) else url
 
     def _evaluate_current_lessons(self, lessons):
+        if self._auth_check_only():
+            return
         now = datetime.now().astimezone()
         lead_minutes = self.join_before.value()
         active = self._lesson_of(self.active_lecture_id)
@@ -4290,6 +4407,8 @@ class MainWindow(QMainWindow):
         force: bool = False,
         manual: bool = False,
     ):
+        if self._auth_check_only():
+            return
         if not url:
             QMessageBox.information(
                 self, "Ссылка не указана", "Сначала вставьте ссылку на лекцию в таблице."
@@ -4362,6 +4481,8 @@ class MainWindow(QMainWindow):
             self.chat_baseline = None
             self.lecture_started_at = time.monotonic()
             self.last_capture_at = 0.0
+            self.capture_grace_at = time.monotonic()
+            self.summary_video_seen = False
         if lesson_id and self.active_lecture_url:
             checkpoint = {"lesson_id": lesson_id, "url": self.active_lecture_url}
             if self.active_lesson is not None:
@@ -4393,6 +4514,8 @@ class MainWindow(QMainWindow):
         self.active_lecture_url = self.browser.lecture_url
         log.info("lecture_opened lesson_id=%s browser=%s", lesson_id, browser_name)
         self._make_active(lesson_id)
+        if lesson is not None and lesson_id:
+            self.db.record_lesson_activity(lesson, "opened")
         self.statusBar().showMessage(
             f"Страница лекции загружена в {browser_name}; подключаемся…", 4000
         )
@@ -4456,7 +4579,7 @@ class MainWindow(QMainWindow):
                 self.lecture_unstable_checks = 0
             if state == "live" and (
                 self.scan_timer.isActive()
-                and time.monotonic() - (self.last_capture_at or self.lecture_started_at) > 30
+                and time.monotonic() - max(self.last_capture_at, self.capture_grace_at) > 30
             ):
                 log.warning("lecture_capture_stale")
                 state = "stalled"
@@ -4465,6 +4588,8 @@ class MainWindow(QMainWindow):
                     return
                 state = "lost"
             if state == "live":
+                if lesson is not None:
+                    self.db.record_lesson_activity(lesson, "joined")
                 self.lecture_recovery_failures = 0
                 return
             if state == "ended":
@@ -4506,7 +4631,7 @@ class MainWindow(QMainWindow):
         self.soft_recovery_at = now
         # The reloaded room gets the same 30 seconds as a new one before its
         # captures count as stale again.
-        self.last_capture_at = now
+        self.capture_grace_at = now
         return True
 
     def _enter_lecture_room(self):
@@ -4661,7 +4786,33 @@ class MainWindow(QMainWindow):
             6000,
         )
 
+    def _fill_daily_summary(self):
+        day = self.summary_date.date().toPython()
+        rows = self.db.daily_summary(day)
+        self.daily_summary.setRowCount(len(rows))
+        for index, row in enumerate(rows):
+
+            def stamp(key, row=row):
+                value = row.get(key)
+                return (
+                    datetime.fromisoformat(value).astimezone().strftime("%H:%M")
+                    if value
+                    else "Нет данных"
+                )
+
+            values = [
+                datetime.fromisoformat(row["start_at"]).astimezone().strftime("%H:%M"),
+                row["subject_name"],
+                stamp("opened_at"),
+                stamp("joined_at"),
+                stamp("video_at"),
+                "Отмечено" if row["marked"] else "Не подтверждено",
+            ]
+            for column, value in enumerate(values):
+                self.daily_summary.setItem(index, column, QTableWidgetItem(value))
+
     def _fill_history(self):
+        self._fill_daily_summary()
         events = self.db.recent_qr_events()
         self.history_table.setRowCount(len(events))
         subjects = {lesson.external_id: lesson.subject_name for lesson in self.db.list_lessons()}
@@ -4754,6 +4905,8 @@ class MainWindow(QMainWindow):
         return f"{lesson.start_at:%d.%m} в {lesson.start_at:%H:%M}"
 
     def toggle_scanner(self):
+        if self._auth_check_only():
+            return
         if self.scan_timer.isActive():
             self.scan_timer.stop()
             self.scan_button.setText("Начать сканирование экрана")
@@ -4763,7 +4916,7 @@ class MainWindow(QMainWindow):
             log.info("scanner_stopped")
             self._update_now_card()
         else:
-            self.last_capture_at = time.monotonic()
+            self.capture_grace_at = time.monotonic()
             self.scan_timer.start(self.scan_interval.value() * 1000)
             self.scan_button.setText("Остановить сканирование")
             self.scan_state.setText("● Сканирует")
@@ -4784,7 +4937,13 @@ class MainWindow(QMainWindow):
             "scan_frame",
             log_success=False,
         )
-        self._start_worker(worker, self._scan_results, self._scan_failed, pool=self.scan_pool)
+        context = (self.active_lecture_id, self.active_lecture_url)
+        self._start_worker(
+            worker,
+            lambda observation: self._scan_results(observation, context),
+            self._scan_failed,
+            pool=self.scan_pool,
+        )
 
     def _scan_source(self, direct_capture: bool):
         if direct_capture:
@@ -4793,11 +4952,26 @@ class MainWindow(QMainWindow):
             return self.scanner.decode_png(png), page_text
         return self.scanner.scan_once(), ""
 
-    def _scan_results(self, observation):
+    def _scan_results(self, observation, context=None):
         self.scan_running = False
+        if context is not None and context != (self.active_lecture_id, self.active_lecture_url):
+            self._continue_scan_without_gap()
+            return  # A frame from the previous room proves nothing about the current one.
         batch, page_text = observation
         now = time.monotonic()
         self.last_capture_at = now
+        if (
+            self.active_lesson is not None
+            and self.active_lecture_id == self.active_lesson.external_id
+        ):
+            # Persist at most once per log heartbeat, plus the first real video frame.
+            video = self.direct_capture.isChecked() and self.browser._capture_backend == "video"
+            if video and (
+                now - self.last_capture_heartbeat >= 30
+                or not getattr(self, "summary_video_seen", False)
+            ):
+                self.db.record_lesson_activity(self.active_lesson, "video")
+                self.summary_video_seen = True
         if now - self.last_capture_heartbeat >= 30:
             self.last_capture_heartbeat = now
             log.info(
@@ -4846,6 +5020,8 @@ class MainWindow(QMainWindow):
             self._handle_qr(raw, allow_bare_token=True)
 
     def _handle_qr(self, raw: str, *, silent_invalid: bool = False, allow_bare_token: bool = False):
+        if self._auth_check_only():
+            return
         qr, error = validate_qr(raw, allow_bare_token=allow_bare_token)
         if qr is None:
             if not silent_invalid:
@@ -4902,6 +5078,8 @@ class MainWindow(QMainWindow):
         self._submit_attendance(event_id)
 
     def _submit_attendance(self, event_id: int):
+        if self._auth_check_only():
+            return
         if event_id in self.attendance_inflight:
             return
         pending = self.pending_qr.get(event_id)
@@ -5115,6 +5293,8 @@ class MainWindow(QMainWindow):
             self.db.set_setting("qr_seen_lessons", qr_seen_lessons[-100:])
 
     def _send_chat_fallback(self, reason: str = "classmate_messages", lesson_id: str | None = None):
+        if self._auth_check_only():
+            return
         lesson_id = lesson_id or self.active_lecture_id
         if not lesson_id or lesson_id != self.active_lecture_id:
             log.warning(

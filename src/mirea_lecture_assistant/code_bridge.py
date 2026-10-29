@@ -29,6 +29,9 @@ class CodeBridge:
         # The code mark («#1F») each sign-in page asks for, and pages given a code.
         self.watcher_tags: dict[str, str | None] = {}
         self.filled: dict[str, float] = {}
+        self.acknowledged: dict[str, str] = {}
+        self.cancelled: dict[str, float] = {}
+        self.published_at = 0.0
         self.token = secrets.token_urlsafe(32)
         self.condition = threading.Condition()
         self.watchers: dict[str, float] = {}
@@ -145,6 +148,7 @@ class CodeBridge:
         with self.condition:
             receipt = secrets.token_hex(16)
             self.pending = (code, receipt, time.monotonic() + 90, None)
+            self.published_at = time.monotonic()
             if self.expiry_timer:
                 self.expiry_timer.cancel()
 
@@ -171,6 +175,24 @@ class CodeBridge:
     def request(self, path: str, key: str, receipt=None, origin="", *, tag=None):
         watcher = origin + ":" + key
         with self.condition:
+            if path == "/watch":
+                if self.stopped:
+                    return {"watching": False}
+                now = time.monotonic()
+                self.watchers = {k: t for k, t in self.watchers.items() if t > now - 45}
+                self.watcher_tags = {
+                    k: v for k, v in self.watcher_tags.items() if k in self.watchers
+                }
+                if watcher not in self.watchers and len(self.watchers) >= 32:
+                    return {"watching": False}
+                fresh = watcher not in self.watchers
+                self.cancelled.pop(watcher, None)
+                self.watchers[watcher] = now
+                self.watcher_tags[watcher] = tag
+                if fresh:
+                    log.info("manual_code_watch_started waiting_pages=%s", len(self.watchers))
+                self.condition.notify_all()
+                return {"watching": True}
             if path == "/ack":
                 if (
                     self.pending
@@ -180,9 +202,18 @@ class CodeBridge:
                 ):
                     self.pending = None
                     self.watchers.pop(watcher, None)
+                    self.watcher_tags.pop(watcher, None)
                     self.filled[watcher] = time.monotonic()
+                    self.acknowledged[watcher] = receipt
+                    log.info(
+                        "manual_code_fill_confirmed elapsed_ms=%s",
+                        round((time.monotonic() - self.published_at) * 1000),
+                    )
                     self.delivered()
-                return {}
+                return {
+                    "accepted": self.acknowledged.get(watcher) == receipt
+                    and time.monotonic() - self.filled.get(watcher, -1e9) < 120
+                }
             if path == "/signed-in":
                 # Only a page that was given a code moments ago may say so.
                 if time.monotonic() - self.filled.pop(watcher, -1e9) < 120:
@@ -190,8 +221,15 @@ class CodeBridge:
                 return {}
             if path == "/cancel":
                 self.watchers.pop(watcher, None)
+                self.watcher_tags.pop(watcher, None)
+                now = time.monotonic()
+                self.cancelled = {k: t for k, t in self.cancelled.items() if t > now - 45}
+                if len(self.cancelled) < 64:
+                    self.cancelled[watcher] = now
                 if self.pending and self.pending[3] == watcher:
-                    self.pending = None
+                    code, token, expires, _owner = self.pending
+                    self.pending = (code, token, expires, None)
+                self.condition.notify_all()
                 return {}
             if path != "/poll" or self.stopped:
                 return {}
@@ -199,6 +237,8 @@ class CodeBridge:
                 return {}
             deadline = time.monotonic() + 20
             while not self.stopped:
+                if watcher in self.cancelled:
+                    return {}
                 now = time.monotonic()
                 self.watchers = {k: t for k, t in self.watchers.items() if t > now - 45}
                 self.watchers[watcher] = now
@@ -208,10 +248,24 @@ class CodeBridge:
                 }
                 if self.pending and self.pending[2] <= now:
                     self.pending = None
-                if self.pending and len(self.watchers) == 1:
+                self.filled = {k: t for k, t in self.filled.items() if t > now - 120}
+                self.acknowledged = {k: v for k, v in self.acknowledged.items() if k in self.filled}
+                if self.pending:
                     code, receipt, expires, owner = self.pending
+                    letter_tag = getattr(code, "tag", None)
+                    matches = [
+                        key
+                        for key in self.watchers
+                        if letter_tag and self.watcher_tags.get(key) == letter_tag.upper()
+                    ]
+                    eligible = matches if matches else list(self.watchers)
                     # A code goes only to the page whose mark («#1F») it carries.
-                    if (owner is None or owner == watcher) and tags_agree(tag, code):
+                    if (
+                        len(eligible) == 1
+                        and eligible[0] == watcher
+                        and (owner is None or owner == watcher)
+                        and tags_agree(tag, code)
+                    ):
                         self.pending = (code, receipt, expires, watcher)
                         return {"code": code, "receipt": receipt}
                 if now >= deadline:
@@ -227,6 +281,10 @@ class CodeBridge:
                 self.expiry_timer.cancel()
                 self.expiry_timer = None
             self.watchers.clear()
+            self.watcher_tags.clear()
+            self.filled.clear()
+            self.acknowledged.clear()
+            self.cancelled.clear()
             self.condition.notify_all()
         if self.server:
             self.server.shutdown()
