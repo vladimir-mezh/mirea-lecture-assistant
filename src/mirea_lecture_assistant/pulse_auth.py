@@ -6,8 +6,12 @@ cookie alone is not a completed Pulse login.
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import json
 import logging
-from urllib.parse import parse_qs, urljoin, urlsplit
+import secrets
+from urllib.parse import parse_qs, parse_qsl, urljoin, urlsplit
 
 import httpx
 from bs4 import BeautifulSoup
@@ -18,6 +22,30 @@ from .pulse_api import PULSE_COOKIE_NAMES
 
 log = logging.getLogger(__name__)
 REDIRECTS = {301, 302, 303, 307, 308}
+CALLBACK_PATHS = {
+    "/signin-oidc",
+    "/api/mireaauth",
+    "/api/auth/callback",
+    "/api/auth/callback/keycloak",
+    "/api/auth/callback/mirea",
+    "/api/auth/callback/oidc",
+}
+RESPONSE_FIELDS = {
+    "code",
+    "state",
+    "session_state",
+    "iss",
+    "id_token",
+    "access_token",
+    "token_type",
+    "expires_in",
+    "scope",
+    "client_id",
+}
+
+
+class PulseProtocolError(ValueError):
+    """A changed or inconsistent sign-in contract, not a wrong email code."""
 
 
 class PulseAuth:
@@ -27,6 +55,10 @@ class PulseAuth:
         self._parser = MireaAuth()
         self.client = self._parser.client
         self._challenge = None
+        self._callback_uri = None
+        self._oidc_state = None
+        self._callback_visits = set()
+        self._bootstrapping = False
 
     async def close(self):
         await self._parser.close()
@@ -86,6 +118,102 @@ class PulseAuth:
             follow_redirects=False,
         )
 
+    def _remember_authorization(self, source, target):
+        """Pin only the authorization request issued by Pulse, never an HTML hint."""
+        if (
+            source.host not in {"pulse.mirea.ru", "sso.mirea.ru", "login.mirea.ru"}
+            or not getattr(self, "_bootstrapping", False)
+            or getattr(self, "_callback_uri", None)
+        ):
+            return
+        parsed = urlsplit(self._trusted(target))
+        if parsed.hostname not in {"sso.mirea.ru", "login.mirea.ru"}:
+            return
+        query = parse_qs(parsed.query)
+        # With pushed authorization requests (PAR), the public request_uri is
+        # opaque. Keycloak then carries the resolved request in client_data on
+        # its own login-actions redirect. Read it only in this trusted bootstrap.
+        if "client_data" in query and "redirect_uri" not in query:
+            values = query["client_data"]
+            if len(values) != 1 or len(values[0]) > 16384:
+                raise PulseProtocolError("invalid_authorization_context")
+            try:
+                raw = values[0]
+                context = json.loads(
+                    base64.b64decode(raw + "=" * (-len(raw) % 4), altchars=b"-_", validate=True)
+                )
+                if not isinstance(context, dict):
+                    raise TypeError()
+                for key, short in (
+                    ("redirect_uri", "ru"),
+                    ("state", "st"),
+                    ("response_type", "rt"),
+                ):
+                    if not isinstance(context.get(short), str) or not context[short]:
+                        raise ValueError()
+                    query[key] = [context[short]]
+            except (ValueError, TypeError, UnicodeError):
+                raise PulseProtocolError("invalid_authorization_context") from None
+        if not {"redirect_uri", "state", "client_id", "response_type"} <= query.keys():
+            return  # Older flows without these hints retain the conservative route list.
+        if any(
+            len(query[key]) != 1 for key in ("redirect_uri", "state", "client_id", "response_type")
+        ):
+            raise PulseProtocolError("ambiguous_authorization_request")
+        if "code" not in query["response_type"][0].split():
+            raise PulseProtocolError("unsupported_authorization_response")
+        callback = urlsplit(self._trusted(query["redirect_uri"][0]))
+        if callback.hostname != "pulse.mirea.ru" or callback.fragment:
+            raise PulseProtocolError("unexpected_callback_destination")
+        self._callback_uri = query["redirect_uri"][0]
+        self._oidc_state = query["state"][0]
+        log.info("pulse_auth_contract_detected callback_declared=True")
+
+    def _callback_matches(self, target, *, response_query=False):
+        parsed = urlsplit(self._trusted(target))
+        if parsed.hostname != "pulse.mirea.ru" or parsed.fragment:
+            return False
+        declared = getattr(self, "_callback_uri", None)
+        if declared:
+            expected = urlsplit(declared)
+            if (parsed.path, parsed.port or 443) != (expected.path, expected.port or 443):
+                return False
+            expected_query = parse_qs(expected.query, keep_blank_values=True)
+        else:
+            if parsed.path.rstrip("/") not in CALLBACK_PATHS:
+                return False
+            expected_query = {}
+        actual = parse_qs(parsed.query, keep_blank_values=True)
+        if any(actual.get(key) != value for key, value in expected_query.items()):
+            return False
+        extras = actual.keys() - expected_query.keys()
+        return extras <= RESPONSE_FIELDS if response_query else not extras
+
+    def _validate_callback_state(self, fields):
+        expected = getattr(self, "_oidc_state", None)
+        if expected is not None and not secrets.compare_digest(
+            str(fields.get("state", "")).encode(), expected.encode()
+        ):
+            raise PulseProtocolError("callback_state_mismatch")
+
+    def _claim_callback(self, method, target, fields):
+        self._validate_callback_state(fields)
+        # A repeated form must not redeem the same one-time response in a loop.
+        parsed = urlsplit(target)
+        destination = (
+            parsed.scheme,
+            parsed.hostname,
+            parsed.port or 443,
+            parsed.path,
+            sorted(parse_qsl(parsed.query, keep_blank_values=True)),
+        )
+        digest = hashlib.sha256(
+            repr((method, destination, sorted(fields.items()))).encode()
+        ).digest()
+        if digest in self._callback_visits:
+            raise PulseProtocolError("repeated_callback")
+        self._callback_visits.add(digest)
+
     def _callback_form(self, page):
         # OIDC response_mode=form_post returns a page that a browser submits to
         # Pulse. Only accept authorization responses to the known callback routes.
@@ -96,38 +224,22 @@ class PulseAuth:
             if str(form.get("method", "get")).strip().lower() != "post":
                 continue
             action = urljoin(str(page.url), form.get("action", ""))
-            parsed = urlsplit(self._trusted(action))
-            if parsed.hostname != "pulse.mirea.ru" or parsed.path.rstrip("/") not in {
-                "/signin-oidc",
-                "/api/mireaauth",
-                "/api/auth/callback",
-                "/api/auth/callback/keycloak",
-                "/api/auth/callback/mirea",
-                "/api/auth/callback/oidc",
-            }:
+            if not self._callback_matches(action):
                 continue
-            fields = {
-                item["name"]: item.get("value", "")
-                for item in form.find_all("input")
-                if item.get("name") and str(item.get("type", "hidden")).lower() == "hidden"
-            }
-            if (
-                fields.get("code")
-                and fields.get("state")
-                and fields.keys()
-                <= {
-                    "code",
-                    "state",
-                    "session_state",
-                    "iss",
-                    "id_token",
-                    "access_token",
-                    "token_type",
-                    "expires_in",
-                    "scope",
-                    "client_id",
-                }
-            ):
+            fields = {}
+            for item in form.find_all("input"):
+                name = item.get("name")
+                if (
+                    not name
+                    or str(item.get("type", "hidden")).lower() != "hidden"
+                    or item.has_attr("disabled")
+                ):
+                    continue
+                if name in fields:
+                    raise PulseProtocolError("duplicate_callback_field")
+                fields[name] = item.get("value", "")
+            if fields.get("code") and fields.get("state") and fields.keys() <= RESPONSE_FIELDS:
+                self._validate_callback_state(fields)
                 return action, fields
         return None
 
@@ -149,13 +261,49 @@ class PulseAuth:
                 if not location:
                     return response
                 target = self._trusted(urljoin(str(response.url), location))
-                response = await self.client.get(target, follow_redirects=False)
+                self._remember_authorization(response.url, target)
+                query = parse_qs(urlsplit(target).query)
+                if (
+                    response.url.host in {"sso.mirea.ru", "login.mirea.ru"}
+                    and urlsplit(target).hostname == "pulse.mirea.ru"
+                    and "code" in query
+                ):
+                    if (
+                        not self._callback_matches(target, response_query=True)
+                        or not query.get("state")
+                        or any(len(value) != 1 for value in query.values())
+                    ):
+                        raise PulseProtocolError("unexpected_redirect_response")
+                    self._claim_callback(
+                        "GET", target, {key: value[0] for key, value in query.items()}
+                    )
+                if response.status_code in {307, 308} and response.request.method == "POST":
+                    # Browser redirect semantics: preserve a POST, but never copy its
+                    # potentially sensitive body to another origin or arbitrary SSO route.
+                    if response.url.host != urlsplit(target).hostname:
+                        raise PulseProtocolError("cross_origin_post_redirect")
+                    if response.url.host != "pulse.mirea.ru":
+                        self._trusted(target, action=True)
+                    response = await self.client.post(
+                        target,
+                        content=response.request.content,
+                        headers={
+                            "Content-Type": response.request.headers.get(
+                                "content-type", "application/x-www-form-urlencoded"
+                            )
+                        },
+                        follow_redirects=False,
+                    )
+                else:
+                    response = await self.client.get(target, follow_redirects=False)
                 continue
             if response.status_code != 200:
                 return response
             callback = self._callback_form(response)
             if callback:
                 action, fields = callback
+                self._claim_callback("POST", action, fields)
+                log.info("pulse_auth_callback_submitted mode=form_post")
                 response = await self.client.post(
                     action,
                     data=fields,
@@ -163,6 +311,17 @@ class PulseAuth:
                     follow_redirects=False,
                 )
                 continue
+            soup = BeautifulSoup(response.text, "html.parser")
+            if response.url.host in {"sso.mirea.ru", "login.mirea.ru"} and any(
+                form.find("input", attrs={"name": "code"})
+                and form.find("input", attrs={"name": "state"})
+                and urlsplit(urljoin(str(response.url), form.get("action", ""))).hostname
+                == "pulse.mirea.ru"
+                for form in soup.find_all("form")
+            ):
+                # An unsupported OAuth response is not an email OTP prompt. Do not
+                # spend another email code or guess a new destination.
+                raise PulseProtocolError("unrecognized_callback_form")
             execution = parse_qs(response.url.query.decode()).get("execution", [])
             if execution == ["max-account-config"]:
                 form = self._form(response, skip=True)
@@ -251,6 +410,13 @@ class PulseAuth:
     @staticmethod
     def _failure(exc):
         log.warning("pulse_auth_failed kind=%s", type(exc).__name__)
+        if isinstance(exc, PulseProtocolError):
+            # Reasons are fixed internal identifiers, never remote values or HTML.
+            log.warning("pulse_auth_contract_changed reason=%s", str(exc))
+            return AuthResult(
+                False,
+                "Пульс изменил или не завершил сценарий входа. Автоматические повторы остановлены; требуется проверка совместимости.",
+            )
         if isinstance(exc, httpx.HTTPError) and not isinstance(exc, httpx.TooManyRedirects):
             # Preserve the UI's outage retry classification, including after OTP.
             return AuthResult(False, "Ошибка соединения с МИРЭА. Повторим вход позже.")
@@ -258,6 +424,10 @@ class PulseAuth:
 
     async def login(self, username: str, password: str):
         self._challenge = None
+        self._callback_uri = None
+        self._oidc_state = None
+        self._callback_visits = set()
+        self._bootstrapping = True
         try:
             page = await self._settle(
                 await self.client.get(
@@ -266,6 +436,7 @@ class PulseAuth:
                     follow_redirects=False,
                 )
             )
+            self._bootstrapping = False
             if page.url.host == "pulse.mirea.ru":
                 return self._result(page)
             form = self._form(page)
@@ -276,6 +447,9 @@ class PulseAuth:
             return self._result(await self._settle(await self._post(action, fields, str(page.url))))
         except (httpx.HTTPError, ValueError) as exc:
             return self._failure(exc)
+
+        finally:
+            self._bootstrapping = False
 
     async def complete_2fa(self, challenge, code: str):
         if challenge is not self._challenge or challenge is None:

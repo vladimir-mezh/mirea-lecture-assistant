@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mirea-lecture-assistant"
-version = "0.2.36"
+version = "0.2.37"
 description = "Desktop assistant for MIREA online lectures and attendance QR codes"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -25,7 +25,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest>=8,<9", "pytest-cov>=5,<7", "qrcode>=8,<9", "ruff>=0.8,<1"]
 opencv = ["opencv-python>=4.10,<5"]
-build = ["pyinstaller>=6.10,<7"]
+build = ["pyinstaller>=6.22.3,<7"]
 
 [project.scripts]
 mirea-lecture-assistant = "mirea_lecture_assistant.app:main"

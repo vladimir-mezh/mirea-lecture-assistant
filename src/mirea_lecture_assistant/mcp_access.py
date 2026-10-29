@@ -104,6 +104,10 @@ class McpAccess:
                         raise ValueError()
                     method = data.get("method")
                     with access.lock:
+                        now = time.monotonic()
+                        access.clients = {
+                            k: v for k, v in access.clients.items() if now - v["seen"] < 35
+                        }
                         if method == "disconnect":
                             access.clients.pop(client_id, None)
                         elif len(access.clients) < 32 or client_id in access.clients:
@@ -113,7 +117,7 @@ class McpAccess:
                                 "state": "connected"
                                 if client.get("state") == "connected"
                                 else "waiting",
-                                "seen": time.monotonic(),
+                                "seen": now,
                             }
                     if method in {"heartbeat", "disconnect"}:
                         result = {"protocol": PROTOCOL, "ok": True}
@@ -157,7 +161,17 @@ class McpAccess:
         now = time.monotonic()
         with self.lock:
             self.clients = {k: v for k, v in self.clients.items() if now - v["seen"] < 35}
-            return list(self.clients.values())
+            # A client may start one adapter per chat/session. Keep those leases
+            # independent (one disconnect must not remove the others), but show
+            # one row per client, preferring a live connection over an idle one.
+            grouped = {}
+            for client in self.clients.values():
+                key = " ".join(client["name"].split()).casefold()
+                rank = (client["state"] == "connected", client["seen"])
+                previous = grouped.get(key)
+                if previous is None or rank > (previous["state"] == "connected", previous["seen"]):
+                    grouped[key] = {**client, "name": " ".join(client["name"].split())}
+            return [grouped[key] for key in sorted(grouped)]
 
     def stop(self):
         if self.server:

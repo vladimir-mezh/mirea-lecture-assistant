@@ -679,6 +679,8 @@ class MainWindow(QMainWindow):
         self.mcp_signals.requested.connect(self._mcp_rpc)
         self.mcp_access = McpAccess(data_dir(), self.mcp_signals.requested.emit)
         self.mcp_busy = False
+        self.ai_links_busy = False
+        self.ai_links_errors: set[str] = set()
         self.auth_state = "unknown"
         self.duty_signals = DutySignals()
         self.duty_signals.finished.connect(self._duty_finished)
@@ -791,6 +793,12 @@ class MainWindow(QMainWindow):
             hints.colorSchemeChanged.connect(self._color_scheme_changed)
         self.refresh_views()
         log.info("main_window_ready")
+        if self._auth_check_only():
+            self.setWindowTitle(self.windowTitle() + " — Проверка входа")
+            self.statusBar().addPermanentWidget(
+                QLabel("Проверка входа: вебинары, QR и сообщения отключены")
+            )
+            log.info("auth_check_mode_enabled")
 
         self.clock = QTimer(self)
         self.clock.timeout.connect(self._refresh_relative_times)
@@ -845,6 +853,12 @@ class MainWindow(QMainWindow):
         self.mcp_timer.timeout.connect(self._refresh_extension_status)
         self.mcp_timer.start(5_000)
         QTimer.singleShot(0, self._sync_mcp_access)
+        self.ai_links_timer = QTimer(self)
+        self.ai_links_timer.setInterval(30_000)
+        self.ai_links_timer.timeout.connect(self._sync_ai_client_links)
+        if os.environ.get("MIREA_ASSISTANT_SMOKE_TEST") != "1":
+            self.ai_links_timer.start()
+            QTimer.singleShot(5_000, self._sync_ai_client_links)
         if updater.can_self_update() and os.environ.get("MIREA_ASSISTANT_SMOKE_TEST") != "1":
             # An update needs a check (20 s) and a click first, so no download of
             # this copy can be running yet: leftovers of an interrupted one go too.
@@ -1360,8 +1374,9 @@ class MainWindow(QMainWindow):
             "включит подключение и пропишет его в настройках клиента. Чужие настройки "
             "клиента не меняются. Клиент сам запускает MCP.\n\n"
             "Без разрешения изменений доступны только диагностика и чтение настроек. "
-            "Пароли, коды входа, QR и сообщения лекций недоступны. При обновлении MCP "
-            "переподключите его в ИИ-клиенте; Lecture Assistant обновлять не нужно."
+            "Пароли, коды входа, QR и сообщения лекций недоступны. Пути уже подключённых "
+            "клиентов обновляются автоматически. Если клиент не подхватил изменение, "
+            "начните в нём новый сеанс; Lecture Assistant обновлять не нужно."
         )
         hint.setWordWrap(True)
         layout.addWidget(hint)
@@ -1422,6 +1437,34 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Не удалось включить MCP-подключение", 5000)
         self._refresh_mcp_status()
 
+    def _sync_ai_client_links(self):
+        if (
+            self.ai_links_busy
+            or self.mcp_busy
+            or not ai_clients.supported()
+            or os.environ.get("MIREA_ASSISTANT_SMOKE_TEST") == "1"
+            or mcp_install.installed(self._mcp_root()) is None
+        ):
+            return
+        self.ai_links_busy = True
+        if self.pages.currentIndex() == MCP_PAGE:
+            self._refresh_ai_clients()
+        launcher, profile = self._mcp_root() / "McpLauncher.exe", self.mcp_access.root
+
+        def done(result):
+            self.ai_links_busy = False
+            self.ai_links_errors = set(result["errors"])
+            if self.pages.currentIndex() == MCP_PAGE:
+                self._refresh_ai_clients()
+
+        def failed(_message):
+            self.ai_links_busy = False
+            log.warning("ai_client_links_check_failed")
+            if self.pages.currentIndex() == MCP_PAGE:
+                self._refresh_ai_clients()
+
+        self._run(lambda: ai_clients.sync_links(launcher, profile), done, "", failed=failed)
+
     def _refresh_ai_clients(self):
         """One row per AI client found here: its state and the one button it needs."""
         while self.ai_clients_layout.count():
@@ -1450,17 +1493,22 @@ class MainWindow(QMainWindow):
                 client.name
                 + {
                     "connected": " — ✓ подключён",
-                    "outdated": " — подключён по старому пути",
+                    "outdated": (
+                        " — не удалось обновить путь, повторим автоматически"
+                        if client.key in self.ai_links_errors
+                        else " — путь обновляется автоматически"
+                    ),
+                    "disabled": " — выключен в ИИ-клиенте",
                     "absent": "",
                 }[state]
             )
             line.addWidget(label, 1)
             button = QPushButton(
-                {"connected": "Отключить", "outdated": "Обновить", "absent": "Подключить"}[state],
-                objectName="secondary" if state == "connected" else "",
+                "Подключить" if state == "absent" else "Отключить",
+                objectName="" if state == "absent" else "secondary",
             )
-            button.setEnabled(not self.mcp_busy)
-            if state == "connected":
+            button.setEnabled(not self.mcp_busy and not self.ai_links_busy)
+            if state != "absent":
                 button.clicked.connect(partial(self._disconnect_ai_client, client))
             else:
                 button.clicked.connect(partial(self._connect_ai_client, client))
@@ -1469,7 +1517,7 @@ class MainWindow(QMainWindow):
 
     def _connect_ai_client(self, client):
         """Everything one click needs: MCP installed, access on, the client's settings."""
-        if self.mcp_busy:
+        if self.mcp_busy or self.ai_links_busy:
             return
         if mcp_install.installed(self._mcp_root()) is None:
             self._install_mcp(then=lambda: self._connect_ai_client(client))
@@ -1477,6 +1525,8 @@ class MainWindow(QMainWindow):
         if not self.mcp_enabled.isChecked():
             self.mcp_enabled.setChecked(True)  # saves the setting and opens access
         launcher, profile = self._mcp_root() / "McpLauncher.exe", self.mcp_access.root
+        self.ai_links_busy = True
+        self._refresh_ai_clients()
 
         def connect():
             try:
@@ -1486,6 +1536,7 @@ class MainWindow(QMainWindow):
             return True
 
         def done(connected):
+            self.ai_links_busy = False
             self._refresh_ai_clients()
             if not connected:
                 QMessageBox.warning(
@@ -1506,6 +1557,7 @@ class MainWindow(QMainWindow):
             )
 
         def failed(message):
+            self.ai_links_busy = False
             self._refresh_ai_clients()
             QMessageBox.warning(self, "MCP", f"Не удалось подключить {client.name}: {message}")
 
@@ -1517,11 +1569,18 @@ class MainWindow(QMainWindow):
         )
 
     def _disconnect_ai_client(self, client):
+        if self.mcp_busy or self.ai_links_busy:
+            return
+        self.ai_links_busy = True
+        self._refresh_ai_clients()
+
         def done(_result):
+            self.ai_links_busy = False
             self._refresh_ai_clients()
             self.statusBar().showMessage(f"MCP отключён от {client.name}", 5000)
 
         def failed(message):
+            self.ai_links_busy = False
             self._refresh_ai_clients()
             QMessageBox.warning(self, "MCP", f"Не удалось отключить {client.name}: {message}")
 
@@ -1540,6 +1599,8 @@ class MainWindow(QMainWindow):
             action()
 
     def _current_online_lesson(self, now=None):
+        if self._auth_check_only():
+            return None
         """The online pair on right now that the app should be in, if any."""
         now = now or datetime.now().astimezone()
         lessons = [
@@ -1916,7 +1977,7 @@ class MainWindow(QMainWindow):
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))
 
     def _install_mcp(self, then=None):
-        if self.mcp_busy:
+        if self.mcp_busy or self.ai_links_busy:
             return
         self.mcp_busy = True
         self._refresh_mcp_status()
@@ -1935,6 +1996,8 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"MCP {release['version']} установлен", 5000)
             if then is not None:
                 then()
+            else:
+                self._sync_ai_client_links()
 
         def failed(_message):
             self.mcp_busy = False
@@ -2607,6 +2670,7 @@ class MainWindow(QMainWindow):
         if index == MCP_PAGE:
             self._refresh_ai_clients()
             self._refresh_duty_agents()
+            self._sync_ai_client_links()
         for i, button in enumerate(self.nav_buttons):
             button.setChecked(i == index)
 
@@ -3366,7 +3430,13 @@ class MainWindow(QMainWindow):
         log.info("first_run_setup_done group_valid=%s", is_group_code(group))
         self.login()
 
+    def _auth_check_only(self):
+        return "--check-login" in sys.argv
+
     def _startup_auth(self):
+        if self._auth_check_only():
+            log.info("startup_auth_waiting_for_user")
+            return
         if os.environ.get("MIREA_ASSISTANT_SMOKE_TEST") == "1":
             # A build smoke test must never reach MIREA and trigger a real 2FA email.
             log.info("startup_auth_skipped reason=smoke_test")
@@ -3687,11 +3757,15 @@ class MainWindow(QMainWindow):
         )
 
     def _evaluate_cached_lessons(self):
+        if self._auth_check_only():
+            return
         self._evaluate_current_lessons(self.db.list_lessons())
         self._duty_tick()
 
     def _restore_active_lecture(self):
         """Resume only a room actually monitored before a crash/update, not old links."""
+        if self._auth_check_only():
+            return
         saved = self.db.get_setting("active_lecture", {})
         if not saved or self.active_lecture_id or self.opening_lecture_id:
             return
@@ -3760,6 +3834,8 @@ class MainWindow(QMainWindow):
         return "" if url in self._rejected_rooms(lesson_id) else url
 
     def _evaluate_current_lessons(self, lessons):
+        if self._auth_check_only():
+            return
         now = datetime.now().astimezone()
         lead_minutes = self.join_before.value()
         active = self._lesson_of(self.active_lecture_id)
@@ -4331,6 +4407,8 @@ class MainWindow(QMainWindow):
         force: bool = False,
         manual: bool = False,
     ):
+        if self._auth_check_only():
+            return
         if not url:
             QMessageBox.information(
                 self, "Ссылка не указана", "Сначала вставьте ссылку на лекцию в таблице."
@@ -4827,6 +4905,8 @@ class MainWindow(QMainWindow):
         return f"{lesson.start_at:%d.%m} в {lesson.start_at:%H:%M}"
 
     def toggle_scanner(self):
+        if self._auth_check_only():
+            return
         if self.scan_timer.isActive():
             self.scan_timer.stop()
             self.scan_button.setText("Начать сканирование экрана")
@@ -4940,6 +5020,8 @@ class MainWindow(QMainWindow):
             self._handle_qr(raw, allow_bare_token=True)
 
     def _handle_qr(self, raw: str, *, silent_invalid: bool = False, allow_bare_token: bool = False):
+        if self._auth_check_only():
+            return
         qr, error = validate_qr(raw, allow_bare_token=allow_bare_token)
         if qr is None:
             if not silent_invalid:
@@ -4996,6 +5078,8 @@ class MainWindow(QMainWindow):
         self._submit_attendance(event_id)
 
     def _submit_attendance(self, event_id: int):
+        if self._auth_check_only():
+            return
         if event_id in self.attendance_inflight:
             return
         pending = self.pending_qr.get(event_id)
@@ -5209,6 +5293,8 @@ class MainWindow(QMainWindow):
             self.db.set_setting("qr_seen_lessons", qr_seen_lessons[-100:])
 
     def _send_chat_fallback(self, reason: str = "classmate_messages", lesson_id: str | None = None):
+        if self._auth_check_only():
+            return
         lesson_id = lesson_id or self.active_lecture_id
         if not lesson_id or lesson_id != self.active_lecture_id:
             log.warning(
